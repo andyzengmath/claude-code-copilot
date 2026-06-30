@@ -98,6 +98,40 @@ ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY=copilot-proxy claude
 | `BRAVE_API_KEY` | *(none)* | Brave Search API key for web search |
 | `WEB_SEARCH_MAX_RESULTS` | `5` | Max search results per query |
 
+
+## Windows Usage
+
+The launch.sh script is bash-only. On Windows, run the proxy and Claude Code manually:
+
+### PowerShell
+
+`powershell
+# 1. Clone and authenticate
+git clone https://github.com/samarth777/claude-code-copilot.git
+cd claude-code-copilot
+node scripts/auth.mjs
+
+# 2. Start the proxy
+node src/proxy.mjs
+
+# 3. In a NEW terminal, set env vars and launch Claude Code
+$env:ANTHROPIC_BASE_URL = "http://localhost:18080"
+$env:ANTHROPIC_API_KEY = "copilot-proxy"
+claude
+`
+
+### CMD
+
+`cmd
+set ANTHROPIC_BASE_URL=http://localhost:18080
+set ANTHROPIC_API_KEY=copilot-proxy
+claude
+`
+
+### Docker (Windows)
+
+If you have Docker Desktop installed, docker compose up -d works the same way, then set the environment variables above and run claude.
+
 ## License
 
 MIT
