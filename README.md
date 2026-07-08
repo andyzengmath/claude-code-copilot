@@ -15,7 +15,7 @@ This project runs a lightweight local proxy that translates between Anthropic's 
 ## Features
 
 - **Full API Translation** — Anthropic Messages API ↔ OpenAI Chat Completions, including streaming
-- **Web Search** — Emulates Anthropic's `web_search_20250305` tool using DuckDuckGo Lite (free) or Brave Search API
+- **Web Search** — Emulates Anthropic's `web_search_20250305` tool using Exa/Parallel MCP (same as OpenCode), with DuckDuckGo fallback
 - **Docker Support** — Run the proxy as an always-on container that survives reboots
 - **Zero Dependencies** — Pure Node.js, no npm install needed
 
@@ -61,9 +61,14 @@ Inside Claude Code, use `/model` to switch between available models (Claude Opus
 
 The proxy emulates Anthropic's web search tool so Claude Code's WebSearch works automatically.
 
-**Search providers:**
-- **Brave Search API** — Best results. Set `BRAVE_API_KEY` env var (free tier: 2000 queries/month at [api.search.brave.com](https://api.search.brave.com/))
-- **DuckDuckGo Lite** — Free, no API key needed (default)
+**Search providers (priority order):**
+
+1. **Brave Search API** — Best results. Set `BRAVE_API_KEY` env var (free tier at [api.search.brave.com](https://api.search.brave.com/))
+2. **Exa / Parallel MCP** — Free, no API key needed (default). Uses the same MCP-based search endpoints as [OpenCode](https://github.com/anomalyco/opencode). Traffic is split 50/50 between providers for reliability, with automatic cross-fallback.
+3. **DuckDuckGo Lite** — Scraping fallback (may hit CAPTCHAs under heavy use)
+4. **DuckDuckGo Instant Answer** — Last resort (limited to knowledge-graph results)
+
+You can force a specific MCP provider with `WEBSEARCH_PROVIDER=exa` or `WEBSEARCH_PROVIDER=parallel`.
 
 ## How It Works
 
@@ -95,7 +100,10 @@ ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY=copilot-proxy claude
 |---|---|---|
 | `COPILOT_PROXY_PORT` | `18080` | Port for the local proxy |
 | `COPILOT_AUTH_FILE` | `~/.claude-copilot-auth.json` | Path to saved OAuth token |
-| `BRAVE_API_KEY` | *(none)* | Brave Search API key for web search |
+| `BRAVE_API_KEY` | *(none)* | Brave Search API key for web search (highest priority) |
+| `WEBSEARCH_PROVIDER` | *(auto)* | Force MCP provider: `exa` or `parallel` (default: 50/50 split) |
+| `EXA_API_KEY` | *(none)* | Optional API key for Exa (works without one) |
+| `PARALLEL_API_KEY` | *(none)* | Optional API key for Parallel (works without one) |
 | `WEB_SEARCH_MAX_RESULTS` | `5` | Max search results per query |
 
 

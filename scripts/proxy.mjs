@@ -1,13 +1,15 @@
 #!/usr/bin/env node
-
 /**
- * Anthropic → GitHub Copilot Proxy Server
+ * Claude Code ↔ GitHub Copilot Proxy
  *
- * Accepts requests in Anthropic Messages API format, translates them to
- * OpenAI Chat Completions format, forwards to api.githubcopilot.com,
- * and translates responses back to Anthropic format.
+ * Translates Anthropic Messages API requests into OpenAI Chat Completions
+ * format and forwards them to GitHub Copilot. Responses are translated back.
  *
- * This allows Claude Code to use GitHub Copilot as its model provider.
+ * Web search: Exa/Parallel MCP (like OpenCode), with DuckDuckGo fallback.
+ *
+ * Usage:
+ *   node scripts/proxy.mjs
+ *   ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY=copilot-proxy claude
  */
 
 import { createServer } from "node:http"
@@ -15,69 +17,234 @@ import { readFileSync, existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
+// ─── Constants ──────────────────────────────────────────────────────────────
+
 const PORT = parseInt(process.env.COPILOT_PROXY_PORT || "18080", 10)
-const AUTH_FILE =
-  process.env.COPILOT_AUTH_FILE || join(homedir(), ".claude-copilot-auth.json")
+const AUTH_FILE = process.env.COPILOT_AUTH_FILE || join(homedir(), ".claude-copilot-auth.json")
 const COPILOT_API_BASE = "https://api.githubcopilot.com"
 const USER_AGENT = "claude-code-copilot-provider/1.0.0"
 const BRAVE_API_KEY = process.env.BRAVE_API_KEY || ""
 const WEB_SEARCH_MAX_RESULTS = parseInt(process.env.WEB_SEARCH_MAX_RESULTS || "5", 10)
 
-// ─── Web Search ──────────────────────────────────────────────────────────────
+// ─── Web Search: MCP Providers (Exa + Parallel) ────────────────────────────
 
-/**
- * Execute a web search using available providers.
- * Priority: Brave Search API > DuckDuckGo HTML > DuckDuckGo Instant Answer API
- */
-async function executeWebSearch(query) {
-  console.log(`  🔍 Executing web search: "${query}"`)
+const EXA_URL = "https://mcp.exa.ai/mcp"
+const PARALLEL_URL = "https://search.parallel.ai/mcp"
+const WEBSEARCH_PROVIDER = process.env.WEBSEARCH_PROVIDER || "" // "exa" | "parallel" | ""
 
-  if (BRAVE_API_KEY) {
-    const results = await braveSearch(query)
-    if (results && results.length > 0) return results
-    console.log(`  ⚠ Brave Search failed, trying DuckDuckGo Lite...`)
+function simpleChecksum(str) {
+  let hash = 0
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0
   }
-
-  const ddgLiteResults = await duckDuckGoLiteSearch(query)
-  if (ddgLiteResults && ddgLiteResults.length > 0) return ddgLiteResults
-
-  console.log(`  ⚠ DuckDuckGo Lite failed, trying instant answer API...`)
-  const instantResults = await duckDuckGoInstantAnswer(query)
-  if (instantResults && instantResults.length > 0) return instantResults
-
-  console.log(`  ⚠ All search providers failed`)
-  return []
+  return Math.abs(hash).toString(36)
 }
+
+function selectProvider(query) {
+  const override = WEBSEARCH_PROVIDER.toLowerCase()
+  if (override === "exa") return "exa"
+  if (override === "parallel") return "parallel"
+  const hasExa = !!process.env.EXA_API_KEY
+  const hasParallel = !!process.env.PARALLEL_API_KEY
+  if (hasParallel && !hasExa) return "parallel"
+  if (hasExa && !hasParallel) return "exa"
+  return parseInt(simpleChecksum(query), 36) % 2 === 0 ? "exa" : "parallel"
+}
+
+function parseMcpResponse(body) {
+  try {
+    const json = JSON.parse(body)
+    if (json.result && json.result.content) return json.result.content
+    if (json.error) {
+      console.warn(`⚠ MCP error: ${JSON.stringify(json.error)}`)
+      return null
+    }
+    return null
+  } catch { /* not JSON */ }
+
+  const lines = body.split("\n")
+  for (const line of lines) {
+    if (!line.startsWith("data: ")) continue
+    const data = line.slice(6).trim()
+    if (!data || data === "[DONE]") continue
+    try {
+      const json = JSON.parse(data)
+      if (json.result && json.result.content) return json.result.content
+    } catch { continue }
+  }
+  return null
+}
+
+async function callMcp(url, toolName, args, headers = {}) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 25000)
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        ...headers,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: toolName, arguments: args },
+      }),
+      signal: controller.signal,
+    })
+    if (!res.ok) {
+      console.warn(`⚠ MCP ${toolName} HTTP error: ${res.status}`)
+      return null
+    }
+    const body = await res.text()
+    return parseMcpResponse(body)
+  } catch (err) {
+    if (err.name === "AbortError") {
+      console.warn(`⚠ MCP ${toolName} timed out (25s)`)
+    } else {
+      console.warn(`⚠ MCP ${toolName} error: ${err.message}`)
+    }
+    return null
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function mcpContentToResults(content) {
+  if (!content || !Array.isArray(content)) return null
+  const results = []
+  for (const item of content) {
+    if (item.type !== "text" || !item.text) continue
+
+    // Try JSON first
+    try {
+      const parsed = JSON.parse(item.text)
+      // Handle Parallel format: { results: [{url, title, excerpts}] }
+      const items = parsed.results && Array.isArray(parsed.results)
+        ? parsed.results
+        : Array.isArray(parsed) ? parsed : [parsed]
+      for (const r of items) {
+        if (!r.url) continue
+        const snippet = r.content || r.text || r.snippet || r.description
+          || (Array.isArray(r.excerpts) ? r.excerpts.join("\n") : "")
+        results.push({
+          type: "web_search_result",
+          url: r.url,
+          title: r.title || "",
+          encrypted_content: Buffer.from(snippet).toString("base64"),
+          page_age: r.publishedDate || r.publish_date || r.age || null,
+        })
+        if (results.length >= WEB_SEARCH_MAX_RESULTS) break
+      }
+    } catch {
+      // Not JSON — parse Exa's plain text format:
+      // Title: ...\nURL: ...\nPublished: ...\nHighlights:\n...\n---\n
+      const blocks = item.text.split(/\n---\n/)
+      for (const block of blocks) {
+        const urlMatch = block.match(/URL:\s*(.+)/)
+        const titleMatch = block.match(/Title:\s*(.+)/)
+        const highlightsMatch = block.match(/Highlights:\n([\s\S]*)/)
+        if (urlMatch) {
+          results.push({
+            type: "web_search_result",
+            url: urlMatch[1].trim(),
+            title: titleMatch ? titleMatch[1].trim() : "",
+            encrypted_content: Buffer.from(
+              highlightsMatch ? highlightsMatch[1].trim() : block.trim()
+            ).toString("base64"),
+            page_age: null,
+          })
+          if (results.length >= WEB_SEARCH_MAX_RESULTS) break
+        }
+      }
+    }
+    if (results.length >= WEB_SEARCH_MAX_RESULTS) break
+  }
+  return results.length > 0 ? results : null
+}
+
+async function exaSearch(query) {
+  const apiKey = process.env.EXA_API_KEY || ""
+  const url = apiKey ? `${EXA_URL}?exaApiKey=${encodeURIComponent(apiKey)}` : EXA_URL
+  const content = await callMcp(url, "web_search_exa", {
+    query,
+    numResults: WEB_SEARCH_MAX_RESULTS,
+    type: "auto",
+    livecrawl: "auto",
+  })
+  const results = mcpContentToResults(content)
+  if (results) console.log(`✓ Exa returned ${results.length} results`)
+  return results
+}
+
+async function parallelSearch(query) {
+  const apiKey = process.env.PARALLEL_API_KEY || ""
+  const headers = apiKey ? { Authorization: `Bearer ${apiKey}` } : {}
+  const content = await callMcp(PARALLEL_URL, "web_search", {
+    objective: query,
+    search_queries: [query],
+  }, headers)
+  const results = mcpContentToResults(content)
+  if (results) console.log(`✓ Parallel returned ${results.length} results`)
+  return results
+}
+
+async function mcpSearch(query) {
+  const provider = selectProvider(query)
+  if (provider === "exa") {
+    const results = await exaSearch(query)
+    if (results) return results
+    console.warn("⚠ Exa failed, trying Parallel...")
+    return await parallelSearch(query)
+  } else {
+    const results = await parallelSearch(query)
+    if (results) return results
+    console.warn("⚠ Parallel failed, trying Exa...")
+    return await exaSearch(query)
+  }
+}
+
+// ─── Web Search: Brave ──────────────────────────────────────────────────────
 
 async function braveSearch(query) {
   try {
-    const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${WEB_SEARCH_MAX_RESULTS}`
-    const res = await fetch(url, {
-      headers: {
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-        "X-Subscription-Token": BRAVE_API_KEY,
+    const res = await fetch(
+      `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=${WEB_SEARCH_MAX_RESULTS}`,
+      {
+        headers: {
+          "Accept": "application/json",
+          "Accept-Encoding": "gzip",
+          "X-Subscription-Token": BRAVE_API_KEY,
+        },
       },
-    })
+    )
     if (!res.ok) {
-      console.log(`  ⚠ Brave API error: ${res.status}`)
+      console.warn(`⚠ Brave HTTP error: ${res.status}`)
       return null
     }
     const data = await res.json()
-    const results = (data.web?.results || []).slice(0, WEB_SEARCH_MAX_RESULTS)
-    console.log(`  ✓ Brave Search returned ${results.length} results`)
-    return results.map((r) => ({
+    const webResults = data.web?.results || []
+    const results = webResults.slice(0, WEB_SEARCH_MAX_RESULTS).map((r) => ({
       type: "web_search_result",
       url: r.url,
       title: r.title || "",
       encrypted_content: Buffer.from(r.description || "").toString("base64"),
       page_age: r.age || null,
     }))
+    if (results.length > 0) {
+      console.log(`✓ Brave returned ${results.length} results`)
+      return results
+    }
+    return null
   } catch (err) {
-    console.log(`  ⚠ Brave Search error: ${err.message}`)
+    console.warn(`⚠ Brave error: ${err.message}`)
     return null
   }
 }
+
+// ─── Web Search: DuckDuckGo Fallback ────────────────────────────────────────
 
 async function duckDuckGoLiteSearch(query) {
   try {
@@ -86,251 +253,220 @@ async function duckDuckGoLiteSearch(query) {
       headers: {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
         "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "text/html",
+        Accept: "text/html",
         "Accept-Language": "en-US,en;q=0.9",
       },
       body: `q=${encodeURIComponent(query)}&kl=us-en`,
       redirect: "follow",
     })
     if (!res.ok) {
-      console.log(`  ⚠ DDG Lite HTTP error: ${res.status}`)
+      console.warn(`⚠ DDG Lite HTTP error: ${res.status}`)
       return null
     }
     const html = await res.text()
-
-    // Check for CAPTCHA
     if (html.includes("captcha") || html.includes("anomaly") || html.includes("challenge")) {
-      console.log(`  ⚠ DDG Lite returned CAPTCHA`)
+      console.warn("⚠ DDG Lite returned CAPTCHA")
       return null
     }
-
-    const results = []
-
-    // Extract result-link elements: <a ... class='result-link'>Title</a>
-    const linkRegex = /<a\s+rel="nofollow"\s+href="([^"]+)"\s+class='result-link'>([\s\S]*?)<\/a>/g
-    let match
+    const linkRegex = /<a rel="nofollow" href="([^"]+)" class='result-link'>/g
+    const snippetRegex = /<td class='result-snippet'>([\s\S]*?)<\/td>/g
     const links = []
-    while ((match = linkRegex.exec(html)) !== null) {
-      links.push({
-        url: match[1],
-        title: match[2]
-          .replace(/<\/?b>/g, "")
-          .replace(/&#x27;/g, "'")
-          .replace(/&#92;/g, "\\")
-          .replace(/&amp;/g, "&")
-          .replace(/&quot;/g, '"')
-          .replace(/&lt;/g, "<")
-          .replace(/&gt;/g, ">")
-          .trim(),
-      })
-    }
-
-    // Extract result-snippet elements: <td class='result-snippet'>...</td>
-    const snippetRegex = /<td\s+class='result-snippet'>\s*([\s\S]*?)\s*<\/td>/g
     const snippets = []
-    while ((match = snippetRegex.exec(html)) !== null) {
-      snippets.push(
-        match[1]
-          .replace(/<\/?b>/g, "")
-          .replace(/&#x27;/g, "'")
-          .replace(/&#92;/g, "\\")
-          .replace(/&amp;/g, "&")
-          .replace(/&quot;/g, '"')
-          .replace(/&lt;/g, "<")
-          .replace(/&gt;/g, ">")
-          .replace(/\s+/g, " ")
-          .trim()
-      )
+    let match
+    while ((match = linkRegex.exec(html)) !== null) links.push(match[1])
+    while ((match = snippetRegex.exec(html)) !== null) snippets.push(match[1])
+    const decode = (s) =>
+      s.replace(/&#x27;/g, "'").replace(/&amp;/g, "&").replace(/&quot;/g, '"')
+        .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#92;/g, "\\")
+        .replace(/<\/?b>/g, "")
+    const results = links.slice(0, WEB_SEARCH_MAX_RESULTS).map((url, i) => ({
+      type: "web_search_result",
+      url: decode(url),
+      title: "",
+      encrypted_content: Buffer.from(decode(snippets[i] || "")).toString("base64"),
+      page_age: null,
+    }))
+    if (results.length > 0) {
+      console.log(`✓ DDG Lite returned ${results.length} results`)
+      return results
     }
-
-    // Combine links + snippets into results
-    for (let i = 0; i < Math.min(links.length, WEB_SEARCH_MAX_RESULTS); i++) {
-      const snippet = i < snippets.length ? snippets[i] : links[i].title
-      results.push({
-        type: "web_search_result",
-        url: links[i].url,
-        title: links[i].title,
-        encrypted_content: Buffer.from(snippet).toString("base64"),
-        page_age: null,
-      })
-    }
-
-    console.log(`  ✓ DDG Lite returned ${results.length} results`)
-    return results.length > 0 ? results : null
+    return null
   } catch (err) {
-    console.log(`  ⚠ DDG Lite error: ${err.message}`)
+    console.warn(`⚠ DDG Lite error: ${err.message}`)
     return null
   }
 }
 
 async function duckDuckGoInstantAnswer(query) {
   try {
-    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`
-    const res = await fetch(url, {
-      headers: { "User-Agent": USER_AGENT },
-    })
+    const res = await fetch(
+      `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`,
+      { headers: { "User-Agent": USER_AGENT } },
+    )
     if (!res.ok) return null
     const data = await res.json()
-
     const results = []
-
-    // Main abstract
     if (data.AbstractURL && data.AbstractText) {
       results.push({
         type: "web_search_result",
         url: data.AbstractURL,
-        title: data.Heading || query,
+        title: data.Heading || "",
         encrypted_content: Buffer.from(data.AbstractText).toString("base64"),
         page_age: null,
       })
     }
-
-    // Related topics
-    for (const topic of (data.RelatedTopics || []).slice(0, WEB_SEARCH_MAX_RESULTS - results.length)) {
-      if (topic.FirstURL && topic.Text) {
+    if (data.RelatedTopics) {
+      for (const topic of data.RelatedTopics) {
+        if (results.length >= WEB_SEARCH_MAX_RESULTS) break
+        if (!topic.FirstURL || !topic.Text) continue
         results.push({
           type: "web_search_result",
           url: topic.FirstURL,
-          title: topic.Text.substring(0, 100),
-          encrypted_content: Buffer.from(topic.Text).toString("base64"),
+          title: (topic.Text || "").slice(0, 100),
+          encrypted_content: Buffer.from(topic.Text || "").toString("base64"),
           page_age: null,
         })
       }
     }
-
-    console.log(`  ✓ DuckDuckGo Instant Answer returned ${results.length} results`)
-    return results.length > 0 ? results : null
+    if (results.length > 0) {
+      console.log(`✓ DDG Instant returned ${results.length} results`)
+      return results
+    }
+    return null
   } catch (err) {
-    console.log(`  ⚠ DDG Instant Answer error: ${err.message}`)
+    console.warn(`⚠ DDG Instant error: ${err.message}`)
     return null
   }
 }
 
-/**
- * Collect a full non-streaming response from Copilot.
- * Used internally for the web search tool call loop.
- */
-async function collectCopilotResponse(openaiReq, token) {
-  const headers = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${token}`,
-    "User-Agent": USER_AGENT,
-    "Openai-Intent": "conversation-edits",
-    "x-initiator": "user",
-  }
-  const hasImages = JSON.stringify(openaiReq.messages).includes("image_url")
-  if (hasImages) headers["Copilot-Vision-Request"] = "true"
+// ─── Web Search: Main Orchestrator ──────────────────────────────────────────
 
-  const reqBody = { ...openaiReq, stream: false }
-  const copilotRes = await fetch(`${COPILOT_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(reqBody),
-  })
-  if (!copilotRes.ok) {
-    const errorText = await copilotRes.text()
-    throw new Error(`Copilot API error (${copilotRes.status}): ${errorText}`)
+async function executeWebSearch(query) {
+  console.log(`🔍 Web search: "${query}"`)
+
+  // 1. Brave (if configured)
+  if (BRAVE_API_KEY) {
+    const results = await braveSearch(query)
+    if (results && results.length > 0) return results
+    console.warn("⚠ Brave failed, trying MCP providers...")
   }
-  return copilotRes.json()
+
+  // 2. Exa/Parallel MCP (primary)
+  const mcpResults = await mcpSearch(query)
+  if (mcpResults && mcpResults.length > 0) return mcpResults
+
+  // 3. DuckDuckGo Lite (fallback)
+  console.warn("⚠ MCP providers failed, trying DuckDuckGo Lite...")
+  const ddgLiteResults = await duckDuckGoLiteSearch(query)
+  if (ddgLiteResults && ddgLiteResults.length > 0) return ddgLiteResults
+
+  // 4. DuckDuckGo Instant Answer (last resort)
+  console.warn("⚠ DDG Lite failed, trying Instant Answer API...")
+  const instantResults = await duckDuckGoInstantAnswer(query)
+  if (instantResults && instantResults.length > 0) return instantResults
+
+  console.warn("⚠ All search providers failed")
+  return []
 }
 
-/**
- * Handle the web search tool call loop.
- *
- * When the model returns a web_search tool call, we:
- * 1. Execute the search ourselves
- * 2. Feed results back to the model
- * 3. Repeat until no more web_search calls
- * 4. Build up the content blocks for the Anthropic response
- *
- * Returns { contentBlocks, openaiResponse, searchCount }
- */
+// ─── Web Search Loop ────────────────────────────────────────────────────────
+
+async function collectCopilotResponse(openaiReq, token) {
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+    "User-Agent": USER_AGENT,
+    "Openai-Intent": "conversation-edits",
+  }
+  const bodyStr = JSON.stringify(openaiReq)
+  if (bodyStr.includes("image_url")) {
+    headers["Copilot-Vision-Request"] = "true"
+  }
+  const res = await fetch(`${COPILOT_API_BASE}/chat/completions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ...openaiReq, stream: false }),
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`Copilot ${res.status}: ${text}`)
+  }
+  return res.json()
+}
+
 async function handleWebSearchLoop(openaiReq, token, maxSearches) {
-  const contentBlocks = [] // Accumulated Anthropic content blocks
+  const contentBlocks = []
   let searchCount = 0
   let currentReq = { ...openaiReq }
   let lastResponse = null
 
   for (let iteration = 0; iteration < (maxSearches || 5) + 1; iteration++) {
-    const response = await collectCopilotResponse(currentReq, token)
-    lastResponse = response
+    lastResponse = await collectCopilotResponse(currentReq, token)
+    const choice = lastResponse.choices?.[0]
 
-    const choice = response.choices?.[0]
-    if (!choice) break
-
-    // Check if there's a web_search tool call
-    const webSearchCall = choice.message?.tool_calls?.find(
-      (tc) => tc.function?.name === "web_search"
+    const webSearchCall = choice?.message?.tool_calls?.find(
+      (tc) => tc.function?.name === "web_search",
     )
 
     if (!webSearchCall || searchCount >= (maxSearches || 5)) {
-      // No web search — we're done. Add any text content.
-      if (choice.message?.content) {
+      // No web search requested — append final content
+      if (choice?.message?.content) {
         contentBlocks.push({ type: "text", text: choice.message.content })
       }
-      // Add non-web-search tool calls if any
-      if (choice.message?.tool_calls) {
+      // Append any non-web-search tool calls
+      if (choice?.message?.tool_calls) {
         for (const tc of choice.message.tool_calls) {
+          if (tc.function?.name === "web_search") continue
+          let input = {}
+          try { input = JSON.parse(tc.function.arguments || "{}") } catch {}
           contentBlocks.push({
             type: "tool_use",
-            id: tc.id,
+            id: tc.id || `toolu_${Date.now()}`,
             name: tc.function.name,
-            input: (() => { try { return JSON.parse(tc.function.arguments) } catch { return {} } })(),
+            input,
           })
         }
       }
       break
     }
 
-    // We have a web_search tool call
+    // Execute web search
     searchCount++
     let searchQuery = ""
     try {
-      searchQuery = JSON.parse(webSearchCall.function.arguments)?.query || ""
+      const args = JSON.parse(webSearchCall.function.arguments || "{}")
+      searchQuery = args.query || args.q || ""
     } catch {
-      searchQuery = webSearchCall.function.arguments || ""
+      searchQuery = ""
     }
 
-    // Add any text before the search
-    if (choice.message?.content) {
-      contentBlocks.push({ type: "text", text: choice.message.content })
+    if (!searchQuery) {
+      contentBlocks.push({ type: "text", text: choice.message?.content || "" })
+      break
     }
 
-    // Add server_tool_use block (Anthropic format)
-    const toolUseId = `srvtoolu_${Date.now()}_${searchCount}`
+    const searchResults = await executeWebSearch(searchQuery)
+
+    // Add search tool use block
     contentBlocks.push({
       type: "server_tool_use",
-      id: toolUseId,
+      id: `srvtoolu_search_${searchCount}`,
       name: "web_search",
       input: { query: searchQuery },
     })
 
-    // Execute the search
-    const searchResults = await executeWebSearch(searchQuery)
-
-    // Add web_search_tool_result block
+    // Add search results block
     contentBlocks.push({
       type: "web_search_tool_result",
-      tool_use_id: toolUseId,
-      content: searchResults.length > 0 ? searchResults : {
-        type: "web_search_tool_result_error",
-        error_code: "unavailable",
-      },
+      tool_use_id: `srvtoolu_search_${searchCount}`,
+      content: searchResults,
     })
 
-    // Build search results text for the model
-    let searchResultsText = ""
-    if (searchResults.length > 0) {
-      searchResultsText = "Web search results:\n\n"
-      for (const r of searchResults) {
-        const content = Buffer.from(r.encrypted_content, "base64").toString("utf-8")
-        searchResultsText += `Title: ${r.title}\nURL: ${r.url}\nSnippet: ${content}\n\n`
-      }
-    } else {
-      searchResultsText = "Web search returned no results."
-    }
+    // Build follow-up messages with search results
+    const searchResultsText = searchResults
+      .map((r) => `[${r.title || r.url}](${r.url})\n${Buffer.from(r.encrypted_content, "base64").toString("utf8")}`)
+      .join("\n\n")
 
-    // Build follow-up messages: original + assistant's tool call + tool result
     const followUpMessages = [
       ...currentReq.messages,
       {
@@ -341,64 +477,48 @@ async function handleWebSearchLoop(openaiReq, token, maxSearches) {
       {
         role: "tool",
         tool_call_id: webSearchCall.id,
-        content: searchResultsText,
+        content: `Search results for "${searchQuery}":\n\n${searchResultsText}`,
       },
     ]
 
-    // Also add any other tool calls from this response (non-web-search)
-    const otherToolCalls = (choice.message?.tool_calls || []).filter(
-      (tc) => tc.function?.name !== "web_search"
-    )
-    // We'll handle these in the next iteration or final response
-
-    currentReq = { ...openaiReq, messages: followUpMessages }
+    currentReq = { ...currentReq, messages: followUpMessages }
   }
 
-  return { contentBlocks, lastResponse: lastResponse, searchCount }
+  return { contentBlocks, lastResponse, searchCount }
 }
 
 // ─── Model Mapping ──────────────────────────────────────────────────────────
 
 const MODEL_MAP = {
-  // Opus 4.6
   "claude-opus-4-6": "claude-opus-4.6",
   "claude-opus-4-6-20260214": "claude-opus-4.6",
   "claude-opus-4-6-latest": "claude-opus-4.6",
-  // Sonnet 4.5
   "claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
   "claude-sonnet-4-5": "claude-sonnet-4.5",
   "claude-sonnet-4-5-latest": "claude-sonnet-4.5",
-  // Sonnet 4
   "claude-sonnet-4-20250514": "claude-sonnet-4",
   "claude-sonnet-4": "claude-sonnet-4",
   "claude-3-5-sonnet-20241022": "claude-sonnet-4",
   "claude-3-5-sonnet-latest": "claude-sonnet-4",
-  // Opus 4.5
   "claude-opus-4-5": "claude-opus-4.5",
   "claude-opus-4-5-20251101": "claude-opus-4.5",
   "claude-opus-4-5-latest": "claude-opus-4.5",
-  // Opus 4.1
   "claude-opus-4-1": "claude-opus-41",
   "claude-opus-4-1-latest": "claude-opus-41",
-  // Haiku 4.5
   "claude-haiku-4-5": "claude-haiku-4.5",
   "claude-haiku-4-5-20251001": "claude-haiku-4.5",
   "claude-haiku-4-5-latest": "claude-haiku-4.5",
   "claude-haiku-4-20250414": "claude-haiku-4.5",
   "claude-3-5-haiku-20241022": "claude-haiku-4.5",
   "claude-3-haiku-20240307": "claude-haiku-4.5",
-  // Legacy opus
   "claude-opus-4-20250918": "claude-opus-4.5",
   "claude-3-opus-20240229": "claude-opus-4.5",
   "claude-3-5-opus-latest": "claude-opus-4.5",
 }
 
-// Fallback: try to intelligently map unknown model names
-function mapModel(anthropicModel) {
-  if (MODEL_MAP[anthropicModel]) return MODEL_MAP[anthropicModel]
-
-  // Try pattern matching for unknown dated versions
-  const m = anthropicModel.toLowerCase()
+function mapModel(model) {
+  if (MODEL_MAP[model]) return MODEL_MAP[model]
+  const m = model.toLowerCase()
   if (m.includes("opus") && (m.includes("4.6") || m.includes("4-6"))) return "claude-opus-4.6"
   if (m.includes("sonnet") && (m.includes("4.5") || m.includes("4-5"))) return "claude-sonnet-4.5"
   if (m.includes("sonnet")) return "claude-sonnet-4"
@@ -406,28 +526,26 @@ function mapModel(anthropicModel) {
   if (m.includes("opus") && (m.includes("4.1") || m.includes("4-1") || m.includes("41"))) return "claude-opus-41"
   if (m.includes("haiku")) return "claude-haiku-4.5"
   if (m.includes("opus")) return "claude-opus-4.6"
-
-  // Pass through as-is
-  return anthropicModel
+  return model
 }
 
-// ─── Auth ────────────────────────────────────────────────────────────────────
+// ─── Auth ───────────────────────────────────────────────────────────────────
 
 function loadAuth() {
   if (!existsSync(AUTH_FILE)) {
-    console.error(`✗ Auth file not found: ${AUTH_FILE}`)
-    console.error("  Run 'node scripts/auth.mjs' first to authenticate.")
+    console.error(`❌ Auth file not found: ${AUTH_FILE}`)
+    console.error("   Run: node scripts/auth.mjs")
     process.exit(1)
   }
-
   try {
-    const data = JSON.parse(readFileSync(AUTH_FILE, "utf-8"))
+    const data = JSON.parse(readFileSync(AUTH_FILE, "utf8"))
     if (!data.access_token) {
-      throw new Error("No access_token in auth file")
+      console.error("❌ No access_token in auth file")
+      process.exit(1)
     }
     return data.access_token
   } catch (err) {
-    console.error(`✗ Failed to read auth file: ${err.message}`)
+    console.error(`❌ Failed to parse auth file: ${err.message}`)
     process.exit(1)
   }
 }
@@ -435,162 +553,113 @@ function loadAuth() {
 // ─── Message Translation (Anthropic → OpenAI) ───────────────────────────────
 
 function translateContentPart(part) {
-  if (typeof part === "string") {
-    return { type: "text", text: part }
+  if (typeof part === "string") return { type: "text", text: part }
+  if (part.type === "text") return { type: "text", text: part.text }
+  if (part.type === "image") {
+    return {
+      type: "image_url",
+      image_url: { url: `data:${part.source.media_type};base64,${part.source.data}` },
+    }
   }
-
-  switch (part.type) {
-    case "text":
-      return { type: "text", text: part.text }
-    case "image":
-      return {
-        type: "image_url",
-        image_url: {
-          url: `data:${part.source.media_type};base64,${part.source.data}`,
-        },
-      }
-    case "tool_use":
-      return null // Handled separately
-    case "tool_result":
-      return null // Handled separately
-    default:
-      return { type: "text", text: JSON.stringify(part) }
-  }
+  if (part.type === "tool_use" || part.type === "tool_result") return null
+  return { type: "text", text: JSON.stringify(part) }
 }
 
 function translateMessages(anthropicMessages, system) {
-  const openaiMessages = []
+  const messages = []
 
-  // System message
+  // System prompt
   if (system) {
-    if (typeof system === "string") {
-      openaiMessages.push({ role: "system", content: system })
-    } else if (Array.isArray(system)) {
-      const systemText = system
-        .map((s) => {
-          if (typeof s === "string") return s
-          if (s.type === "text") return s.text
-          return JSON.stringify(s)
-        })
-        .join("\n\n")
-      openaiMessages.push({ role: "system", content: systemText })
-    }
+    const systemText = Array.isArray(system)
+      ? system.map((s) => (typeof s === "string" ? s : s.text || "")).join("\n\n")
+      : system
+    if (systemText) messages.push({ role: "system", content: systemText })
   }
 
   for (const msg of anthropicMessages) {
     if (msg.role === "user") {
       if (typeof msg.content === "string") {
-        openaiMessages.push({ role: "user", content: msg.content })
+        messages.push({ role: "user", content: msg.content })
       } else if (Array.isArray(msg.content)) {
-        // Check for tool_result blocks
         const toolResults = msg.content.filter((p) => p.type === "tool_result")
         const otherParts = msg.content.filter((p) => p.type !== "tool_result")
 
-        // Tool results become separate tool messages
-        for (const result of toolResults) {
-          let content
-          if (typeof result.content === "string") {
-            content = result.content
-          } else if (Array.isArray(result.content)) {
-            content = result.content
-              .map((p) => (p.type === "text" ? p.text : JSON.stringify(p)))
-              .join("\n")
-          } else {
-            content = JSON.stringify(result.content)
-          }
-
-          openaiMessages.push({
-            role: "tool",
-            tool_call_id: result.tool_use_id,
-            content: content || "",
-          })
+        for (const tr of toolResults) {
+          const content = typeof tr.content === "string"
+            ? tr.content
+            : Array.isArray(tr.content)
+              ? tr.content.map((c) => c.text || JSON.stringify(c)).join("\n")
+              : JSON.stringify(tr.content || "")
+          messages.push({ role: "tool", tool_call_id: tr.tool_use_id, content })
         }
 
-        // Format remaining content parts
         if (otherParts.length > 0) {
-          const parts = otherParts.map(translateContentPart).filter(Boolean)
-          if (parts.length === 1 && parts[0].type === "text") {
-            openaiMessages.push({ role: "user", content: parts[0].text })
-          } else if (parts.length > 0) {
-            openaiMessages.push({ role: "user", content: parts })
+          const translated = otherParts.map(translateContentPart).filter(Boolean)
+          if (translated.length > 0) {
+            messages.push({ role: "user", content: translated })
           }
         }
       }
     } else if (msg.role === "assistant") {
-      if (typeof msg.content === "string") {
-        openaiMessages.push({ role: "assistant", content: msg.content })
-      } else if (Array.isArray(msg.content)) {
-        const textParts = msg.content.filter((p) => p.type === "text")
-        const toolUses = msg.content.filter((p) => p.type === "tool_use")
-        // server_tool_use and web_search_tool_result are Anthropic web search blocks
-        // We strip them for Copilot and inject their content as context text
-        const serverToolUses = msg.content.filter((p) => p.type === "server_tool_use")
-        const webSearchResults = msg.content.filter((p) => p.type === "web_search_tool_result")
+      const assistantMsg = { role: "assistant" }
+      const textParts = []
+      const toolCalls = []
 
-        // Build text from regular text + web search context
-        let textContent = textParts.map((p) => p.text).join("\n")
+      const content = typeof msg.content === "string"
+        ? [{ type: "text", text: msg.content }]
+        : Array.isArray(msg.content) ? msg.content : []
 
-        // Include web search results as context for the model
-        for (const wsResult of webSearchResults) {
-          if (Array.isArray(wsResult.content)) {
-            for (const r of wsResult.content) {
-              if (r.type === "web_search_result" && r.title && r.url) {
-                textContent += `\n[Search result: ${r.title} - ${r.url}]`
-              }
-            }
-          }
-        }
-
-        const assistantMsg = {
-          role: "assistant",
-          content:
-            textContent.length > 0
-              ? textContent
-              : toolUses.length > 0
-                ? null
-                : "",
-        }
-
-        if (toolUses.length > 0) {
-          assistantMsg.tool_calls = toolUses.map((tu) => ({
-            id: tu.id,
+      for (const block of content) {
+        if (block.type === "text") {
+          textParts.push(block.text)
+        } else if (block.type === "tool_use") {
+          toolCalls.push({
+            id: block.id,
             type: "function",
             function: {
-              name: tu.name,
-              arguments: JSON.stringify(tu.input || {}),
+              name: block.name,
+              arguments: JSON.stringify(block.input || {}),
             },
-          }))
+          })
+        } else if (block.type === "server_tool_use") {
+          // Skip — handled internally
+        } else if (block.type === "web_search_tool_result") {
+          // Inline search results as context
+          if (Array.isArray(block.content)) {
+            const ctx = block.content
+              .map((r) => `[${r.title || r.url}](${r.url}): ${Buffer.from(r.encrypted_content || "", "base64").toString("utf8")}`)
+              .join("\n")
+            textParts.push(`[Search Results]\n${ctx}`)
+          }
         }
-
-        openaiMessages.push(assistantMsg)
       }
+
+      if (textParts.length > 0) assistantMsg.content = textParts.join("\n")
+      if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls
+      if (assistantMsg.content || assistantMsg.tool_calls) messages.push(assistantMsg)
     }
   }
 
-  return openaiMessages
+  return messages
 }
 
-// ─── Tool Translation ─────────────────────────────────────────────────────────
+// ─── Tool Translation ───────────────────────────────────────────────────────
 
 function translateTools(anthropicTools) {
   if (!anthropicTools || anthropicTools.length === 0) return undefined
-
-  return anthropicTools
-    .filter((tool) => tool.type !== "web_search_20250305") // Handled separately by proxy
-    .map((tool) => ({
+  const tools = anthropicTools
+    .filter((t) => t.type !== "web_search_20250305")
+    .map((t) => ({
       type: "function",
       function: {
-        name: tool.name,
-        description: tool.description || "",
-        parameters: tool.input_schema || { type: "object", properties: {} },
+        name: t.name,
+        description: t.description || "",
+        parameters: t.input_schema || { type: "object", properties: {} },
       },
     }))
+  return tools.length > 0 ? tools : undefined
 }
 
-/**
- * Check if the request includes a web_search tool and extract its config.
- * Returns { hasWebSearch, maxUses, allowedDomains, blockedDomains, userLocation }
- */
 function extractWebSearchConfig(anthropicTools) {
   if (!anthropicTools) return { hasWebSearch: false }
   const wsTool = anthropicTools.find((t) => t.type === "web_search_20250305")
@@ -608,57 +677,35 @@ function extractWebSearchConfig(anthropicTools) {
 
 function translateResponseToAnthropic(openaiResponse, model) {
   const choice = openaiResponse.choices?.[0]
-  if (!choice) {
-    return {
-      id: openaiResponse.id || `msg_${Date.now()}`,
-      type: "message",
-      role: "assistant",
-      model: model,
-      content: [],
-      stop_reason: "end_turn",
-      usage: {
-        input_tokens: openaiResponse.usage?.prompt_tokens || 0,
-        output_tokens: openaiResponse.usage?.completion_tokens || 0,
-      },
-    }
-  }
-
   const content = []
 
-  // Text content
-  if (choice.message?.content) {
+  if (choice?.message?.content) {
     content.push({ type: "text", text: choice.message.content })
   }
 
-  // Tool calls
-  if (choice.message?.tool_calls) {
+  if (choice?.message?.tool_calls) {
     for (const tc of choice.message.tool_calls) {
+      let input = {}
+      try { input = JSON.parse(tc.function.arguments || "{}") } catch {}
       content.push({
         type: "tool_use",
-        id: tc.id,
+        id: tc.id || `toolu_${Date.now()}`,
         name: tc.function.name,
-        input: (() => {
-          try {
-            return JSON.parse(tc.function.arguments)
-          } catch {
-            return {}
-          }
-        })(),
+        input,
       })
     }
   }
 
-  // Map finish reason
+  const finishReason = choice?.finish_reason
   let stopReason = "end_turn"
-  if (choice.finish_reason === "tool_calls") stopReason = "tool_use"
-  else if (choice.finish_reason === "length") stopReason = "max_tokens"
-  else if (choice.finish_reason === "content_filter") stopReason = "end_turn"
+  if (finishReason === "tool_calls") stopReason = "tool_use"
+  else if (finishReason === "length") stopReason = "max_tokens"
 
   return {
     id: openaiResponse.id || `msg_${Date.now()}`,
     type: "message",
     role: "assistant",
-    model: model,
+    model,
     content: content.length > 0 ? content : [{ type: "text", text: "" }],
     stop_reason: stopReason,
     stop_sequence: null,
@@ -678,82 +725,83 @@ function createStreamTranslator(model, res) {
   let inputTokens = 0
   let outputTokens = 0
   let sentStart = false
-  let toolCallBuffers = {} // id -> {name, arguments}
+  const toolCallBuffers = {}
+  let contentBlockIndex = 0
+  let _inTextBlock = false
 
   function sendSSE(event, data) {
-    const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
-    res.write(line)
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
   }
 
-  // Debug: log raw Copilot chunks
-  const DEBUG_STREAM = process.env.DEBUG_STREAM === "1"
-
   function sendStartIfNeeded() {
-    if (!sentStart) {
-      sentStart = true
-      sendSSE("message_start", {
-        type: "message_start",
-        message: {
-          id: messageId,
-          type: "message",
-          role: "assistant",
-          model: model,
-          content: [],
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
-        },
-      })
+    if (sentStart) return
+    sentStart = true
+    sendSSE("message_start", {
+      type: "message_start",
+      message: {
+        id: messageId,
+        type: "message",
+        role: "assistant",
+        model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: inputTokens, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+    })
+  }
+
+  function closeTextBlock() {
+    if (!_inTextBlock) return
+    _inTextBlock = false
+    sendSSE("content_block_stop", { type: "content_block_stop", index: contentBlockIndex })
+    contentBlockIndex++
+  }
+
+  function closeToolBlocks() {
+    for (const idx of Object.keys(toolCallBuffers)) {
+      sendSSE("content_block_stop", { type: "content_block_stop", index: parseInt(idx) })
     }
   }
 
-  let contentBlockIndex = 0
-
   return {
     processChunk(chunk) {
-      // Parse OpenAI SSE chunk
       if (!chunk || chunk === "[DONE]") {
-        // Send message_stop
+        sendStartIfNeeded()
+        closeTextBlock()
+        closeToolBlocks()
         sendSSE("message_delta", {
           type: "message_delta",
           delta: { stop_reason: "end_turn", stop_sequence: null },
           usage: { output_tokens: outputTokens },
         })
         sendSSE("message_stop", { type: "message_stop" })
-        return true // done
+        return true
       }
 
       let data
-      try {
-        data = typeof chunk === "string" ? JSON.parse(chunk) : chunk
-      } catch {
-        return false
-      }
+      try { data = typeof chunk === "string" ? JSON.parse(chunk) : chunk } catch { return false }
 
       sendStartIfNeeded()
 
+      if (data.id) messageId = data.id
       if (data.usage) {
         inputTokens = data.usage.prompt_tokens || inputTokens
         outputTokens = data.usage.completion_tokens || outputTokens
       }
 
-      const choice = data.choices?.[0]
-      if (!choice) return false
+      const delta = data.choices?.[0]?.delta
+      const finishReason = data.choices?.[0]?.finish_reason
 
-      const delta = choice.delta
-      if (DEBUG_STREAM) console.log(`  [stream] delta=${JSON.stringify(delta)?.substring(0, 120)} finish=${choice.finish_reason || ""}`)
-
-      // Text content
       if (delta?.content) {
-        if (!this._inTextBlock) {
+        if (!_inTextBlock) {
+          _inTextBlock = true
           sendSSE("content_block_start", {
             type: "content_block_start",
             index: contentBlockIndex,
             content_block: { type: "text", text: "" },
           })
-          this._inTextBlock = true
         }
-
         sendSSE("content_block_delta", {
           type: "content_block_delta",
           index: contentBlockIndex,
@@ -761,81 +809,39 @@ function createStreamTranslator(model, res) {
         })
       }
 
-      // Tool calls
       if (delta?.tool_calls) {
         for (const tc of delta.tool_calls) {
-          const tcIndex = tc.index ?? 0
-          const tcId = tc.id
-
-          if (tcId) {
-            // Close text block if open
-            if (this._inTextBlock) {
-              sendSSE("content_block_stop", {
-                type: "content_block_stop",
-                index: contentBlockIndex,
-              })
-              contentBlockIndex++
-              this._inTextBlock = false
-            }
-
-            // New tool call
-            toolCallBuffers[tcIndex] = {
-              id: tcId,
-              name: tc.function?.name || "",
-              arguments: tc.function?.arguments || "",
-            }
-
+          const idx = tc.index ?? Object.keys(toolCallBuffers).length
+          if (tc.id) {
+            closeTextBlock()
+            const blockIdx = contentBlockIndex
+            toolCallBuffers[blockIdx] = { id: tc.id, name: tc.function?.name || "", arguments: "" }
             sendSSE("content_block_start", {
               type: "content_block_start",
-              index: contentBlockIndex + tcIndex,
-              content_block: {
-                type: "tool_use",
-                id: tcId,
-                name: tc.function?.name || "",
-                input: {},
-              },
+              index: blockIdx,
+              content_block: { type: "tool_use", id: tc.id, name: tc.function?.name || "", input: {} },
             })
+            contentBlockIndex++
           } else if (tc.function?.arguments) {
-            // Continuation of tool call arguments
-            if (toolCallBuffers[tcIndex]) {
-              toolCallBuffers[tcIndex].arguments += tc.function.arguments
+            const bufIdx = Object.keys(toolCallBuffers).pop()
+            if (bufIdx !== undefined) {
+              toolCallBuffers[bufIdx].arguments += tc.function.arguments
+              sendSSE("content_block_delta", {
+                type: "content_block_delta",
+                index: parseInt(bufIdx),
+                delta: { type: "input_json_delta", partial_json: tc.function.arguments },
+              })
             }
-
-            sendSSE("content_block_delta", {
-              type: "content_block_delta",
-              index: contentBlockIndex + tcIndex,
-              delta: {
-                type: "input_json_delta",
-                partial_json: tc.function.arguments,
-              },
-            })
           }
         }
       }
 
-      // Handle finish
-      if (choice.finish_reason) {
-        // Close any open blocks
-        if (this._inTextBlock) {
-          sendSSE("content_block_stop", {
-            type: "content_block_stop",
-            index: contentBlockIndex,
-          })
-          this._inTextBlock = false
-        }
-
-        // Close tool call blocks
-        for (const idx of Object.keys(toolCallBuffers)) {
-          sendSSE("content_block_stop", {
-            type: "content_block_stop",
-            index: contentBlockIndex + parseInt(idx),
-          })
-        }
-
+      if (finishReason) {
+        closeTextBlock()
+        closeToolBlocks()
         let stopReason = "end_turn"
-        if (choice.finish_reason === "tool_calls") stopReason = "tool_use"
-        else if (choice.finish_reason === "length") stopReason = "max_tokens"
-
+        if (finishReason === "tool_calls") stopReason = "tool_use"
+        else if (finishReason === "length") stopReason = "max_tokens"
         sendSSE("message_delta", {
           type: "message_delta",
           delta: { stop_reason: stopReason, stop_sequence: null },
@@ -847,30 +853,20 @@ function createStreamTranslator(model, res) {
 
       return false
     },
-
-    _inTextBlock: false,
   }
 }
 
-// ─── Request Handler ─────────────────────────────────────────────────────────
+// ─── Request Handler ────────────────────────────────────────────────────────
 
 async function handleRequest(req, res, token) {
-  const url = req.url || ""
-  const method = req.method || "GET"
-
-  // Log every request for debugging
-  console.log(`[${new Date().toISOString()}] ${method} ${url}`)
+  const url = req.url || "/"
+  console.log(`[${new Date().toISOString()}] ${req.method} ${url}`)
 
   // CORS
   res.setHeader("Access-Control-Allow-Origin", "*")
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
   res.setHeader("Access-Control-Allow-Headers", "*")
-
-  if (method === "OPTIONS") {
-    res.writeHead(204)
-    res.end()
-    return
-  }
+  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return }
 
   // Health check
   if (url === "/health" || url === "/") {
@@ -879,359 +875,213 @@ async function handleRequest(req, res, token) {
     return
   }
 
-  // Handle messages endpoint - match any path ending in /messages or containing messages
-  const isMessagesEndpoint = url.includes("/messages")
-
-  // Handle token counting / tokenizer endpoints - Claude Code calls this
+  // Token counting
   if (url.includes("/count_tokens") || url.includes("/token")) {
-    // Read body to get token count request for accurate-ish estimation
-    let body = ""
-    for await (const chunk of req) {
-      body += chunk
-    }
-    let inputTokens = 0
-    try {
-      const data = JSON.parse(body)
-      // Rough estimation: ~4 chars per token
-      const text = JSON.stringify(data.messages || []) + JSON.stringify(data.system || "")
-      inputTokens = Math.ceil(text.length / 4)
-    } catch {}
-    console.log(`  ⚡ Token count → ~${inputTokens} tokens (estimated)`)
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const body = Buffer.concat(chunks).toString()
+    const inputTokens = Math.ceil(body.length / 4)
     res.writeHead(200, { "Content-Type": "application/json" })
     res.end(JSON.stringify({ input_tokens: inputTokens }))
     return
   }
 
-  // Handle models list endpoint — Claude Code may probe this
+  // Models
   if (url.includes("/models")) {
-    console.log(`  ⚡ Models endpoint hit — returning available models`)
     res.writeHead(200, { "Content-Type": "application/json" })
     res.end(JSON.stringify({
       data: [
         { id: "claude-opus-4-6", object: "model" },
-        { id: "claude-sonnet-4-5-20250929", object: "model" },
-        { id: "claude-sonnet-4-20250514", object: "model" },
-        { id: "claude-opus-4-5-20251101", object: "model" },
+        { id: "claude-sonnet-4-5", object: "model" },
+        { id: "claude-sonnet-4", object: "model" },
+        { id: "claude-opus-4-5", object: "model" },
         { id: "claude-haiku-4-5", object: "model" },
-      ]
+      ],
     }))
     return
   }
 
-  if (!isMessagesEndpoint) {
-    console.log(`  ⚠ Unhandled path: ${url}`)
+  // Messages endpoint
+  if (!url.includes("/messages")) {
     res.writeHead(404, { "Content-Type": "application/json" })
-    res.end(JSON.stringify({ error: `Not found: ${url}. Messages API is at /v1/messages` }))
+    res.end(JSON.stringify({ error: "Not found" }))
     return
   }
 
-  if (method !== "POST") {
+  if (req.method !== "POST") {
     res.writeHead(405, { "Content-Type": "application/json" })
     res.end(JSON.stringify({ error: "Method not allowed" }))
     return
   }
 
-  // Read request body
-  let body = ""
-  for await (const chunk of req) {
-    body += chunk
-  }
-
-  // Log key headers for debugging
-  console.log(`  Headers: anthropic-version=${req.headers["anthropic-version"] || "none"}, content-type=${req.headers["content-type"] || "none"}`)
-
-  let anthropicReq
   try {
-    anthropicReq = JSON.parse(body)
-  } catch {
-    res.writeHead(400, { "Content-Type": "application/json" })
-    res.end(JSON.stringify({ error: "Invalid JSON" }))
-    return
-  }
-
-  const copilotModel = mapModel(anthropicReq.model)
-  const isStream = anthropicReq.stream === true
-
-  // Check for web_search tool
-  const wsConfig = extractWebSearchConfig(anthropicReq.tools)
-  if (wsConfig.hasWebSearch) {
-    console.log(`  🔍 Web search enabled (max_uses: ${wsConfig.maxUses})`)
-  }
-
-  console.log(
-    `→ ${anthropicReq.model} → ${copilotModel} | ${isStream ? "stream" : "sync"} | ${anthropicReq.messages?.length || 0} messages${wsConfig.hasWebSearch ? " | 🔍 web_search" : ""}`
-  )
-
-  // Build OpenAI request
-  const openaiReq = {
-    model: copilotModel,
-    messages: translateMessages(anthropicReq.messages, anthropicReq.system),
-    max_tokens: anthropicReq.max_tokens || 4096,
-    stream: isStream,
-  }
-
-  if (anthropicReq.temperature !== undefined) {
-    openaiReq.temperature = anthropicReq.temperature
-  }
-
-  if (anthropicReq.top_p !== undefined) {
-    openaiReq.top_p = anthropicReq.top_p
-  }
-
-  if (anthropicReq.tools) {
-    openaiReq.tools = translateTools(anthropicReq.tools)
-    if (!openaiReq.tools || openaiReq.tools.length === 0) {
-      delete openaiReq.tools
+    // Parse request body
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const body = Buffer.concat(chunks).toString()
+    let anthropicReq
+    try {
+      anthropicReq = JSON.parse(body)
+    } catch {
+      res.writeHead(400, { "Content-Type": "application/json" })
+      res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "Invalid JSON" } }))
+      return
     }
-  }
 
-  // If web search is enabled, add the web_search function tool for Copilot
-  if (wsConfig.hasWebSearch) {
-    if (!openaiReq.tools) openaiReq.tools = []
-    openaiReq.tools.push({
-      type: "function",
-      function: {
-        name: "web_search",
-        description: "Search the web for current information. Use this when you need up-to-date facts, news, or information that may not be in your training data.",
-        parameters: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: "The search query to look up on the web",
-            },
-          },
-          required: ["query"],
-        },
-      },
-    })
-  }
+    const isStream = anthropicReq.stream === true
+    const copilotModel = mapModel(anthropicReq.model || "claude-sonnet-4")
+    const wsConfig = extractWebSearchConfig(anthropicReq.tools)
 
-  if (anthropicReq.stop_sequences) {
-    openaiReq.stop = anthropicReq.stop_sequences
-  }
+    // Build OpenAI request
+    const openaiReq = {
+      model: copilotModel,
+      messages: translateMessages(anthropicReq.messages || [], anthropicReq.system),
+      max_tokens: anthropicReq.max_tokens || 4096,
+      stream: isStream,
+    }
+    if (anthropicReq.temperature != null) openaiReq.temperature = anthropicReq.temperature
+    if (anthropicReq.top_p != null) openaiReq.top_p = anthropicReq.top_p
+    if (anthropicReq.stop_sequences) openaiReq.stop = anthropicReq.stop_sequences
 
-  // Determine if there are images (for Copilot vision header)
-  const hasImages = JSON.stringify(openaiReq.messages).includes("image_url")
+    const tools = translateTools(anthropicReq.tools)
+    if (tools) openaiReq.tools = tools
 
-  // Forward to Copilot
-  const headers = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${token}`,
-    "User-Agent": USER_AGENT,
-    "Openai-Intent": "conversation-edits",
-    "x-initiator": "user",
-  }
-
-  if (hasImages) {
-    headers["Copilot-Vision-Request"] = "true"
-  }
-
-  try {
-    // ── Web Search Path: use internal loop (always non-streaming internally) ──
+    // Add web_search tool for Copilot if Anthropic request uses it
     if (wsConfig.hasWebSearch) {
-      console.log(`  ⚡ Using web search loop (internally non-streaming)`)
-      try {
-        const { contentBlocks, lastResponse, searchCount } = await handleWebSearchLoop(
-          openaiReq, token, wsConfig.maxUses
-        )
-
-        const usage = lastResponse?.usage || {}
-        const anthropicResponse = {
-          id: lastResponse?.id || `msg_${Date.now()}`,
-          type: "message",
-          role: "assistant",
-          model: anthropicReq.model,
-          content: contentBlocks.length > 0 ? contentBlocks : [{ type: "text", text: "" }],
-          stop_reason: contentBlocks.some((b) => b.type === "tool_use") ? "tool_use" : "end_turn",
-          stop_sequence: null,
-          usage: {
-            input_tokens: usage.prompt_tokens || 0,
-            output_tokens: usage.completion_tokens || 0,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            server_tool_use: searchCount > 0 ? { web_search_requests: searchCount } : undefined,
+      if (!openaiReq.tools) openaiReq.tools = []
+      openaiReq.tools.push({
+        type: "function",
+        function: {
+          name: "web_search",
+          description: "Search the web for up-to-date facts, news, or information. Use when you need current data.",
+          parameters: {
+            type: "object",
+            properties: { query: { type: "string", description: "Search query" } },
+            required: ["query"],
           },
-        }
+        },
+      })
+    }
+
+    const hasImages = JSON.stringify(openaiReq.messages).includes("image_url")
+
+    // ── Web Search Path ──
+    if (wsConfig.hasWebSearch) {
+      try {
+        const { contentBlocks, lastResponse, searchCount } = await handleWebSearchLoop(openaiReq, token, wsConfig.maxUses)
 
         if (isStream) {
-          // Emit the response as streaming SSE events
           res.writeHead(200, {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             Connection: "keep-alive",
           })
 
+          const msgId = `msg_${Date.now()}`
+          const usage = lastResponse?.usage || {}
+
           // message_start
-          const startEvent = `event: message_start\ndata: ${JSON.stringify({
+          res.write(`event: message_start\ndata: ${JSON.stringify({
             type: "message_start",
             message: {
-              id: anthropicResponse.id,
-              type: "message",
-              role: "assistant",
-              model: anthropicReq.model,
-              content: [],
-              stop_reason: null,
-              stop_sequence: null,
-              usage: { input_tokens: anthropicResponse.usage.input_tokens, output_tokens: 0 },
+              id: msgId, type: "message", role: "assistant", model: anthropicReq.model,
+              content: [], stop_reason: null, stop_sequence: null,
+              usage: { input_tokens: usage.prompt_tokens || 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
             },
-          })}\n\n`
-          res.write(startEvent)
-
-          // Emit each content block
-          for (let i = 0; i < contentBlocks.length; i++) {
-            const block = contentBlocks[i]
-
-            if (block.type === "text") {
-              // content_block_start
-              res.write(`event: content_block_start\ndata: ${JSON.stringify({
-                type: "content_block_start",
-                index: i,
-                content_block: { type: "text", text: "" },
-              })}\n\n`)
-
-              // content_block_delta - send text in chunks for natural streaming feel
-              const chunkSize = 50
-              for (let j = 0; j < block.text.length; j += chunkSize) {
-                const textChunk = block.text.substring(j, j + chunkSize)
-                res.write(`event: content_block_delta\ndata: ${JSON.stringify({
-                  type: "content_block_delta",
-                  index: i,
-                  delta: { type: "text_delta", text: textChunk },
-                })}\n\n`)
-              }
-
-              // content_block_stop
-              res.write(`event: content_block_stop\ndata: ${JSON.stringify({
-                type: "content_block_stop",
-                index: i,
-              })}\n\n`)
-            } else if (block.type === "server_tool_use") {
-              // Emit server_tool_use block
-              res.write(`event: content_block_start\ndata: ${JSON.stringify({
-                type: "content_block_start",
-                index: i,
-                content_block: {
-                  type: "server_tool_use",
-                  id: block.id,
-                  name: block.name,
-                  input: {},
-                },
-              })}\n\n`)
-
-              // Emit the query as input_json_delta
-              res.write(`event: content_block_delta\ndata: ${JSON.stringify({
-                type: "content_block_delta",
-                index: i,
-                delta: {
-                  type: "input_json_delta",
-                  partial_json: JSON.stringify(block.input),
-                },
-              })}\n\n`)
-
-              res.write(`event: content_block_stop\ndata: ${JSON.stringify({
-                type: "content_block_stop",
-                index: i,
-              })}\n\n`)
-            } else if (block.type === "web_search_tool_result") {
-              // Emit web_search_tool_result block
-              res.write(`event: content_block_start\ndata: ${JSON.stringify({
-                type: "content_block_start",
-                index: i,
-                content_block: block,
-              })}\n\n`)
-
-              res.write(`event: content_block_stop\ndata: ${JSON.stringify({
-                type: "content_block_stop",
-                index: i,
-              })}\n\n`)
-            } else if (block.type === "tool_use") {
-              // Regular tool use
-              res.write(`event: content_block_start\ndata: ${JSON.stringify({
-                type: "content_block_start",
-                index: i,
-                content_block: { type: "tool_use", id: block.id, name: block.name, input: {} },
-              })}\n\n`)
-
-              res.write(`event: content_block_delta\ndata: ${JSON.stringify({
-                type: "content_block_delta",
-                index: i,
-                delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) },
-              })}\n\n`)
-
-              res.write(`event: content_block_stop\ndata: ${JSON.stringify({
-                type: "content_block_stop",
-                index: i,
-              })}\n\n`)
-            }
-          }
-
-          // message_delta
-          res.write(`event: message_delta\ndata: ${JSON.stringify({
-            type: "message_delta",
-            delta: { stop_reason: anthropicResponse.stop_reason, stop_sequence: null },
-            usage: { output_tokens: anthropicResponse.usage.output_tokens },
           })}\n\n`)
 
-          // message_stop
+          // Emit content blocks
+          let blockIdx = 0
+          for (const block of contentBlocks) {
+            if (block.type === "text") {
+              res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: blockIdx, content_block: { type: "text", text: "" } })}\n\n`)
+              // Send text in chunks
+              const text = block.text || ""
+              for (let i = 0; i < text.length; i += 50) {
+                res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: blockIdx, delta: { type: "text_delta", text: text.slice(i, i + 50) } })}\n\n`)
+              }
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIdx })}\n\n`)
+            } else if (block.type === "server_tool_use") {
+              res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: blockIdx, content_block: { type: "server_tool_use", id: block.id, name: block.name, input: {} } })}\n\n`)
+              res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } })}\n\n`)
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIdx })}\n\n`)
+            } else if (block.type === "web_search_tool_result") {
+              res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: blockIdx, content_block: block })}\n\n`)
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIdx })}\n\n`)
+            } else if (block.type === "tool_use") {
+              res.write(`event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: blockIdx, content_block: { type: "tool_use", id: block.id, name: block.name, input: {} } })}\n\n`)
+              res.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: blockIdx, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } })}\n\n`)
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIdx })}\n\n`)
+            }
+            blockIdx++
+          }
+
+          // Determine stop reason
+          const hasToolUse = contentBlocks.some((b) => b.type === "tool_use")
+          const stopReason = hasToolUse ? "tool_use" : "end_turn"
+
+          res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: usage.completion_tokens || 0 } })}\n\n`)
           res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`)
           res.end()
         } else {
-          // Non-streaming: return the full response
+          // Non-streaming web search response
+          const hasToolUse = contentBlocks.some((b) => b.type === "tool_use")
+          const usage = lastResponse?.usage || {}
+          const response = {
+            id: `msg_${Date.now()}`,
+            type: "message",
+            role: "assistant",
+            model: anthropicReq.model,
+            content: contentBlocks,
+            stop_reason: hasToolUse ? "tool_use" : "end_turn",
+            stop_sequence: null,
+            usage: {
+              input_tokens: usage.prompt_tokens || 0,
+              output_tokens: usage.completion_tokens || 0,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+            },
+          }
           res.writeHead(200, { "Content-Type": "application/json" })
-          res.end(JSON.stringify(anthropicResponse))
+          res.end(JSON.stringify(response))
         }
-
-        console.log(`  ✓ Response sent (${searchCount} web searches performed)`)
         return
       } catch (err) {
-        console.error(`✗ Web search loop error: ${err.message}`)
-        // Fall through to normal path without web search
-        console.log(`  ↓ Falling back to normal path without web search`)
-        if (openaiReq.tools) {
-          openaiReq.tools = openaiReq.tools.filter((t) => t.function?.name !== "web_search")
-          if (openaiReq.tools.length === 0) delete openaiReq.tools
-        }
+        console.warn(`⚠ Web search loop error: ${err.message}, falling back to normal path`)
+        // Remove web_search tool and fall through
+        openaiReq.tools = (openaiReq.tools || []).filter((t) => t.function?.name !== "web_search")
+        if (openaiReq.tools.length === 0) delete openaiReq.tools
       }
     }
 
-    // ── Normal Path (no web search) ──
-    const copilotRes = await fetch(
-      `${COPILOT_API_BASE}/chat/completions`,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify(openaiReq),
-      }
-    )
+    // ── Normal (non-web-search) Path ──
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "User-Agent": USER_AGENT,
+      "Openai-Intent": "conversation-edits",
+    }
+    if (hasImages) headers["Copilot-Vision-Request"] = "true"
+
+    const copilotRes = await fetch(`${COPILOT_API_BASE}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(openaiReq),
+    })
 
     if (!copilotRes.ok) {
-      const errorText = await copilotRes.text()
-      console.error(`✗ Copilot API error: ${copilotRes.status} ${errorText}`)
+      const errText = await copilotRes.text()
+      let errType = "api_error"
+      if (copilotRes.status === 401) errType = "authentication_error"
+      else if (copilotRes.status === 429) errType = "rate_limit_error"
+      else if (copilotRes.status === 403) errType = "permission_error"
 
-      // Translate to Anthropic error format
       res.writeHead(copilotRes.status, { "Content-Type": "application/json" })
-      res.end(
-        JSON.stringify({
-          type: "error",
-          error: {
-            type:
-              copilotRes.status === 401
-                ? "authentication_error"
-                : copilotRes.status === 429
-                  ? "rate_limit_error"
-                  : copilotRes.status === 403
-                    ? "permission_error"
-                    : "api_error",
-            message: `Copilot API error (${copilotRes.status}): ${errorText}`,
-          },
-        })
-      )
+      res.end(JSON.stringify({ type: "error", error: { type: errType, message: errText } }))
       return
     }
 
     if (isStream) {
-      // Streaming response
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -1239,120 +1089,85 @@ async function handleRequest(req, res, token) {
       })
 
       const translator = createStreamTranslator(anthropicReq.model, res)
-
       const reader = copilotRes.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ""
 
       while (true) {
         const { done, value } = await reader.read()
-        if (done) break
+        if (done) {
+          translator.processChunk(null)
+          break
+        }
 
         buffer += decoder.decode(value, { stream: true })
         const lines = buffer.split("\n")
         buffer = lines.pop() || ""
 
         for (const line of lines) {
-          if (!line.startsWith("data: ")) continue
-          const data = line.slice(6).trim()
-
+          const trimmed = line.trim()
+          if (!trimmed || !trimmed.startsWith("data: ")) continue
+          const data = trimmed.slice(6)
           if (data === "[DONE]") {
             translator.processChunk("[DONE]")
-            res.end()
-            return
+            break
           }
-
           try {
             const parsed = JSON.parse(data)
             const isDone = translator.processChunk(parsed)
-            if (isDone) {
-              res.end()
-              return
-            }
-          } catch {
-            // Skip unparseable chunks
-          }
+            if (isDone) break
+          } catch { continue }
         }
       }
 
-      // If we get here without [DONE], clean up
-      translator.processChunk("[DONE]")
       res.end()
     } else {
-      // Non-streaming response
-      const openaiData = await copilotRes.json()
-      const anthropicRes = translateResponseToAnthropic(
-        openaiData,
-        anthropicReq.model
-      )
-
+      const data = await copilotRes.json()
+      const response = translateResponseToAnthropic(data, anthropicReq.model)
       res.writeHead(200, { "Content-Type": "application/json" })
-      res.end(JSON.stringify(anthropicRes))
+      res.end(JSON.stringify(response))
     }
-
-    console.log(`  ✓ Response sent`)
   } catch (err) {
-    console.error(`✗ Proxy error: ${err.message}`)
+    console.error(`❌ Error: ${err.message}`)
     res.writeHead(500, { "Content-Type": "application/json" })
-    res.end(
-      JSON.stringify({
-        type: "error",
-        error: {
-          type: "api_error",
-          message: `Proxy error: ${err.message}`,
-        },
-      })
-    )
+    res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: err.message } }))
   }
 }
 
-// ─── Server ──────────────────────────────────────────────────────────────────
+// ─── Server Setup ───────────────────────────────────────────────────────────
 
 const token = loadAuth()
-console.log()
-console.log("╔══════════════════════════════════════════════════════════╗")
-console.log("║   GitHub Copilot Proxy for Claude Code                  ║")
-console.log("╚══════════════════════════════════════════════════════════╝")
-console.log()
-
 const server = createServer((req, res) => handleRequest(req, res, token))
 
 server.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
-    console.error(`✗ Port ${PORT} is already in use.`)
-    console.error(`  Kill the existing process:  lsof -ti:${PORT} | xargs kill -9`)
-    console.error(`  Or use a different port:    COPILOT_PROXY_PORT=18081 node scripts/proxy.mjs`)
-  } else {
-    console.error(`✗ Server error: ${err.message}`)
+    console.error(`❌ Port ${PORT} is already in use`)
+    console.error(`   Try: lsof -i :${PORT}  or  COPILOT_PROXY_PORT=18081 node scripts/proxy.mjs`)
+    process.exit(1)
   }
-  process.exit(1)
+  throw err
 })
 
 server.listen(PORT, () => {
-  console.log(`✓ Proxy server running on http://localhost:${PORT}`)
-  console.log()
-  console.log("  Translates: Anthropic Messages API → Copilot Chat Completions API")
-  console.log()
+  console.log("┌─────────────────────────────────────────────┐")
+  console.log("│  Claude Code ↔ GitHub Copilot Proxy         │")
+  console.log("├─────────────────────────────────────────────┤")
+  console.log(`│  Port: ${PORT}                              │`)
+  console.log(`│  Search: Exa/Parallel MCP + DDG fallback    │`)
   if (BRAVE_API_KEY) {
-    console.log("  🔍 Web Search: Brave Search API (configured)")
-  } else {
-    console.log("  🔍 Web Search: DuckDuckGo Lite (free, no API key)")
-    console.log("     For better results, set BRAVE_API_KEY (free at https://api.search.brave.com/)")
+    console.log("│  Brave: ✓ (primary)                         │")
   }
-  console.log()
-  console.log("  Use Claude Code with:")
-  console.log(
-    `  ANTHROPIC_BASE_URL=http://localhost:${PORT} ANTHROPIC_API_KEY=copilot-proxy claude`
-  )
-  console.log()
-  console.log("  Press Ctrl+C to stop")
-  console.log()
-  console.log("─".repeat(60))
+  if (WEBSEARCH_PROVIDER) {
+    console.log(`│  Provider override: ${WEBSEARCH_PROVIDER.padEnd(23)}│`)
+  }
+  console.log("├─────────────────────────────────────────────┤")
+  console.log(`│  ANTHROPIC_BASE_URL=http://localhost:${PORT}  │`)
+  console.log("│  ANTHROPIC_API_KEY=copilot-proxy             │")
+  console.log("└─────────────────────────────────────────────┘")
 })
 
-// Graceful shutdown
 process.on("SIGINT", () => {
-  console.log("\n\nShutting down proxy server...")
+  console.log("\nShutting down proxy server...")
   server.close()
   process.exit(0)
 })
