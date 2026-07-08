@@ -932,6 +932,8 @@ async function handleRequest(req, res, token) {
     const copilotModel = mapModel(anthropicReq.model || "claude-sonnet-4")
     const wsConfig = extractWebSearchConfig(anthropicReq.tools)
 
+    console.log(`  → model: ${anthropicReq.model} → ${copilotModel} | stream: ${isStream} | max_tokens: ${anthropicReq.max_tokens || 4096}${wsConfig.hasWebSearch ? " | web_search: enabled" : ""}`)
+
     // Build OpenAI request
     const openaiReq = {
       model: copilotModel,
@@ -1023,6 +1025,7 @@ async function handleRequest(req, res, token) {
           res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: usage.completion_tokens || 0 } })}\n\n`)
           res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`)
           res.end()
+          console.log(`  ← stream ${stopReason} | in: ${usage.prompt_tokens || 0} out: ${usage.completion_tokens || 0} | blocks: ${contentBlocks.length} | searches: ${searchCount}`)
         } else {
           // Non-streaming web search response
           const hasToolUse = contentBlocks.some((b) => b.type === "tool_use")
@@ -1044,6 +1047,7 @@ async function handleRequest(req, res, token) {
           }
           res.writeHead(200, { "Content-Type": "application/json" })
           res.end(JSON.stringify(response))
+          console.log(`  ← ${response.stop_reason} | in: ${response.usage.input_tokens} out: ${response.usage.output_tokens} | blocks: ${contentBlocks.length} | searches: ${searchCount}`)
         }
         return
       } catch (err) {
@@ -1121,11 +1125,13 @@ async function handleRequest(req, res, token) {
       }
 
       res.end()
+      console.log(`  ← stream complete`)
     } else {
       const data = await copilotRes.json()
       const response = translateResponseToAnthropic(data, anthropicReq.model)
       res.writeHead(200, { "Content-Type": "application/json" })
       res.end(JSON.stringify(response))
+      console.log(`  ← ${response.stop_reason} | in: ${response.usage.input_tokens} out: ${response.usage.output_tokens}`)
     }
   } catch (err) {
     console.error(`❌ Error: ${err.message}`)
