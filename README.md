@@ -63,10 +63,16 @@ The proxy emulates Anthropic's web search tool so Claude Code's WebSearch works 
 
 **Search providers (priority order):**
 
-1. **Brave Search API** — Best results. Set `BRAVE_API_KEY` env var (free tier at [api.search.brave.com](https://api.search.brave.com/))
-2. **Exa / Parallel MCP** — Free, no API key needed (default). Uses the same MCP-based search endpoints as [OpenCode](https://github.com/anomalyco/opencode). Traffic is split 50/50 between providers for reliability, with automatic cross-fallback.
-3. **DuckDuckGo Lite** — Scraping fallback (may hit CAPTCHAs under heavy use)
-4. **DuckDuckGo Instant Answer** — Last resort (limited to knowledge-graph results)
+1. **Exa / Parallel MCP** — Free, no API key needed (default). Uses the same MCP-based search endpoints as [OpenCode](https://github.com/anomalyco/opencode). Traffic is split 50/50 between providers for reliability, with automatic cross-fallback.
+2. **Brave Search API** — Best results quality. Set `BRAVE_API_KEY` env var (free $5/mo credit at [brave.com/search/api](https://brave.com/search/api/))
+3. **Serper.dev** — Google SERP results as fallback. Set `SERPER_API_KEY` env var (2,500 free queries at [serper.dev](https://serper.dev/), no credit card required)
+4. **DuckDuckGo Lite** — Scraping fallback (may hit CAPTCHAs under heavy use)
+5. **DuckDuckGo Instant Answer** — Last resort (limited to knowledge-graph results)
+
+**Rate-limit protection (for multi-agent workflows):**
+
+- **Search cache** — 5-minute TTL; identical queries from parallel subagents return cached results instantly
+- **Concurrency semaphore** — max 2 concurrent search requests; excess searches queue automatically, preventing DDG/API rate-limit storms
 
 You can force a specific MCP provider with `WEBSEARCH_PROVIDER=exa` or `WEBSEARCH_PROVIDER=parallel`.
 
@@ -100,7 +106,8 @@ ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY=copilot-proxy claude
 |---|---|---|
 | `COPILOT_PROXY_PORT` | `18080` | Port for the local proxy |
 | `COPILOT_AUTH_FILE` | `~/.claude-copilot-auth.json` | Path to saved OAuth token |
-| `BRAVE_API_KEY` | *(none)* | Brave Search API key for web search (highest priority) |
+| `SERPER_API_KEY` | *(none)* | Serper.dev API key — Google SERP fallback (free 2,500 queries at [serper.dev](https://serper.dev/)) |
+| `BRAVE_API_KEY` | *(none)* | Brave Search API key (free $5/mo credit at [brave.com/search/api](https://brave.com/search/api/)) |
 | `WEBSEARCH_PROVIDER` | *(auto)* | Force MCP provider: `exa` or `parallel` (default: 50/50 split) |
 | `EXA_API_KEY` | *(none)* | Optional API key for Exa (works without one) |
 | `PARALLEL_API_KEY` | *(none)* | Optional API key for Parallel (works without one) |
