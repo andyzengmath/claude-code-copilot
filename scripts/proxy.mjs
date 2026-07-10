@@ -24,6 +24,7 @@ const AUTH_FILE = process.env.COPILOT_AUTH_FILE || join(homedir(), ".claude-copi
 const COPILOT_API_BASE = "https://api.githubcopilot.com"
 const USER_AGENT = "claude-code-copilot-provider/1.0.0"
 const BRAVE_API_KEY = process.env.BRAVE_API_KEY || ""
+const SERPER_API_KEY = process.env.SERPER_API_KEY || ""
 const WEB_SEARCH_MAX_RESULTS = parseInt(process.env.WEB_SEARCH_MAX_RESULTS || "5", 10)
 
 // ─── Web Search: MCP Providers (Exa + Parallel) ────────────────────────────
@@ -244,6 +245,42 @@ async function braveSearch(query) {
   }
 }
 
+// ─── Web Search: Serper (Google SERP API) ───────────────────────────────────
+
+async function serperSearch(query) {
+  try {
+    const res = await fetch("https://google.serper.dev/search", {
+      method: "POST",
+      headers: {
+        "X-API-KEY": SERPER_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ q: query, num: WEB_SEARCH_MAX_RESULTS }),
+    })
+    if (!res.ok) {
+      console.warn(`⚠ Serper HTTP error: ${res.status}`)
+      return null
+    }
+    const data = await res.json()
+    const organic = data.organic || []
+    const results = organic.slice(0, WEB_SEARCH_MAX_RESULTS).map((r) => ({
+      type: "web_search_result",
+      url: r.link || "",
+      title: r.title || "",
+      encrypted_content: Buffer.from(r.snippet || "").toString("base64"),
+      page_age: null,
+    }))
+    if (results.length > 0) {
+      console.log(`✓ Serper returned ${results.length} results`)
+      return results
+    }
+    return null
+  } catch (err) {
+    console.warn(`⚠ Serper error: ${err.message}`)
+    return null
+  }
+}
+
 // ─── Web Search: DuckDuckGo Fallback ────────────────────────────────────────
 
 async function duckDuckGoLiteSearch(query) {
@@ -341,32 +378,76 @@ async function duckDuckGoInstantAnswer(query) {
 
 // ─── Web Search: Main Orchestrator ──────────────────────────────────────────
 
+// Search result cache (deduplicates identical queries across parallel agents)
+const searchCache = new Map()
+const SEARCH_CACHE_TTL = 5 * 60 * 1000 // 5 minutes
+
+// Concurrency semaphore (prevents DDG/API rate-limit storms from parallel agents)
+const MAX_CONCURRENT_SEARCHES = 2
+let activeSearchCount = 0
+const searchWaitQueue = []
+
 async function executeWebSearch(query) {
   console.log(`🔍 Web search: "${query}"`)
 
-  // 1. Brave (if configured)
-  if (BRAVE_API_KEY) {
-    const results = await braveSearch(query)
-    if (results && results.length > 0) return results
-    console.warn("⚠ Brave failed, trying MCP providers...")
-  }
-
-  // 2. Exa/Parallel MCP (primary)
+  // 1. Exa/Parallel MCP (primary — free, no quota)
   const mcpResults = await mcpSearch(query)
   if (mcpResults && mcpResults.length > 0) return mcpResults
 
-  // 3. DuckDuckGo Lite (fallback)
-  console.warn("⚠ MCP providers failed, trying DuckDuckGo Lite...")
+  // 2. Brave (if configured)
+  if (BRAVE_API_KEY) {
+    console.warn("⚠ MCP providers failed, trying Brave...")
+    const results = await braveSearch(query)
+    if (results && results.length > 0) return results
+  }
+
+  // 3. Serper (if configured — paid fallback, saves free credits)
+  if (SERPER_API_KEY) {
+    console.warn("⚠ Trying Serper (Google SERP)...")
+    const results = await serperSearch(query)
+    if (results && results.length > 0) return results
+  }
+
+  // 4. DuckDuckGo Lite (free fallback)
+  console.warn("⚠ Trying DuckDuckGo Lite...")
   const ddgLiteResults = await duckDuckGoLiteSearch(query)
   if (ddgLiteResults && ddgLiteResults.length > 0) return ddgLiteResults
 
-  // 4. DuckDuckGo Instant Answer (last resort)
+  // 5. DuckDuckGo Instant Answer (last resort)
   console.warn("⚠ DDG Lite failed, trying Instant Answer API...")
   const instantResults = await duckDuckGoInstantAnswer(query)
   if (instantResults && instantResults.length > 0) return instantResults
 
   console.warn("⚠ All search providers failed")
   return []
+}
+
+// Throttled wrapper: cache + concurrency gate
+async function executeWebSearchThrottled(query) {
+  // Check cache first
+  const cached = searchCache.get(query)
+  if (cached && Date.now() - cached.ts < SEARCH_CACHE_TTL) {
+    console.log(`📋 Search cache hit: "${query.slice(0, 50)}..."`)
+    return cached.results
+  }
+
+  // Concurrency gate — wait if too many searches are in flight
+  if (activeSearchCount >= MAX_CONCURRENT_SEARCHES) {
+    console.log(`⏳ Search queued (${activeSearchCount}/${MAX_CONCURRENT_SEARCHES} active): "${query.slice(0, 50)}..."`)
+    await new Promise((resolve) => searchWaitQueue.push(resolve))
+  }
+  activeSearchCount++
+  try {
+    const results = await executeWebSearch(query)
+    // Cache the results (even empty ones, to avoid re-hitting a failing provider)
+    searchCache.set(query, { results, ts: Date.now() })
+    return results
+  } finally {
+    activeSearchCount--
+    if (searchWaitQueue.length > 0) {
+      searchWaitQueue.shift()()
+    }
+  }
 }
 
 // ─── Web Search Loop ────────────────────────────────────────────────────────
@@ -445,7 +526,7 @@ async function handleWebSearchLoop(openaiReq, token, maxSearches) {
       break
     }
 
-    const searchResults = await executeWebSearch(searchQuery)
+    const searchResults = await executeWebSearchThrottled(searchQuery)
 
     // Add search tool use block
     contentBlocks.push({
