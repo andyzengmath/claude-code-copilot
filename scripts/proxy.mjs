@@ -571,6 +571,9 @@ async function handleWebSearchLoop(openaiReq, token, maxSearches) {
 // ─── Model Mapping ──────────────────────────────────────────────────────────
 
 const MODEL_MAP = {
+  "claude-opus-4-8": "claude-opus-4.8",
+  "claude-opus-4-8-20260610": "claude-opus-4.8",
+  "claude-opus-4-8-latest": "claude-opus-4.8",
   "claude-opus-4-6": "claude-opus-4.6",
   "claude-opus-4-6-20260214": "claude-opus-4.6",
   "claude-opus-4-6-latest": "claude-opus-4.6",
@@ -600,13 +603,14 @@ const MODEL_MAP = {
 function mapModel(model) {
   if (MODEL_MAP[model]) return MODEL_MAP[model]
   const m = model.toLowerCase()
+  if (m.includes("opus") && (m.includes("4.8") || m.includes("4-8"))) return "claude-opus-4.8"
   if (m.includes("opus") && (m.includes("4.6") || m.includes("4-6"))) return "claude-opus-4.6"
   if (m.includes("sonnet") && (m.includes("4.5") || m.includes("4-5"))) return "claude-sonnet-4.5"
   if (m.includes("sonnet")) return "claude-sonnet-4"
   if (m.includes("opus") && (m.includes("4.5") || m.includes("4-5"))) return "claude-opus-4.5"
   if (m.includes("opus") && (m.includes("4.1") || m.includes("4-1") || m.includes("41"))) return "claude-opus-41"
   if (m.includes("haiku")) return "claude-haiku-4.5"
-  if (m.includes("opus")) return "claude-opus-4.6"
+  if (m.includes("opus")) return "claude-opus-4.8"
   return model
 }
 
@@ -854,7 +858,7 @@ function createStreamTranslator(model, res) {
         sendSSE("message_delta", {
           type: "message_delta",
           delta: { stop_reason: "end_turn", stop_sequence: null },
-          usage: { output_tokens: outputTokens },
+          usage: { input_tokens: inputTokens, output_tokens: outputTokens },
         })
         sendSSE("message_stop", { type: "message_stop" })
         return true
@@ -863,13 +867,13 @@ function createStreamTranslator(model, res) {
       let data
       try { data = typeof chunk === "string" ? JSON.parse(chunk) : chunk } catch { return false }
 
-      sendStartIfNeeded()
-
       if (data.id) messageId = data.id
       if (data.usage) {
-        inputTokens = data.usage.prompt_tokens || inputTokens
-        outputTokens = data.usage.completion_tokens || outputTokens
+        inputTokens = data.usage.prompt_tokens ?? inputTokens
+        outputTokens = data.usage.completion_tokens ?? outputTokens
       }
+
+      sendStartIfNeeded()
 
       const delta = data.choices?.[0]?.delta
       const finishReason = data.choices?.[0]?.finish_reason
@@ -926,7 +930,7 @@ function createStreamTranslator(model, res) {
         sendSSE("message_delta", {
           type: "message_delta",
           delta: { stop_reason: stopReason, stop_sequence: null },
-          usage: { output_tokens: outputTokens },
+          usage: { input_tokens: inputTokens, output_tokens: outputTokens },
         })
         sendSSE("message_stop", { type: "message_stop" })
         return true
@@ -1101,7 +1105,7 @@ async function handleRequest(req, res, token) {
           const hasToolUse = contentBlocks.some((b) => b.type === "tool_use")
           const stopReason = hasToolUse ? "tool_use" : "end_turn"
 
-          res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: usage.completion_tokens || 0 } })}\n\n`)
+          res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { input_tokens: usage.prompt_tokens || 0, output_tokens: usage.completion_tokens || 0 } })}\n\n`)
           res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`)
           res.end()
         } else {
