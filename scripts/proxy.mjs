@@ -810,6 +810,7 @@ function createStreamTranslator(model, res) {
   let inputTokens = 0
   let outputTokens = 0
   let sentStart = false
+  let sentStop = false
   const toolCallBuffers = {}
   let contentBlockIndex = 0
   let _inTextBlock = false
@@ -852,6 +853,8 @@ function createStreamTranslator(model, res) {
   return {
     processChunk(chunk) {
       if (!chunk || chunk === "[DONE]") {
+        if (sentStop) return true
+        sentStop = true
         sendStartIfNeeded()
         closeTextBlock()
         closeToolBlocks()
@@ -922,6 +925,8 @@ function createStreamTranslator(model, res) {
       }
 
       if (finishReason) {
+        if (sentStop) return true
+        sentStop = true
         closeTextBlock()
         closeToolBlocks()
         let stopReason = "end_turn"
