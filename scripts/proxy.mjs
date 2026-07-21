@@ -717,7 +717,7 @@ function createStreamTranslator(model, res) {
         sendSSE("message_delta", {
           type: "message_delta",
           delta: { stop_reason: "end_turn", stop_sequence: null },
-          usage: { output_tokens: outputTokens },
+          usage: { input_tokens: inputTokens, output_tokens: outputTokens },
         })
         sendSSE("message_stop", { type: "message_stop" })
         return true // done
@@ -730,12 +730,12 @@ function createStreamTranslator(model, res) {
         return false
       }
 
-      sendStartIfNeeded()
-
       if (data.usage) {
-        inputTokens = data.usage.prompt_tokens || inputTokens
-        outputTokens = data.usage.completion_tokens || outputTokens
+        inputTokens = data.usage.prompt_tokens ?? inputTokens
+        outputTokens = data.usage.completion_tokens ?? outputTokens
       }
+
+      sendStartIfNeeded()
 
       const choice = data.choices?.[0]
       if (!choice) return false
@@ -839,7 +839,7 @@ function createStreamTranslator(model, res) {
         sendSSE("message_delta", {
           type: "message_delta",
           delta: { stop_reason: stopReason, stop_sequence: null },
-          usage: { output_tokens: outputTokens },
+          usage: { input_tokens: inputTokens, output_tokens: outputTokens },
         })
         sendSSE("message_stop", { type: "message_stop" })
         return true
@@ -1170,7 +1170,7 @@ async function handleRequest(req, res, token) {
           res.write(`event: message_delta\ndata: ${JSON.stringify({
             type: "message_delta",
             delta: { stop_reason: anthropicResponse.stop_reason, stop_sequence: null },
-            usage: { output_tokens: anthropicResponse.usage.output_tokens },
+            usage: { input_tokens: anthropicResponse.usage.input_tokens, output_tokens: anthropicResponse.usage.output_tokens },
           })}\n\n`)
 
           // message_stop
