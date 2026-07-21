@@ -457,6 +457,8 @@ async function collectCopilotResponse(openaiReq, token) {
     Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
     "User-Agent": USER_AGENT,
+    "Editor-Version": "vscode/1.99.0",
+    "Copilot-Integration-Id": "vscode-chat",
     "Openai-Intent": "conversation-edits",
   }
   const bodyStr = JSON.stringify(openaiReq)
@@ -571,46 +573,57 @@ async function handleWebSearchLoop(openaiReq, token, maxSearches) {
 // ─── Model Mapping ──────────────────────────────────────────────────────────
 
 const MODEL_MAP = {
+  // Opus — Copilot supports 4.6, 4.7, 4.8
   "claude-opus-4-8": "claude-opus-4.8",
   "claude-opus-4-8-20260610": "claude-opus-4.8",
   "claude-opus-4-8-latest": "claude-opus-4.8",
+  "claude-opus-4-7": "claude-opus-4.7",
+  "claude-opus-4-7-latest": "claude-opus-4.7",
   "claude-opus-4-6": "claude-opus-4.6",
   "claude-opus-4-6-20260214": "claude-opus-4.6",
   "claude-opus-4-6-latest": "claude-opus-4.6",
-  "claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
-  "claude-sonnet-4-5": "claude-sonnet-4.5",
-  "claude-sonnet-4-5-latest": "claude-sonnet-4.5",
-  "claude-sonnet-4-20250514": "claude-sonnet-4",
-  "claude-sonnet-4": "claude-sonnet-4",
-  "claude-3-5-sonnet-20241022": "claude-sonnet-4",
-  "claude-3-5-sonnet-latest": "claude-sonnet-4",
-  "claude-opus-4-5": "claude-opus-4.5",
-  "claude-opus-4-5-20251101": "claude-opus-4.5",
-  "claude-opus-4-5-latest": "claude-opus-4.5",
-  "claude-opus-4-1": "claude-opus-41",
-  "claude-opus-4-1-latest": "claude-opus-41",
+  // Older Opus → nearest supported (4.6)
+  "claude-opus-4-5": "claude-opus-4.6",
+  "claude-opus-4-5-20251101": "claude-opus-4.6",
+  "claude-opus-4-5-latest": "claude-opus-4.6",
+  "claude-opus-4-1": "claude-opus-4.6",
+  "claude-opus-4-1-latest": "claude-opus-4.6",
+  "claude-opus-4-20250918": "claude-opus-4.6",
+  "claude-3-opus-20240229": "claude-opus-4.6",
+  "claude-3-5-opus-latest": "claude-opus-4.6",
+  // Sonnet — Copilot supports 4.6 and 5
+  "claude-sonnet-5": "claude-sonnet-5",
+  "claude-sonnet-5-latest": "claude-sonnet-5",
+  "claude-sonnet-4-6": "claude-sonnet-4.6",
+  "claude-sonnet-4-6-latest": "claude-sonnet-4.6",
+  "claude-sonnet-4-5-20250929": "claude-sonnet-4.6",
+  "claude-sonnet-4-5": "claude-sonnet-4.6",
+  "claude-sonnet-4-5-latest": "claude-sonnet-4.6",
+  "claude-sonnet-4-20250514": "claude-sonnet-4.6",
+  "claude-sonnet-4": "claude-sonnet-4.6",
+  "claude-3-5-sonnet-20241022": "claude-sonnet-4.6",
+  "claude-3-5-sonnet-latest": "claude-sonnet-4.6",
+  // Haiku — Copilot supports 4.5
   "claude-haiku-4-5": "claude-haiku-4.5",
   "claude-haiku-4-5-20251001": "claude-haiku-4.5",
   "claude-haiku-4-5-latest": "claude-haiku-4.5",
   "claude-haiku-4-20250414": "claude-haiku-4.5",
   "claude-3-5-haiku-20241022": "claude-haiku-4.5",
   "claude-3-haiku-20240307": "claude-haiku-4.5",
-  "claude-opus-4-20250918": "claude-opus-4.5",
-  "claude-3-opus-20240229": "claude-opus-4.5",
-  "claude-3-5-opus-latest": "claude-opus-4.5",
 }
 
 function mapModel(model) {
   if (MODEL_MAP[model]) return MODEL_MAP[model]
   const m = model.toLowerCase()
+  // Sonnet — newest supported is 5, then 4.6
+  if (m.includes("sonnet") && m.includes("5")) return "claude-sonnet-5"
+  if (m.includes("sonnet")) return "claude-sonnet-4.6"
+  // Opus — map to nearest supported tier
   if (m.includes("opus") && (m.includes("4.8") || m.includes("4-8"))) return "claude-opus-4.8"
-  if (m.includes("opus") && (m.includes("4.6") || m.includes("4-6"))) return "claude-opus-4.6"
-  if (m.includes("sonnet") && (m.includes("4.5") || m.includes("4-5"))) return "claude-sonnet-4.5"
-  if (m.includes("sonnet")) return "claude-sonnet-4"
-  if (m.includes("opus") && (m.includes("4.5") || m.includes("4-5"))) return "claude-opus-4.5"
-  if (m.includes("opus") && (m.includes("4.1") || m.includes("4-1") || m.includes("41"))) return "claude-opus-41"
+  if (m.includes("opus") && (m.includes("4.7") || m.includes("4-7"))) return "claude-opus-4.7"
+  if (m.includes("opus")) return "claude-opus-4.6"
+  // Haiku
   if (m.includes("haiku")) return "claude-haiku-4.5"
-  if (m.includes("opus")) return "claude-opus-4.8"
   return model
 }
 
@@ -981,10 +994,11 @@ async function handleRequest(req, res, token) {
     res.writeHead(200, { "Content-Type": "application/json" })
     res.end(JSON.stringify({
       data: [
+        { id: "claude-opus-4-8", object: "model" },
+        { id: "claude-opus-4-7", object: "model" },
         { id: "claude-opus-4-6", object: "model" },
-        { id: "claude-sonnet-4-5", object: "model" },
-        { id: "claude-sonnet-4", object: "model" },
-        { id: "claude-opus-4-5", object: "model" },
+        { id: "claude-sonnet-5", object: "model" },
+        { id: "claude-sonnet-4-6", object: "model" },
         { id: "claude-haiku-4-5", object: "model" },
       ],
     }))
@@ -1151,6 +1165,8 @@ async function handleRequest(req, res, token) {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
       "User-Agent": USER_AGENT,
+      "Editor-Version": "vscode/1.99.0",
+      "Copilot-Integration-Id": "vscode-chat",
       "Openai-Intent": "conversation-edits",
     }
     if (hasImages) headers["Copilot-Vision-Request"] = "true"
