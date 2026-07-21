@@ -1022,6 +1022,8 @@ async function handleRequest(req, res, token) {
     const copilotModel = mapModel(anthropicReq.model || "claude-sonnet-4")
     const wsConfig = extractWebSearchConfig(anthropicReq.tools)
 
+    console.log(`  → ${anthropicReq.model} → ${copilotModel} | ${isStream ? "stream" : "sync"} | ${anthropicReq.messages?.length || 0} messages${wsConfig.hasWebSearch ? " | web_search" : ""}`)
+
     // Build OpenAI request
     const openaiReq = {
       model: copilotModel,
