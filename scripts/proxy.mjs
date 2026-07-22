@@ -23,6 +23,8 @@ const PORT = parseInt(process.env.COPILOT_PROXY_PORT || "18080", 10)
 const AUTH_FILE = process.env.COPILOT_AUTH_FILE || join(homedir(), ".claude-copilot-auth.json")
 const COPILOT_API_BASE = "https://api.githubcopilot.com"
 const USER_AGENT = "claude-code-copilot-provider/1.0.0"
+const EDITOR_VERSION = process.env.COPILOT_EDITOR_VERSION || "vscode/1.99.0"
+const COPILOT_INTEGRATION_ID = process.env.COPILOT_INTEGRATION_ID || "vscode-chat"
 const BRAVE_API_KEY = process.env.BRAVE_API_KEY || ""
 const SERPER_API_KEY = process.env.SERPER_API_KEY || ""
 const WEB_SEARCH_MAX_RESULTS = parseInt(process.env.WEB_SEARCH_MAX_RESULTS || "5", 10)
@@ -381,6 +383,7 @@ async function duckDuckGoInstantAnswer(query) {
 // Search result cache (deduplicates identical queries across parallel agents)
 const searchCache = new Map()
 const SEARCH_CACHE_TTL = 5 * 60 * 1000 // 5 minutes
+const SEARCH_CACHE_MAX_ENTRIES = 500 // bound memory over the proxy's lifetime
 
 // Concurrency semaphore (prevents DDG/API rate-limit storms from parallel agents)
 const MAX_CONCURRENT_SEARCHES = 2
@@ -439,8 +442,19 @@ async function executeWebSearchThrottled(query) {
   activeSearchCount++
   try {
     const results = await executeWebSearch(query)
-    // Cache the results (even empty ones, to avoid re-hitting a failing provider)
-    searchCache.set(query, { results, ts: Date.now() })
+    // Only cache non-empty results — caching [] would suppress a query for the
+    // full TTL after a transient all-providers-fail, blinding parallel agents.
+    if (results && results.length > 0) {
+      // Evict expired entries, then bound total size (oldest-first) before insert.
+      const now = Date.now()
+      for (const [k, v] of searchCache) {
+        if (now - v.ts >= SEARCH_CACHE_TTL) searchCache.delete(k)
+      }
+      while (searchCache.size >= SEARCH_CACHE_MAX_ENTRIES) {
+        searchCache.delete(searchCache.keys().next().value)
+      }
+      searchCache.set(query, { results, ts: now })
+    }
     return results
   } finally {
     activeSearchCount--
@@ -457,8 +471,8 @@ async function collectCopilotResponse(openaiReq, token) {
     Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
     "User-Agent": USER_AGENT,
-    "Editor-Version": "vscode/1.99.0",
-    "Copilot-Integration-Id": "vscode-chat",
+    "Editor-Version": EDITOR_VERSION,
+    "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
     "Openai-Intent": "conversation-edits",
   }
   const bodyStr = JSON.stringify(openaiReq)
@@ -615,9 +629,13 @@ const MODEL_MAP = {
 function mapModel(model) {
   if (MODEL_MAP[model]) return MODEL_MAP[model]
   const m = model.toLowerCase()
-  // Sonnet — newest supported is 5, then 4.6
-  if (m.includes("sonnet") && m.includes("5")) return "claude-sonnet-5"
-  if (m.includes("sonnet")) return "claude-sonnet-4.6"
+  // Sonnet — newest supported is 5, then 4.6.
+  // Match the major version right after the "sonnet" token so "sonnet-5" maps to 5,
+  // but "sonnet-4-5" / "3-5-sonnet" / dated 4.5 builds map to 4.6 (not silently upgraded).
+  if (m.includes("sonnet")) {
+    const major = m.match(/sonnet[-_ ]?(\d+)/)
+    return major && major[1] === "5" ? "claude-sonnet-5" : "claude-sonnet-4.6"
+  }
   // Opus — map to nearest supported tier
   if (m.includes("opus") && (m.includes("4.8") || m.includes("4-8"))) return "claude-opus-4.8"
   if (m.includes("opus") && (m.includes("4.7") || m.includes("4-7"))) return "claude-opus-4.7"
@@ -1165,8 +1183,8 @@ async function handleRequest(req, res, token) {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
       "User-Agent": USER_AGENT,
-      "Editor-Version": "vscode/1.99.0",
-      "Copilot-Integration-Id": "vscode-chat",
+      "Editor-Version": EDITOR_VERSION,
+      "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
       "Openai-Intent": "conversation-edits",
     }
     if (hasImages) headers["Copilot-Vision-Request"] = "true"
