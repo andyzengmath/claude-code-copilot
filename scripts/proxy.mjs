@@ -23,9 +23,12 @@ const PORT = parseInt(process.env.COPILOT_PROXY_PORT || "18080", 10)
 const AUTH_FILE = process.env.COPILOT_AUTH_FILE || join(homedir(), ".claude-copilot-auth.json")
 const COPILOT_API_BASE = "https://api.githubcopilot.com"
 const USER_AGENT = "claude-code-copilot-provider/1.0.0"
+const EDITOR_VERSION = process.env.COPILOT_EDITOR_VERSION || "vscode/1.99.0"
+const COPILOT_INTEGRATION_ID = process.env.COPILOT_INTEGRATION_ID || "vscode-chat"
 const BRAVE_API_KEY = process.env.BRAVE_API_KEY || ""
 const SERPER_API_KEY = process.env.SERPER_API_KEY || ""
 const WEB_SEARCH_MAX_RESULTS = parseInt(process.env.WEB_SEARCH_MAX_RESULTS || "5", 10)
+const COPILOT_REQUEST_TIMEOUT_MS = parseInt(process.env.COPILOT_REQUEST_TIMEOUT_MS || "120000", 10)
 
 // ─── Web Search: MCP Providers (Exa + Parallel) ────────────────────────────
 
@@ -381,6 +384,7 @@ async function duckDuckGoInstantAnswer(query) {
 // Search result cache (deduplicates identical queries across parallel agents)
 const searchCache = new Map()
 const SEARCH_CACHE_TTL = 5 * 60 * 1000 // 5 minutes
+const SEARCH_CACHE_MAX_ENTRIES = 500 // bound memory over the proxy's lifetime
 
 // Concurrency semaphore (prevents DDG/API rate-limit storms from parallel agents)
 const MAX_CONCURRENT_SEARCHES = 2
@@ -439,8 +443,19 @@ async function executeWebSearchThrottled(query) {
   activeSearchCount++
   try {
     const results = await executeWebSearch(query)
-    // Cache the results (even empty ones, to avoid re-hitting a failing provider)
-    searchCache.set(query, { results, ts: Date.now() })
+    // Only cache non-empty results — caching [] would suppress a query for the
+    // full TTL after a transient all-providers-fail, blinding parallel agents.
+    if (results && results.length > 0) {
+      // Evict expired entries, then bound total size (oldest-first) before insert.
+      const now = Date.now()
+      for (const [k, v] of searchCache) {
+        if (now - v.ts >= SEARCH_CACHE_TTL) searchCache.delete(k)
+      }
+      while (searchCache.size >= SEARCH_CACHE_MAX_ENTRIES) {
+        searchCache.delete(searchCache.keys().next().value)
+      }
+      searchCache.set(query, { results, ts: now })
+    }
     return results
   } finally {
     activeSearchCount--
@@ -457,17 +472,31 @@ async function collectCopilotResponse(openaiReq, token) {
     Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
     "User-Agent": USER_AGENT,
+    "Editor-Version": EDITOR_VERSION,
+    "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
     "Openai-Intent": "conversation-edits",
   }
   const bodyStr = JSON.stringify(openaiReq)
   if (bodyStr.includes("image_url")) {
     headers["Copilot-Vision-Request"] = "true"
   }
-  const res = await fetch(`${COPILOT_API_BASE}/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ ...openaiReq, stream: false }),
-  })
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), COPILOT_REQUEST_TIMEOUT_MS)
+  let res
+  try {
+    res = await fetch(`${COPILOT_API_BASE}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...openaiReq, stream: false }),
+      signal: controller.signal,
+    })
+  } catch (err) {
+    throw new Error(err.name === "AbortError"
+      ? `Copilot request timed out after ${COPILOT_REQUEST_TIMEOUT_MS}ms`
+      : `Copilot request failed: ${err.message}`)
+  } finally {
+    clearTimeout(timeout)
+  }
   if (!res.ok) {
     const text = await res.text()
     throw new Error(`Copilot ${res.status}: ${text}`)
@@ -571,42 +600,61 @@ async function handleWebSearchLoop(openaiReq, token, maxSearches) {
 // ─── Model Mapping ──────────────────────────────────────────────────────────
 
 const MODEL_MAP = {
+  // Opus — Copilot supports 4.6, 4.7, 4.8
+  "claude-opus-4-8": "claude-opus-4.8",
+  "claude-opus-4-8-20260610": "claude-opus-4.8",
+  "claude-opus-4-8-latest": "claude-opus-4.8",
+  "claude-opus-4-7": "claude-opus-4.7",
+  "claude-opus-4-7-latest": "claude-opus-4.7",
   "claude-opus-4-6": "claude-opus-4.6",
   "claude-opus-4-6-20260214": "claude-opus-4.6",
   "claude-opus-4-6-latest": "claude-opus-4.6",
-  "claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
-  "claude-sonnet-4-5": "claude-sonnet-4.5",
-  "claude-sonnet-4-5-latest": "claude-sonnet-4.5",
-  "claude-sonnet-4-20250514": "claude-sonnet-4",
-  "claude-sonnet-4": "claude-sonnet-4",
-  "claude-3-5-sonnet-20241022": "claude-sonnet-4",
-  "claude-3-5-sonnet-latest": "claude-sonnet-4",
-  "claude-opus-4-5": "claude-opus-4.5",
-  "claude-opus-4-5-20251101": "claude-opus-4.5",
-  "claude-opus-4-5-latest": "claude-opus-4.5",
-  "claude-opus-4-1": "claude-opus-41",
-  "claude-opus-4-1-latest": "claude-opus-41",
+  // Older Opus → nearest supported (4.6)
+  "claude-opus-4-5": "claude-opus-4.6",
+  "claude-opus-4-5-20251101": "claude-opus-4.6",
+  "claude-opus-4-5-latest": "claude-opus-4.6",
+  "claude-opus-4-1": "claude-opus-4.6",
+  "claude-opus-4-1-latest": "claude-opus-4.6",
+  "claude-opus-4-20250918": "claude-opus-4.6",
+  "claude-3-opus-20240229": "claude-opus-4.6",
+  "claude-3-5-opus-latest": "claude-opus-4.6",
+  // Sonnet — Copilot supports 4.6 and 5
+  "claude-sonnet-5": "claude-sonnet-5",
+  "claude-sonnet-5-latest": "claude-sonnet-5",
+  "claude-sonnet-4-6": "claude-sonnet-4.6",
+  "claude-sonnet-4-6-latest": "claude-sonnet-4.6",
+  "claude-sonnet-4-5-20250929": "claude-sonnet-4.6",
+  "claude-sonnet-4-5": "claude-sonnet-4.6",
+  "claude-sonnet-4-5-latest": "claude-sonnet-4.6",
+  "claude-sonnet-4-20250514": "claude-sonnet-4.6",
+  "claude-sonnet-4": "claude-sonnet-4.6",
+  "claude-3-5-sonnet-20241022": "claude-sonnet-4.6",
+  "claude-3-5-sonnet-latest": "claude-sonnet-4.6",
+  // Haiku — Copilot supports 4.5
   "claude-haiku-4-5": "claude-haiku-4.5",
   "claude-haiku-4-5-20251001": "claude-haiku-4.5",
   "claude-haiku-4-5-latest": "claude-haiku-4.5",
   "claude-haiku-4-20250414": "claude-haiku-4.5",
   "claude-3-5-haiku-20241022": "claude-haiku-4.5",
   "claude-3-haiku-20240307": "claude-haiku-4.5",
-  "claude-opus-4-20250918": "claude-opus-4.5",
-  "claude-3-opus-20240229": "claude-opus-4.5",
-  "claude-3-5-opus-latest": "claude-opus-4.5",
 }
 
 function mapModel(model) {
   if (MODEL_MAP[model]) return MODEL_MAP[model]
   const m = model.toLowerCase()
-  if (m.includes("opus") && (m.includes("4.6") || m.includes("4-6"))) return "claude-opus-4.6"
-  if (m.includes("sonnet") && (m.includes("4.5") || m.includes("4-5"))) return "claude-sonnet-4.5"
-  if (m.includes("sonnet")) return "claude-sonnet-4"
-  if (m.includes("opus") && (m.includes("4.5") || m.includes("4-5"))) return "claude-opus-4.5"
-  if (m.includes("opus") && (m.includes("4.1") || m.includes("4-1") || m.includes("41"))) return "claude-opus-41"
-  if (m.includes("haiku")) return "claude-haiku-4.5"
+  // Sonnet — newest supported is 5, then 4.6.
+  // Match the major version right after the "sonnet" token so "sonnet-5" maps to 5,
+  // but "sonnet-4-5" / "3-5-sonnet" / dated 4.5 builds map to 4.6 (not silently upgraded).
+  if (m.includes("sonnet")) {
+    const major = m.match(/sonnet[-_ ]?(\d+)/)
+    return major && major[1] === "5" ? "claude-sonnet-5" : "claude-sonnet-4.6"
+  }
+  // Opus — map to nearest supported tier
+  if (m.includes("opus") && (m.includes("4.8") || m.includes("4-8"))) return "claude-opus-4.8"
+  if (m.includes("opus") && (m.includes("4.7") || m.includes("4-7"))) return "claude-opus-4.7"
   if (m.includes("opus")) return "claude-opus-4.6"
+  // Haiku
+  if (m.includes("haiku")) return "claude-haiku-4.5"
   return model
 }
 
@@ -633,6 +681,36 @@ function loadAuth() {
 
 // ─── Message Translation (Anthropic → OpenAI) ───────────────────────────────
 
+// Estimate input tokens from an Anthropic Messages request body.
+// Extracts the actual natural-language text (system + message content + tool
+// schemas) and applies ~4 chars/token, rather than counting raw JSON bytes.
+// Claude Code calls /count_tokens to decide when to auto-compact, so this
+// should track real usage reasonably closely.
+function estimateTokens(body) {
+  let text = ""
+  try {
+    const req = JSON.parse(body)
+    const walk = (v) => {
+      if (v == null) return
+      if (typeof v === "string") { text += v + " "; return }
+      if (Array.isArray(v)) { v.forEach(walk); return }
+      if (typeof v === "object") {
+        // Only descend into fields that carry natural-language or schema text
+        if (typeof v.text === "string") text += v.text + " "
+        if (typeof v.content !== "undefined") walk(v.content)
+        if (typeof v.input !== "undefined") text += JSON.stringify(v.input) + " "
+      }
+    }
+    if (req.system) walk(req.system)
+    if (req.messages) walk(req.messages)
+    if (req.tools) text += JSON.stringify(req.tools) + " "
+  } catch {
+    // Fall back to raw length if body isn't parseable JSON
+    text = body
+  }
+  return Math.max(1, Math.ceil(text.length / 4))
+}
+
 function translateContentPart(part) {
   if (typeof part === "string") return { type: "text", text: part }
   if (part.type === "text") return { type: "text", text: part.text }
@@ -643,6 +721,9 @@ function translateContentPart(part) {
     }
   }
   if (part.type === "tool_use" || part.type === "tool_result") return null
+  // Extended-thinking blocks are Anthropic-internal reasoning that Copilot's
+  // OpenAI-format API cannot consume; drop them rather than injecting raw JSON.
+  if (part.type === "thinking" || part.type === "redacted_thinking") return null
   return { type: "text", text: JSON.stringify(part) }
 }
 
@@ -704,6 +785,8 @@ function translateMessages(anthropicMessages, system) {
           })
         } else if (block.type === "server_tool_use") {
           // Skip — handled internally
+        } else if (block.type === "thinking" || block.type === "redacted_thinking") {
+          // Skip — Anthropic-internal reasoning, not consumable by Copilot
         } else if (block.type === "web_search_tool_result") {
           // Inline search results as context
           if (Array.isArray(block.content)) {
@@ -806,6 +889,7 @@ function createStreamTranslator(model, res) {
   let inputTokens = 0
   let outputTokens = 0
   let sentStart = false
+  let sentStop = false
   const toolCallBuffers = {}
   let contentBlockIndex = 0
   let _inTextBlock = false
@@ -848,13 +932,15 @@ function createStreamTranslator(model, res) {
   return {
     processChunk(chunk) {
       if (!chunk || chunk === "[DONE]") {
+        if (sentStop) return true
+        sentStop = true
         sendStartIfNeeded()
         closeTextBlock()
         closeToolBlocks()
         sendSSE("message_delta", {
           type: "message_delta",
           delta: { stop_reason: "end_turn", stop_sequence: null },
-          usage: { output_tokens: outputTokens },
+          usage: { input_tokens: inputTokens, output_tokens: outputTokens },
         })
         sendSSE("message_stop", { type: "message_stop" })
         return true
@@ -863,13 +949,13 @@ function createStreamTranslator(model, res) {
       let data
       try { data = typeof chunk === "string" ? JSON.parse(chunk) : chunk } catch { return false }
 
-      sendStartIfNeeded()
-
       if (data.id) messageId = data.id
       if (data.usage) {
-        inputTokens = data.usage.prompt_tokens || inputTokens
-        outputTokens = data.usage.completion_tokens || outputTokens
+        inputTokens = data.usage.prompt_tokens ?? inputTokens
+        outputTokens = data.usage.completion_tokens ?? outputTokens
       }
+
+      sendStartIfNeeded()
 
       const delta = data.choices?.[0]?.delta
       const finishReason = data.choices?.[0]?.finish_reason
@@ -918,6 +1004,8 @@ function createStreamTranslator(model, res) {
       }
 
       if (finishReason) {
+        if (sentStop) return true
+        sentStop = true
         closeTextBlock()
         closeToolBlocks()
         let stopReason = "end_turn"
@@ -926,7 +1014,7 @@ function createStreamTranslator(model, res) {
         sendSSE("message_delta", {
           type: "message_delta",
           delta: { stop_reason: stopReason, stop_sequence: null },
-          usage: { output_tokens: outputTokens },
+          usage: { input_tokens: inputTokens, output_tokens: outputTokens },
         })
         sendSSE("message_stop", { type: "message_stop" })
         return true
@@ -961,9 +1049,8 @@ async function handleRequest(req, res, token) {
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
     const body = Buffer.concat(chunks).toString()
-    const inputTokens = Math.ceil(body.length / 4)
     res.writeHead(200, { "Content-Type": "application/json" })
-    res.end(JSON.stringify({ input_tokens: inputTokens }))
+    res.end(JSON.stringify({ input_tokens: estimateTokens(body) }))
     return
   }
 
@@ -972,10 +1059,11 @@ async function handleRequest(req, res, token) {
     res.writeHead(200, { "Content-Type": "application/json" })
     res.end(JSON.stringify({
       data: [
+        { id: "claude-opus-4-8", object: "model" },
+        { id: "claude-opus-4-7", object: "model" },
         { id: "claude-opus-4-6", object: "model" },
-        { id: "claude-sonnet-4-5", object: "model" },
-        { id: "claude-sonnet-4", object: "model" },
-        { id: "claude-opus-4-5", object: "model" },
+        { id: "claude-sonnet-5", object: "model" },
+        { id: "claude-sonnet-4-6", object: "model" },
         { id: "claude-haiku-4-5", object: "model" },
       ],
     }))
@@ -1022,6 +1110,9 @@ async function handleRequest(req, res, token) {
       max_tokens: anthropicReq.max_tokens || 4096,
       stream: isStream,
     }
+    // Ask Copilot to include token usage in the final streaming chunk so the
+    // proxy can report accurate input_tokens (otherwise usage is often omitted).
+    if (isStream) openaiReq.stream_options = { include_usage: true }
     if (anthropicReq.temperature != null) openaiReq.temperature = anthropicReq.temperature
     if (anthropicReq.top_p != null) openaiReq.top_p = anthropicReq.top_p
     if (anthropicReq.stop_sequences) openaiReq.stop = anthropicReq.stop_sequences
@@ -1103,7 +1194,7 @@ async function handleRequest(req, res, token) {
           const hasToolUse = contentBlocks.some((b) => b.type === "tool_use")
           const stopReason = hasToolUse ? "tool_use" : "end_turn"
 
-          res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: usage.completion_tokens || 0 } })}\n\n`)
+          res.write(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { input_tokens: usage.prompt_tokens || 0, output_tokens: usage.completion_tokens || 0 } })}\n\n`)
           res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`)
           res.end()
           console.log(`  ← stream ${stopReason} | in: ${usage.prompt_tokens || 0} out: ${usage.completion_tokens || 0} | blocks: ${contentBlocks.length} | searches: ${searchCount}`)
@@ -1144,17 +1235,35 @@ async function handleRequest(req, res, token) {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
       "User-Agent": USER_AGENT,
+      "Editor-Version": EDITOR_VERSION,
+      "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
       "Openai-Intent": "conversation-edits",
     }
     if (hasImages) headers["Copilot-Vision-Request"] = "true"
 
-    const copilotRes = await fetch(`${COPILOT_API_BASE}/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(openaiReq),
-    })
+    const copilotController = new AbortController()
+    const copilotTimeout = setTimeout(() => copilotController.abort(), COPILOT_REQUEST_TIMEOUT_MS)
+    let copilotRes
+    try {
+      copilotRes = await fetch(`${COPILOT_API_BASE}/chat/completions`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(openaiReq),
+        signal: copilotController.signal,
+      })
+    } catch (err) {
+      clearTimeout(copilotTimeout)
+      const msg = err.name === "AbortError"
+        ? `Copilot request timed out after ${COPILOT_REQUEST_TIMEOUT_MS}ms`
+        : `Copilot request failed: ${err.message}`
+      console.error(`❌ ${msg}`)
+      res.writeHead(504, { "Content-Type": "application/json" })
+      res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: msg } }))
+      return
+    }
 
     if (!copilotRes.ok) {
+      clearTimeout(copilotTimeout)
       const errText = await copilotRes.text()
       let errType = "api_error"
       if (copilotRes.status === 401) errType = "authentication_error"
@@ -1167,6 +1276,10 @@ async function handleRequest(req, res, token) {
     }
 
     if (isStream) {
+      // Response has started streaming; the connection timeout has served its
+      // purpose (guarding the initial connect). Clear it so a legitimately long
+      // stream isn't aborted mid-flight.
+      clearTimeout(copilotTimeout)
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -1178,36 +1291,46 @@ async function handleRequest(req, res, token) {
       const decoder = new TextDecoder()
       let buffer = ""
 
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) {
-          translator.processChunk(null)
-          break
-        }
-
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split("\n")
-        buffer = lines.pop() || ""
-
-        for (const line of lines) {
-          const trimmed = line.trim()
-          if (!trimmed || !trimmed.startsWith("data: ")) continue
-          const data = trimmed.slice(6)
-          if (data === "[DONE]") {
-            translator.processChunk("[DONE]")
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) {
+            translator.processChunk(null)
             break
           }
-          try {
-            const parsed = JSON.parse(data)
-            const isDone = translator.processChunk(parsed)
-            if (isDone) break
-          } catch { continue }
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split("\n")
+          buffer = lines.pop() || ""
+
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed || !trimmed.startsWith("data: ")) continue
+            const data = trimmed.slice(6)
+            if (data === "[DONE]") {
+              translator.processChunk("[DONE]")
+              break
+            }
+            try {
+              const parsed = JSON.parse(data)
+              const isDone = translator.processChunk(parsed)
+              if (isDone) break
+            } catch { continue }
+          }
         }
+      } catch (err) {
+        // Stream broke after headers were already sent — emit a proper
+        // terminator so Claude Code sees a clean end instead of a truncated stream.
+        console.error(`❌ Stream error: ${err.message}`)
+        translator.processChunk(null)
+      } finally {
+        clearTimeout(copilotTimeout)
       }
 
       res.end()
       console.log(`  ← stream complete`)
     } else {
+      clearTimeout(copilotTimeout)
       const data = await copilotRes.json()
       const response = translateResponseToAnthropic(data, anthropicReq.model)
       res.writeHead(200, { "Content-Type": "application/json" })
