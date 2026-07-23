@@ -631,6 +631,16 @@ function reasoningEffortFromRequest(anthropicReq) {
   return null
 }
 
+// Whether a resolved Copilot model accepts the OpenAI reasoning_effort param.
+// Verified live against the Copilot API: opus and sonnet Claude models accept
+// low/medium/high/xhigh/max; Haiku rejects it with a 400. Unknown models are
+// treated as unsupported so a new model never 400s on an effort we guessed wrong.
+function modelSupportsReasoningEffort(copilotModel) {
+  const m = (copilotModel || "").toLowerCase()
+  if (m.includes("haiku")) return false
+  return m.includes("opus") || m.includes("sonnet")
+}
+
 const MODEL_MAP = {
   // Opus — Copilot supports 4.6, 4.7, 4.8
   "claude-opus-4-8": "claude-opus-4.8",
@@ -1151,8 +1161,11 @@ async function handleRequest(req, res, token) {
 
     // Map Anthropic reasoning depth (adaptive effort or legacy thinking budget)
     // -> OpenAI reasoning_effort so the model tracks Claude Code's effort setting.
+    // Only sent to models that accept it — Haiku rejects reasoning_effort (400).
     const reasoningEffort = reasoningEffortFromRequest(anthropicReq)
-    if (FORWARD_REASONING && reasoningEffort) openaiReq.reasoning_effort = reasoningEffort
+    if (FORWARD_REASONING && reasoningEffort && modelSupportsReasoningEffort(copilotModel)) {
+      openaiReq.reasoning_effort = reasoningEffort
+    }
 
     const tools = translateTools(anthropicReq.tools)
     if (tools) openaiReq.tools = tools
