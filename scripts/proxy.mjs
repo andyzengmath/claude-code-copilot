@@ -29,6 +29,11 @@ const BRAVE_API_KEY = process.env.BRAVE_API_KEY || ""
 const SERPER_API_KEY = process.env.SERPER_API_KEY || ""
 const WEB_SEARCH_MAX_RESULTS = parseInt(process.env.WEB_SEARCH_MAX_RESULTS || "5", 10)
 const COPILOT_REQUEST_TIMEOUT_MS = parseInt(process.env.COPILOT_REQUEST_TIMEOUT_MS || "120000", 10)
+// Forward Anthropic extended-thinking as OpenAI reasoning_effort. Copilot currently
+// ignores it (GitHub does not expose Claude reasoning budgets), so this is a harmless
+// no-op today; kept on by default so it "just works" if Copilot ever honors it.
+// Set COPILOT_FORWARD_REASONING=0 to disable.
+const FORWARD_REASONING = process.env.COPILOT_FORWARD_REASONING !== "0"
 
 // ─── Web Search: MCP Providers (Exa + Parallel) ────────────────────────────
 
@@ -599,6 +604,20 @@ async function handleWebSearchLoop(openaiReq, token, maxSearches) {
 
 // ─── Model Mapping ──────────────────────────────────────────────────────────
 
+// Map Anthropic `thinking` (extended thinking) to an OpenAI `reasoning_effort`
+// bucket. Claude Code sends thinking.budget_tokens scaled to its effort setting;
+// translate the budget into low/medium/high so a backend that honors
+// reasoning_effort tracks the user's chosen depth. Returns null when thinking
+// is disabled/absent.
+function reasoningEffortFromThinking(thinking) {
+  if (!thinking || thinking.type !== "enabled") return null
+  const budget = Number(thinking.budget_tokens) || 0
+  if (budget <= 0) return null
+  if (budget <= 4096) return "low"
+  if (budget <= 16384) return "medium"
+  return "high"
+}
+
 const MODEL_MAP = {
   // Opus — Copilot supports 4.6, 4.7, 4.8
   "claude-opus-4-8": "claude-opus-4.8",
@@ -1117,6 +1136,11 @@ async function handleRequest(req, res, token) {
     if (anthropicReq.top_p != null) openaiReq.top_p = anthropicReq.top_p
     if (anthropicReq.stop_sequences) openaiReq.stop = anthropicReq.stop_sequences
 
+    // Map Anthropic extended-thinking -> OpenAI reasoning_effort so the model's
+    // reasoning depth tracks Claude Code's effort setting if Copilot supports it.
+    const reasoningEffort = reasoningEffortFromThinking(anthropicReq.thinking)
+    if (FORWARD_REASONING && reasoningEffort) openaiReq.reasoning_effort = reasoningEffort
+
     const tools = translateTools(anthropicReq.tools)
     if (tools) openaiReq.tools = tools
 
@@ -1374,6 +1398,11 @@ server.listen(PORT, () => {
   console.log(`│  ANTHROPIC_BASE_URL=http://localhost:${PORT}  │`)
   console.log("│  ANTHROPIC_API_KEY=copilot-proxy             │")
   console.log("└─────────────────────────────────────────────┘")
+  console.log(
+    FORWARD_REASONING
+      ? "  ℹ Reasoning effort forwarded as reasoning_effort (Copilot may ignore it — GitHub does not expose Claude reasoning budgets yet)."
+      : "  ℹ Reasoning-effort forwarding disabled (COPILOT_FORWARD_REASONING=0)."
+  )
 })
 
 process.on("SIGINT", () => {
