@@ -32,6 +32,10 @@ const COPILOT_REQUEST_TIMEOUT_MS = parseInt(process.env.COPILOT_REQUEST_TIMEOUT_
 // Retry transient Copilot failures (429 / 5xx / network / timeout) with
 // exponential backoff. Set COPILOT_MAX_RETRIES=0 to disable.
 const COPILOT_MAX_RETRIES = parseInt(process.env.COPILOT_MAX_RETRIES || "3", 10)
+// Proactive self-throttle: minimum spacing between requests sent to Copilot.
+// Default 0 (disabled) — opt in via COPILOT_MIN_REQUEST_INTERVAL_MS to pace
+// heavy parallel-subagent workloads and avoid 429s before they happen.
+const COPILOT_MIN_REQUEST_INTERVAL_MS = parseInt(process.env.COPILOT_MIN_REQUEST_INTERVAL_MS || "0", 10)
 // Forward Claude Code's reasoning depth (adaptive-thinking effort or legacy
 // thinking budget) as OpenAI reasoning_effort. Copilot's Claude models accept
 // low/medium/high/xhigh/max; the observable effect is currently modest and
@@ -480,6 +484,27 @@ async function executeWebSearchThrottled(query) {
 // 400/401/403/404 are deliberately excluded — they will not self-heal.
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504])
 
+// Self-throttle state: serialize the min-interval check so concurrent callers
+// (parallel subagents) queue behind one another instead of all firing at once.
+let throttleChainTail = Promise.resolve()
+let lastRequestSentAt = 0
+
+// Block until at least COPILOT_MIN_REQUEST_INTERVAL_MS has elapsed since the
+// previous request was released. No-op when the interval is 0 (default).
+function throttleGate() {
+  if (COPILOT_MIN_REQUEST_INTERVAL_MS <= 0) return Promise.resolve()
+  const wait = throttleChainTail.then(async () => {
+    const now = Date.now()
+    const elapsed = now - lastRequestSentAt
+    const delay = COPILOT_MIN_REQUEST_INTERVAL_MS - elapsed
+    if (delay > 0) await sleep(delay)
+    lastRequestSentAt = Date.now()
+  })
+  // Advance the chain even if this link rejects, so the queue never wedges.
+  throttleChainTail = wait.catch(() => {})
+  return wait
+}
+
 // POST to Copilot's chat/completions with per-attempt timeout and exponential
 // backoff on transient failures. Returns the fetch Response (body untouched, so
 // streaming callers can read it). Throws a tagged Error only after retries are
@@ -487,6 +512,7 @@ const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504])
 async function fetchCopilotWithRetry(headers, bodyStr) {
   let lastErr
   for (let attempt = 0; attempt <= COPILOT_MAX_RETRIES; attempt++) {
+    await throttleGate()
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), COPILOT_REQUEST_TIMEOUT_MS)
     let res
@@ -937,6 +963,22 @@ function extractWebSearchConfig(anthropicTools) {
 
 // ─── Response Translation (OpenAI → Anthropic) ──────────────────────────────
 
+// Build an Anthropic-shaped usage object from Copilot's OpenAI usage.
+// Copilot's prompt_tokens INCLUDES cached tokens; Anthropic's input_tokens
+// EXCLUDES them (cache is a separate bucket). Split them so the total is
+// preserved and cache reads are surfaced honestly (0 today; correct if Copilot
+// ever enables prompt caching).
+function buildAnthropicUsage(openaiUsage) {
+  const prompt = openaiUsage?.prompt_tokens || 0
+  const cachedRead = openaiUsage?.prompt_tokens_details?.cached_tokens || 0
+  return {
+    input_tokens: Math.max(0, prompt - cachedRead),
+    output_tokens: openaiUsage?.completion_tokens || 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: cachedRead,
+  }
+}
+
 function translateResponseToAnthropic(openaiResponse, model) {
   const choice = openaiResponse.choices?.[0]
   const content = []
@@ -971,12 +1013,7 @@ function translateResponseToAnthropic(openaiResponse, model) {
     content: content.length > 0 ? content : [{ type: "text", text: "" }],
     stop_reason: stopReason,
     stop_sequence: null,
-    usage: {
-      input_tokens: openaiResponse.usage?.prompt_tokens || 0,
-      output_tokens: openaiResponse.usage?.completion_tokens || 0,
-      cache_creation_input_tokens: 0,
-      cache_read_input_tokens: 0,
-    },
+    usage: buildAnthropicUsage(openaiResponse.usage),
   }
 }
 
@@ -986,6 +1023,7 @@ function createStreamTranslator(model, res) {
   let messageId = `msg_${Date.now()}`
   let inputTokens = 0
   let outputTokens = 0
+  let cachedReadTokens = 0
   let sentStart = false
   let sentStop = false
   const toolCallBuffers = {}
@@ -1009,7 +1047,7 @@ function createStreamTranslator(model, res) {
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: inputTokens, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        usage: { input_tokens: Math.max(0, inputTokens - cachedReadTokens), output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: cachedReadTokens },
       },
     })
   }
@@ -1038,7 +1076,7 @@ function createStreamTranslator(model, res) {
         sendSSE("message_delta", {
           type: "message_delta",
           delta: { stop_reason: "end_turn", stop_sequence: null },
-          usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+          usage: { input_tokens: Math.max(0, inputTokens - cachedReadTokens), output_tokens: outputTokens, cache_read_input_tokens: cachedReadTokens },
         })
         sendSSE("message_stop", { type: "message_stop" })
         return true
@@ -1051,6 +1089,7 @@ function createStreamTranslator(model, res) {
       if (data.usage) {
         inputTokens = data.usage.prompt_tokens ?? inputTokens
         outputTokens = data.usage.completion_tokens ?? outputTokens
+        cachedReadTokens = data.usage.prompt_tokens_details?.cached_tokens ?? cachedReadTokens
       }
 
       sendStartIfNeeded()
@@ -1112,7 +1151,7 @@ function createStreamTranslator(model, res) {
         sendSSE("message_delta", {
           type: "message_delta",
           delta: { stop_reason: stopReason, stop_sequence: null },
-          usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+          usage: { input_tokens: Math.max(0, inputTokens - cachedReadTokens), output_tokens: outputTokens, cache_read_input_tokens: cachedReadTokens },
         })
         sendSSE("message_stop", { type: "message_stop" })
         return true
@@ -1316,12 +1355,7 @@ async function handleRequest(req, res, token) {
             content: contentBlocks,
             stop_reason: hasToolUse ? "tool_use" : "end_turn",
             stop_sequence: null,
-            usage: {
-              input_tokens: usage.prompt_tokens || 0,
-              output_tokens: usage.completion_tokens || 0,
-              cache_creation_input_tokens: 0,
-              cache_read_input_tokens: 0,
-            },
+            usage: buildAnthropicUsage(usage),
           }
           res.writeHead(200, { "Content-Type": "application/json" })
           res.end(JSON.stringify(response))
