@@ -726,7 +726,9 @@ function modelSupportsReasoningEffort(copilotModel) {
 }
 
 const MODEL_MAP = {
-  // Opus — Copilot supports 4.6, 4.7, 4.8
+  // Opus — Copilot supports 4.6, 4.7, 4.8, 5
+  "claude-opus-5": "claude-opus-5",
+  "claude-opus-5-latest": "claude-opus-5",
   "claude-opus-4-8": "claude-opus-4.8",
   "claude-opus-4-8-20260610": "claude-opus-4.8",
   "claude-opus-4-8-latest": "claude-opus-4.8",
@@ -775,10 +777,16 @@ function mapModel(model) {
     const major = m.match(/sonnet[-_ ]?(\d+)/)
     return major && major[1] === "5" ? "claude-sonnet-5" : "claude-sonnet-4.6"
   }
-  // Opus — map to nearest supported tier
-  if (m.includes("opus") && (m.includes("4.8") || m.includes("4-8"))) return "claude-opus-4.8"
-  if (m.includes("opus") && (m.includes("4.7") || m.includes("4-7"))) return "claude-opus-4.7"
-  if (m.includes("opus")) return "claude-opus-4.6"
+  // Opus — Copilot supports 4.6, 4.7, 4.8, 5. Match the major version right
+  // after the "opus" token so "opus-5" maps to 5, but "opus-4-5"/"opus-4.5"
+  // maps by its 4.x tier (not silently upgraded to 5).
+  if (m.includes("opus")) {
+    const major = m.match(/opus[-_ ]?(\d+)/)
+    if (major && major[1] === "5") return "claude-opus-5"
+    if (m.includes("4.8") || m.includes("4-8")) return "claude-opus-4.8"
+    if (m.includes("4.7") || m.includes("4-7")) return "claude-opus-4.7"
+    return "claude-opus-4.6"
+  }
   // Haiku
   if (m.includes("haiku")) return "claude-haiku-4.5"
   return model
@@ -1198,6 +1206,7 @@ async function handleRequest(req, res, token) {
     res.writeHead(200, { "Content-Type": "application/json" })
     res.end(JSON.stringify({
       data: [
+        { id: "claude-opus-5", object: "model" },
         { id: "claude-opus-4-8", object: "model" },
         { id: "claude-opus-4-7", object: "model" },
         { id: "claude-opus-4-6", object: "model" },
