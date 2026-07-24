@@ -29,6 +29,9 @@ const BRAVE_API_KEY = process.env.BRAVE_API_KEY || ""
 const SERPER_API_KEY = process.env.SERPER_API_KEY || ""
 const WEB_SEARCH_MAX_RESULTS = parseInt(process.env.WEB_SEARCH_MAX_RESULTS || "5", 10)
 const COPILOT_REQUEST_TIMEOUT_MS = parseInt(process.env.COPILOT_REQUEST_TIMEOUT_MS || "120000", 10)
+// Retry transient Copilot failures (429 / 5xx / network / timeout) with
+// exponential backoff. Set COPILOT_MAX_RETRIES=0 to disable.
+const COPILOT_MAX_RETRIES = parseInt(process.env.COPILOT_MAX_RETRIES || "3", 10)
 // Forward Claude Code's reasoning depth (adaptive-thinking effort or legacy
 // thinking budget) as OpenAI reasoning_effort. Copilot's Claude models accept
 // low/medium/high/xhigh/max; the observable effect is currently modest and
@@ -473,6 +476,75 @@ async function executeWebSearchThrottled(query) {
 
 // ─── Web Search Loop ────────────────────────────────────────────────────────
 
+// Transient statuses worth retrying (rate limit + gateway/server errors).
+// 400/401/403/404 are deliberately excluded — they will not self-heal.
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504])
+
+// POST to Copilot's chat/completions with per-attempt timeout and exponential
+// backoff on transient failures. Returns the fetch Response (body untouched, so
+// streaming callers can read it). Throws a tagged Error only after retries are
+// exhausted or on a non-retryable network error.
+async function fetchCopilotWithRetry(headers, bodyStr) {
+  let lastErr
+  for (let attempt = 0; attempt <= COPILOT_MAX_RETRIES; attempt++) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), COPILOT_REQUEST_TIMEOUT_MS)
+    let res
+    try {
+      res = await fetch(`${COPILOT_API_BASE}/chat/completions`, {
+        method: "POST",
+        headers,
+        body: bodyStr,
+        signal: controller.signal,
+      })
+    } catch (err) {
+      clearTimeout(timeout)
+      lastErr = new Error(err.name === "AbortError"
+        ? `Copilot request timed out after ${COPILOT_REQUEST_TIMEOUT_MS}ms`
+        : `Copilot request failed: ${err.message}`)
+      if (attempt < COPILOT_MAX_RETRIES) {
+        await sleep(backoffDelayMs(attempt, null))
+        console.warn(`⚠ Copilot fetch error, retry ${attempt + 1}/${COPILOT_MAX_RETRIES}: ${err.message}`)
+        continue
+      }
+      throw lastErr
+    }
+    clearTimeout(timeout)
+
+    if (res.ok || !RETRYABLE_STATUS.has(res.status) || attempt === COPILOT_MAX_RETRIES) {
+      return res
+    }
+    // Retryable status: drain body, honor Retry-After on 429, back off.
+    const retryAfter = res.status === 429 ? parseRetryAfterMs(res.headers.get("retry-after")) : null
+    res.body?.cancel?.().catch(() => {})
+    console.warn(`⚠ Copilot ${res.status}, retry ${attempt + 1}/${COPILOT_MAX_RETRIES} in ${Math.round(backoffDelayMs(attempt, retryAfter))}ms`)
+    await sleep(backoffDelayMs(attempt, retryAfter))
+  }
+  throw lastErr || new Error("Copilot request failed after retries")
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// Exponential backoff with full jitter, capped at 8s. A Retry-After hint (ms)
+// takes precedence when the server provides one.
+function backoffDelayMs(attempt, retryAfterMs) {
+  if (retryAfterMs && retryAfterMs > 0) return Math.min(retryAfterMs, 30000)
+  const base = Math.min(1000 * 2 ** attempt, 8000)
+  return base / 2 + Math.floor(base / 2 * ((attempt * 2654435761) % 1000) / 1000)
+}
+
+// Parse an HTTP Retry-After header (seconds or HTTP-date) into milliseconds.
+function parseRetryAfterMs(value) {
+  if (!value) return null
+  const secs = Number(value)
+  if (!Number.isNaN(secs)) return secs * 1000
+  const date = Date.parse(value)
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now())
+  return null
+}
+
 async function collectCopilotResponse(openaiReq, token) {
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -482,27 +554,11 @@ async function collectCopilotResponse(openaiReq, token) {
     "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
     "Openai-Intent": "conversation-edits",
   }
-  const bodyStr = JSON.stringify(openaiReq)
+  const bodyStr = JSON.stringify({ ...openaiReq, stream: false })
   if (bodyStr.includes("image_url")) {
     headers["Copilot-Vision-Request"] = "true"
   }
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), COPILOT_REQUEST_TIMEOUT_MS)
-  let res
-  try {
-    res = await fetch(`${COPILOT_API_BASE}/chat/completions`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ ...openaiReq, stream: false }),
-      signal: controller.signal,
-    })
-  } catch (err) {
-    throw new Error(err.name === "AbortError"
-      ? `Copilot request timed out after ${COPILOT_REQUEST_TIMEOUT_MS}ms`
-      : `Copilot request failed: ${err.message}`)
-  } finally {
-    clearTimeout(timeout)
-  }
+  const res = await fetchCopilotWithRetry(headers, bodyStr)
   if (!res.ok) {
     const text = await res.text()
     throw new Error(`Copilot ${res.status}: ${text}`)
@@ -1291,29 +1347,17 @@ async function handleRequest(req, res, token) {
     }
     if (hasImages) headers["Copilot-Vision-Request"] = "true"
 
-    const copilotController = new AbortController()
-    const copilotTimeout = setTimeout(() => copilotController.abort(), COPILOT_REQUEST_TIMEOUT_MS)
     let copilotRes
     try {
-      copilotRes = await fetch(`${COPILOT_API_BASE}/chat/completions`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(openaiReq),
-        signal: copilotController.signal,
-      })
+      copilotRes = await fetchCopilotWithRetry(headers, JSON.stringify(openaiReq))
     } catch (err) {
-      clearTimeout(copilotTimeout)
-      const msg = err.name === "AbortError"
-        ? `Copilot request timed out after ${COPILOT_REQUEST_TIMEOUT_MS}ms`
-        : `Copilot request failed: ${err.message}`
-      console.error(`❌ ${msg}`)
+      console.error(`❌ ${err.message}`)
       res.writeHead(504, { "Content-Type": "application/json" })
-      res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: msg } }))
+      res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: err.message } }))
       return
     }
 
     if (!copilotRes.ok) {
-      clearTimeout(copilotTimeout)
       const errText = await copilotRes.text()
       let errType = "api_error"
       if (copilotRes.status === 401) errType = "authentication_error"
@@ -1326,10 +1370,6 @@ async function handleRequest(req, res, token) {
     }
 
     if (isStream) {
-      // Response has started streaming; the connection timeout has served its
-      // purpose (guarding the initial connect). Clear it so a legitimately long
-      // stream isn't aborted mid-flight.
-      clearTimeout(copilotTimeout)
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -1373,14 +1413,11 @@ async function handleRequest(req, res, token) {
         // terminator so Claude Code sees a clean end instead of a truncated stream.
         console.error(`❌ Stream error: ${err.message}`)
         translator.processChunk(null)
-      } finally {
-        clearTimeout(copilotTimeout)
       }
 
       res.end()
       console.log(`  ← stream complete`)
     } else {
-      clearTimeout(copilotTimeout)
       const data = await copilotRes.json()
       const response = translateResponseToAnthropic(data, anthropicReq.model)
       res.writeHead(200, { "Content-Type": "application/json" })
