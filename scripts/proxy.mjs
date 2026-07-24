@@ -554,11 +554,13 @@ function sleep(ms) {
 }
 
 // Exponential backoff with full jitter, capped at 8s. A Retry-After hint (ms)
-// takes precedence when the server provides one.
+// takes precedence when the server provides one. Randomized per call so
+// concurrent requests hit by the same rate limit decorrelate instead of
+// retrying in lockstep.
 function backoffDelayMs(attempt, retryAfterMs) {
   if (retryAfterMs && retryAfterMs > 0) return Math.min(retryAfterMs, 30000)
   const base = Math.min(1000 * 2 ** attempt, 8000)
-  return base / 2 + Math.floor(base / 2 * ((attempt * 2654435761) % 1000) / 1000)
+  return Math.floor(base * (0.5 + Math.random() * 0.5))
 }
 
 // Parse an HTTP Retry-After header (seconds or HTTP-date) into milliseconds.
