@@ -15,7 +15,8 @@
 import { createServer } from "node:http"
 import { readFileSync, existsSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -448,8 +449,12 @@ async function executeWebSearchThrottled(query) {
     return cached.results
   }
 
-  // Concurrency gate — wait if too many searches are in flight
-  if (activeSearchCount >= MAX_CONCURRENT_SEARCHES) {
+  // Concurrency gate — wait if too many searches are in flight.
+  // `while`, not `if`: being woken only means a slot was released, not that it
+  // is still free. Between the release and this task resuming, a fresh caller
+  // can take the slot (it sees the decremented count and never queues), so a
+  // woken waiter must re-check or the limit is exceeded.
+  while (activeSearchCount >= MAX_CONCURRENT_SEARCHES) {
     console.log(`⏳ Search queued (${activeSearchCount}/${MAX_CONCURRENT_SEARCHES} active): "${query.slice(0, 50)}..."`)
     await new Promise((resolve) => searchWaitQueue.push(resolve))
   }
@@ -503,6 +508,23 @@ function throttleGate() {
   // Advance the chain even if this link rejects, so the queue never wedges.
   throttleChainTail = wait.catch(() => {})
   return wait
+}
+
+// Wrap a body-phase read so a stalled upstream cannot hang the proxy forever.
+// The per-attempt timeout in fetchCopilotWithRetry is cleared once response
+// headers arrive, which leaves the body read — res.json() or the SSE reader
+// loop — completely unguarded. This is an *idle* timeout: it is armed per read,
+// so a long but actively-streaming response is never cut off, while an upstream
+// that goes silent mid-body fails fast instead of holding the client open.
+function withIdleTimeout(promise, ms, label) {
+  if (!(ms > 0)) return promise
+  let timer
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Copilot ${label} stalled after ${ms}ms`)), ms)
+    }),
+  ]).finally(() => clearTimeout(timer))
 }
 
 // POST to Copilot's chat/completions with per-attempt timeout and exponential
@@ -588,10 +610,10 @@ async function collectCopilotResponse(openaiReq, token) {
   }
   const res = await fetchCopilotWithRetry(headers, bodyStr)
   if (!res.ok) {
-    const text = await res.text()
+    const text = await withIdleTimeout(res.text(), COPILOT_REQUEST_TIMEOUT_MS, "error body read")
     throw new Error(`Copilot ${res.status}: ${text}`)
   }
-  return res.json()
+  return withIdleTimeout(res.json(), COPILOT_REQUEST_TIMEOUT_MS, "body read")
 }
 
 async function handleWebSearchLoop(openaiReq, token, maxSearches) {
@@ -1037,6 +1059,11 @@ function createStreamTranslator(model, res) {
   let sentStart = false
   let sentStop = false
   const toolCallBuffers = {}
+  // Maps the provider's tool_call index (tc.index) to the Anthropic content
+  // block index we assigned it. Argument fragments arrive with only tc.index,
+  // so this is the only way to route them back to the right block when several
+  // tool calls stream concurrently.
+  const toolIndexToBlock = {}
   let contentBlockIndex = 0
   let _inTextBlock = false
 
@@ -1129,20 +1156,32 @@ function createStreamTranslator(model, res) {
           if (tc.id) {
             closeTextBlock()
             const blockIdx = contentBlockIndex
-            toolCallBuffers[blockIdx] = { id: tc.id, name: tc.function?.name || "", arguments: "" }
+            toolIndexToBlock[idx] = blockIdx
+            toolCallBuffers[blockIdx] = { id: tc.id, name: tc.function?.name || "", arguments: tc.function?.arguments || "" }
             sendSSE("content_block_start", {
               type: "content_block_start",
               index: blockIdx,
               content_block: { type: "tool_use", id: tc.id, name: tc.function?.name || "", input: {} },
             })
             contentBlockIndex++
+            // A first delta may carry both the id and a leading argument
+            // fragment; emit it now or those bytes are lost.
+            if (tc.function?.arguments) {
+              sendSSE("content_block_delta", {
+                type: "content_block_delta",
+                index: blockIdx,
+                delta: { type: "input_json_delta", partial_json: tc.function.arguments },
+              })
+            }
           } else if (tc.function?.arguments) {
-            const bufIdx = Object.keys(toolCallBuffers).pop()
+            // Route by the provider's tool index, not insertion order — with
+            // parallel tool calls the newest buffer is often the wrong one.
+            const bufIdx = toolIndexToBlock[idx]
             if (bufIdx !== undefined) {
               toolCallBuffers[bufIdx].arguments += tc.function.arguments
               sendSSE("content_block_delta", {
                 type: "content_block_delta",
-                index: parseInt(bufIdx),
+                index: bufIdx,
                 delta: { type: "input_json_delta", partial_json: tc.function.arguments },
               })
             }
@@ -1403,7 +1442,7 @@ async function handleRequest(req, res, token) {
     }
 
     if (!copilotRes.ok) {
-      const errText = await copilotRes.text()
+      const errText = await withIdleTimeout(copilotRes.text(), COPILOT_REQUEST_TIMEOUT_MS, "error body read")
       let errType = "api_error"
       if (copilotRes.status === 401) errType = "authentication_error"
       else if (copilotRes.status === 429) errType = "rate_limit_error"
@@ -1428,7 +1467,7 @@ async function handleRequest(req, res, token) {
 
       try {
         while (true) {
-          const { done, value } = await reader.read()
+          const { done, value } = await withIdleTimeout(reader.read(), COPILOT_REQUEST_TIMEOUT_MS, "stream read")
           if (done) {
             translator.processChunk(null)
             break
@@ -1463,7 +1502,7 @@ async function handleRequest(req, res, token) {
       res.end()
       console.log(`  ← stream complete`)
     } else {
-      const data = await copilotRes.json()
+      const data = await withIdleTimeout(copilotRes.json(), COPILOT_REQUEST_TIMEOUT_MS, "body read")
       const response = translateResponseToAnthropic(data, anthropicReq.model)
       res.writeHead(200, { "Content-Type": "application/json" })
       res.end(JSON.stringify(response))
@@ -1478,48 +1517,58 @@ async function handleRequest(req, res, token) {
 
 // ─── Server Setup ───────────────────────────────────────────────────────────
 
-const token = loadAuth()
-const server = createServer((req, res) => handleRequest(req, res, token))
+// Exported for tests (scripts/test-streaming.mjs). The server below only boots
+// when this file is executed directly, so importing it has no side effects.
+export { createStreamTranslator, translateMessages, translateContentPart, mapModel }
 
-server.on("error", (err) => {
-  if (err.code === "EADDRINUSE") {
-    console.error(`❌ Port ${PORT} is already in use`)
-    console.error(`   Try: lsof -i :${PORT}  or  COPILOT_PROXY_PORT=18081 node scripts/proxy.mjs`)
-    process.exit(1)
-  }
-  throw err
-})
+const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 
-server.listen(PORT, () => {
-  console.log("┌─────────────────────────────────────────────┐")
-  console.log("│  Claude Code ↔ GitHub Copilot Proxy         │")
-  console.log("├─────────────────────────────────────────────┤")
-  console.log(`│  Port: ${PORT}                              │`)
-  console.log(`│  Search: Exa/Parallel MCP + DDG fallback    │`)
-  if (BRAVE_API_KEY) {
-    console.log("│  Brave: ✓ (primary)                         │")
-  }
-  if (WEBSEARCH_PROVIDER) {
-    console.log(`│  Provider override: ${WEBSEARCH_PROVIDER.padEnd(23)}│`)
-  }
-  console.log("├─────────────────────────────────────────────┤")
-  console.log(`│  ANTHROPIC_BASE_URL=http://localhost:${PORT}  │`)
-  console.log("│  ANTHROPIC_API_KEY=copilot-proxy             │")
-  console.log("└─────────────────────────────────────────────┘")
-  console.log(
-    FORWARD_REASONING
-      ? "  ℹ Reasoning effort forwarded to Copilot as reasoning_effort (low/medium/high/xhigh/max)."
-      : "  ℹ Reasoning-effort forwarding disabled (COPILOT_FORWARD_REASONING=0)."
-  )
-})
+if (isMain) startServer()
 
-process.on("SIGINT", () => {
-  console.log("\nShutting down proxy server...")
-  server.close()
-  process.exit(0)
-})
+function startServer() {
+  const token = loadAuth()
+  const server = createServer((req, res) => handleRequest(req, res, token))
 
-process.on("SIGTERM", () => {
-  server.close()
-  process.exit(0)
-})
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`❌ Port ${PORT} is already in use`)
+      console.error(`   Try: lsof -i :${PORT}  or  COPILOT_PROXY_PORT=18081 node scripts/proxy.mjs`)
+      process.exit(1)
+    }
+    throw err
+  })
+
+  server.listen(PORT, () => {
+    console.log("┌─────────────────────────────────────────────┐")
+    console.log("│  Claude Code ↔ GitHub Copilot Proxy         │")
+    console.log("├─────────────────────────────────────────────┤")
+    console.log(`│  Port: ${PORT}                              │`)
+    console.log(`│  Search: Exa/Parallel MCP + DDG fallback    │`)
+    if (BRAVE_API_KEY) {
+      console.log("│  Brave: ✓ (primary)                         │")
+    }
+    if (WEBSEARCH_PROVIDER) {
+      console.log(`│  Provider override: ${WEBSEARCH_PROVIDER.padEnd(23)}│`)
+    }
+    console.log("├─────────────────────────────────────────────┤")
+    console.log(`│  ANTHROPIC_BASE_URL=http://localhost:${PORT}  │`)
+    console.log("│  ANTHROPIC_API_KEY=copilot-proxy             │")
+    console.log("└─────────────────────────────────────────────┘")
+    console.log(
+      FORWARD_REASONING
+        ? "  ℹ Reasoning effort forwarded to Copilot as reasoning_effort (low/medium/high/xhigh/max)."
+        : "  ℹ Reasoning-effort forwarding disabled (COPILOT_FORWARD_REASONING=0)."
+    )
+  })
+
+  process.on("SIGINT", () => {
+    console.log("\nShutting down proxy server...")
+    server.close()
+    process.exit(0)
+  })
+
+  process.on("SIGTERM", () => {
+    server.close()
+    process.exit(0)
+  })
+}
