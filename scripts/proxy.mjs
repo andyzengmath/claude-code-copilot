@@ -1369,8 +1369,23 @@ async function handleRequest(req, res, token) {
 
     // ── Web Search Path ──
     if (wsConfig.hasWebSearch) {
+      // Only the search loop is recoverable. Once emission starts below, a
+      // failure must NOT fall through to the normal path: that would bill a
+      // second Copilot completion and call writeHead() on an already-streaming
+      // socket. Emission errors propagate to the outer catch instead, which
+      // closes cleanly when headers are already sent.
+      let searchResult = null
       try {
-        const { contentBlocks, lastResponse, searchCount } = await handleWebSearchLoop(openaiReq, token, wsConfig.maxUses)
+        searchResult = await handleWebSearchLoop(openaiReq, token, wsConfig.maxUses)
+      } catch (err) {
+        console.warn(`⚠ Web search loop error: ${err.message}, falling back to normal path`)
+        // Remove web_search tool and fall through to the normal path.
+        openaiReq.tools = (openaiReq.tools || []).filter((t) => t.function?.name !== "web_search")
+        if (openaiReq.tools.length === 0) delete openaiReq.tools
+      }
+
+      if (searchResult) {
+        const { contentBlocks, lastResponse, searchCount } = searchResult
 
         if (isStream) {
           res.writeHead(200, {
@@ -1445,11 +1460,6 @@ async function handleRequest(req, res, token) {
           console.log(`  ← ${response.stop_reason} | in: ${response.usage.input_tokens} out: ${response.usage.output_tokens} | blocks: ${contentBlocks.length} | searches: ${searchCount}`)
         }
         return
-      } catch (err) {
-        console.warn(`⚠ Web search loop error: ${err.message}, falling back to normal path`)
-        // Remove web_search tool and fall through
-        openaiReq.tools = (openaiReq.tools || []).filter((t) => t.function?.name !== "web_search")
-        if (openaiReq.tools.length === 0) delete openaiReq.tools
       }
     }
 
