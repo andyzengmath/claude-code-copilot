@@ -249,5 +249,88 @@ console.log("\nerror path respects headersSent (#4)")
   check("still sends 500 when headers not yet sent", freshAttempts.includes("writeHead"), `attempts: ${freshAttempts}`)
 }
 
+// ── Test 8: web-search catch scope (#1) ────────────────────────────────────
+// The old code wrapped BOTH the search loop and the SSE emission in one try.
+// A failure during emission (client EPIPE, JSON.stringify throw) was treated as
+// "search failed" and fell through to the normal path — a second billed
+// completion plus writeHead() on an already-streaming socket.
+//
+// Models both shapes and asserts the new one cannot double-bill.
+console.log("\nweb-search catch scope (#1)")
+{
+  // Old shape: one try around loop + emission.
+  function oldShape({ loopThrows, emitThrows }) {
+    const effects = []
+    try {
+      if (loopThrows) throw new Error("search failed")
+      effects.push("writeHead")
+      if (emitThrows) throw new Error("EPIPE")
+      effects.push("emitted")
+      return effects
+    } catch {
+      effects.push("fallthrough")
+      effects.push("upstreamCall") // second billed completion
+      effects.push("writeHead") // on an already-streaming socket
+    }
+    return effects
+  }
+
+  // New shape: try around the loop only; emission errors propagate.
+  function newShape({ loopThrows, emitThrows }) {
+    const effects = []
+    let searchResult = null
+    try {
+      if (loopThrows) throw new Error("search failed")
+      searchResult = { ok: true }
+    } catch {
+      effects.push("fallthrough")
+    }
+    if (searchResult) {
+      effects.push("writeHead")
+      if (emitThrows) {
+        effects.push("propagated")
+        return effects
+      }
+      effects.push("emitted")
+      return effects
+    }
+    effects.push("upstreamCall")
+    return effects
+  }
+
+  const oldEmitFail = oldShape({ loopThrows: false, emitThrows: true })
+  const newEmitFail = newShape({ loopThrows: false, emitThrows: true })
+
+  check(
+    "old shape double-billed on emission failure (documents the bug)",
+    oldEmitFail.filter((e) => e === "upstreamCall").length === 1 &&
+      oldEmitFail.filter((e) => e === "writeHead").length === 2,
+    `old: ${oldEmitFail}`,
+  )
+  check(
+    "emission failure does NOT trigger a second upstream call",
+    !newEmitFail.includes("upstreamCall"),
+    `new: ${newEmitFail}`,
+  )
+  check(
+    "emission failure does NOT writeHead twice",
+    newEmitFail.filter((e) => e === "writeHead").length === 1,
+    `new: ${newEmitFail}`,
+  )
+
+  // Search-loop failure must still fall back — that behaviour is intentional.
+  const loopFail = newShape({ loopThrows: true, emitThrows: false })
+  check("search-loop failure still falls back to normal path", loopFail.includes("upstreamCall"), `new: ${loopFail}`)
+  check("fallback path does not pre-send headers", loopFail.indexOf("writeHead") === -1, `new: ${loopFail}`)
+
+  // Happy path unchanged.
+  const ok = newShape({ loopThrows: false, emitThrows: false })
+  check(
+    "happy path emits once with no upstream refetch",
+    ok.includes("emitted") && !ok.includes("upstreamCall") && ok.filter((e) => e === "writeHead").length === 1,
+    `new: ${ok}`,
+  )
+}
+
 console.log(failures === 0 ? "\n✅ all streaming tests passed\n" : `\n❌ ${failures} check(s) failed\n`)
 process.exit(failures === 0 ? 0 : 1)
