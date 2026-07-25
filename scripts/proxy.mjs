@@ -879,14 +879,27 @@ function estimateTokens(body) {
   return Math.max(1, Math.ceil(text.length / 4))
 }
 
+// Convert an Anthropic image block's `source` into a URL usable in an OpenAI
+// image_url part. Anthropic supports both base64 and url sources; assuming
+// base64 produced "data:undefined;base64,undefined" for url-sourced images.
+// Returns null for a shape we cannot represent, so callers can drop the block
+// rather than send a corrupt one.
+function imageSourceToUrl(source) {
+  if (!source) return null
+  if (source.type === "url") return source.url || null
+  if (source.type === "base64" || source.data) {
+    if (!source.data || !source.media_type) return null
+    return `data:${source.media_type};base64,${source.data}`
+  }
+  return null
+}
+
 function translateContentPart(part) {
   if (typeof part === "string") return { type: "text", text: part }
   if (part.type === "text") return { type: "text", text: part.text }
   if (part.type === "image") {
-    return {
-      type: "image_url",
-      image_url: { url: `data:${part.source.media_type};base64,${part.source.data}` },
-    }
+    const url = imageSourceToUrl(part.source)
+    return url ? { type: "image_url", image_url: { url } } : null
   }
   if (part.type === "tool_use" || part.type === "tool_result") return null
   // Extended-thinking blocks are Anthropic-internal reasoning that Copilot's
@@ -914,19 +927,43 @@ function translateMessages(anthropicMessages, system) {
         const toolResults = msg.content.filter((p) => p.type === "tool_result")
         const otherParts = msg.content.filter((p) => p.type !== "tool_result")
 
+        // Images returned by a tool cannot ride along in the tool message:
+        // Chat Completions only accepts image_url parts on `user` messages
+        // ("Image URLs are only allowed for messages with role 'user'"). They
+        // used to be JSON.stringify'd into the text, dumping raw base64 into
+        // the prompt. Instead, leave a placeholder in the tool result and
+        // re-attach the images in a follow-up user message.
+        const deferredImages = []
+
         for (const tr of toolResults) {
-          const content = typeof tr.content === "string"
-            ? tr.content
-            : Array.isArray(tr.content)
-              ? tr.content.map((c) => c.text || JSON.stringify(c)).join("\n")
-              : JSON.stringify(tr.content || "")
+          let content
+          if (typeof tr.content === "string") {
+            content = tr.content
+          } else if (Array.isArray(tr.content)) {
+            content = tr.content
+              .map((c) => {
+                if (typeof c === "string") return c
+                if (c.type === "text") return c.text
+                if (c.type === "image") {
+                  const url = imageSourceToUrl(c.source)
+                  if (!url) return "[unsupported image omitted]"
+                  deferredImages.push({ type: "image_url", image_url: { url } })
+                  return "[image returned by tool — attached below]"
+                }
+                return c.text || JSON.stringify(c)
+              })
+              .join("\n")
+          } else {
+            content = JSON.stringify(tr.content || "")
+          }
           messages.push({ role: "tool", tool_call_id: tr.tool_use_id, content })
         }
 
-        if (otherParts.length > 0) {
+        if (otherParts.length > 0 || deferredImages.length > 0) {
           const translated = otherParts.map(translateContentPart).filter(Boolean)
-          if (translated.length > 0) {
-            messages.push({ role: "user", content: translated })
+          const combined = [...translated, ...deferredImages]
+          if (combined.length > 0) {
+            messages.push({ role: "user", content: combined })
           }
         }
       }
