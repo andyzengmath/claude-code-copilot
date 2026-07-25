@@ -8,7 +8,7 @@
 //   #8 first tool_call delta carrying id + a leading argument fragment
 //   #6 concurrency semaphore over-admission on wakeup
 
-import { createStreamTranslator } from "./proxy.mjs"
+import { createStreamTranslator, translateContentPart, translateMessages } from "./proxy.mjs"
 
 let failures = 0
 function check(name, cond, detail) {
@@ -330,6 +330,78 @@ console.log("\nweb-search catch scope (#1)")
     ok.includes("emitted") && !ok.includes("upstreamCall") && ok.filter((e) => e === "writeHead").length === 1,
     `new: ${ok}`,
   )
+}
+
+// ── Test 9: image source translation (#10) ─────────────────────────────────
+// translateContentPart hard-coded a base64 data URL, so a url-sourced image
+// produced "data:undefined;base64,undefined".
+console.log("\nimage source translation (#10)")
+{
+  const b64 = translateContentPart({
+    type: "image",
+    source: { type: "base64", media_type: "image/png", data: "AAAA" },
+  })
+  check("base64 image still works", b64?.image_url?.url === "data:image/png;base64,AAAA", JSON.stringify(b64))
+
+  const url = translateContentPart({
+    type: "image",
+    source: { type: "url", url: "https://example.com/cat.png" },
+  })
+  check("url image uses the url directly", url?.image_url?.url === "https://example.com/cat.png", JSON.stringify(url))
+  check("url image is not a broken data URL", !JSON.stringify(url).includes("undefined"), JSON.stringify(url))
+
+  const broken = translateContentPart({ type: "image", source: { type: "base64" } })
+  check("incomplete image source is dropped, not corrupted", broken === null, JSON.stringify(broken))
+}
+
+// ── Test 10: image inside a tool_result (#9) ───────────────────────────────
+// Chat Completions rejects image parts on `tool` messages ("Image URLs are
+// only allowed for messages with role 'user'"), and the old code
+// JSON.stringify'd them into the tool text — dumping raw base64 in the prompt.
+console.log("\nimage inside tool_result (#9)")
+{
+  const out = translateMessages(
+    [
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_1",
+            content: [
+              { type: "text", text: "here is the screenshot" },
+              { type: "image", source: { type: "base64", media_type: "image/png", data: "SCREENSHOT" } },
+            ],
+          },
+        ],
+      },
+    ],
+    null,
+  )
+
+  const toolMsg = out.find((m) => m.role === "tool")
+  const userMsg = out.find((m) => m.role === "user")
+
+  check("tool message present with correct id", toolMsg?.tool_call_id === "toolu_1", JSON.stringify(toolMsg))
+  check("tool content is a plain string", typeof toolMsg?.content === "string", typeof toolMsg?.content)
+  check("raw base64 not dumped into tool text", !toolMsg?.content.includes("SCREENSHOT"), toolMsg?.content)
+  check("tool text preserved", toolMsg?.content.includes("here is the screenshot"), toolMsg?.content)
+
+  const imgPart = (userMsg?.content || []).find((p) => p.type === "image_url")
+  check("image re-attached on a user message", !!imgPart, JSON.stringify(userMsg))
+  check(
+    "re-attached image keeps its data",
+    imgPart?.image_url?.url === "data:image/png;base64,SCREENSHOT",
+    JSON.stringify(imgPart),
+  )
+
+  // Text-only tool results must not gain a spurious user message.
+  const plain = translateMessages(
+    [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t2", content: "just text" }] }],
+    null,
+  )
+  check("text-only tool_result adds no user message", !plain.some((m) => m.role === "user"), JSON.stringify(plain))
+  check("text-only tool_result content intact", plain.find((m) => m.role === "tool")?.content === "just text")
 }
 
 console.log(failures === 0 ? "\n✅ all streaming tests passed\n" : `\n❌ ${failures} check(s) failed\n`)
