@@ -191,5 +191,63 @@ console.log("\nsearch concurrency gate (#6)")
   check("all tasks drained", active === 0, `active=${active}`)
 }
 
+// ── Test 6: max_uses clamp (#7) ────────────────────────────────────────────
+// max_uses is client-supplied and each round is a billed completion, so an
+// unclamped value fans one request out into hundreds.
+console.log("\nweb_search max_uses clamp (#7)")
+{
+  const CAP = 10
+  const effective = (maxUses) => {
+    const requested = Number.isFinite(maxUses) && maxUses > 0 ? Math.floor(maxUses) : 5
+    return Math.min(requested, CAP)
+  }
+
+  check("absurd max_uses clamped to cap", effective(500) === CAP, `got ${effective(500)}`)
+  check("reasonable max_uses preserved", effective(3) === 3, `got ${effective(3)}`)
+  check("undefined falls back to default", effective(undefined) === 5, `got ${effective(undefined)}`)
+  check("zero falls back to default", effective(0) === 5, `got ${effective(0)}`)
+  check("negative falls back to default", effective(-1) === 5, `got ${effective(-1)}`)
+}
+
+// ── Test 7: outer catch respects headersSent (#4) ──────────────────────────
+// Once a streaming response has sent headers, writeHead(500) throws
+// ERR_HTTP_HEADERS_SENT on top of the original error and corrupts the socket.
+console.log("\nerror path respects headersSent (#4)")
+{
+  const attempts = []
+  const fakeRes = {
+    headersSent: true,
+    writeHead() {
+      attempts.push("writeHead")
+      throw new Error("ERR_HTTP_HEADERS_SENT")
+    },
+    end() {
+      attempts.push("end")
+    },
+  }
+
+  // Mirrors the guard in handleRequest's outer catch.
+  const handleError = (res) => {
+    if (res.headersSent) {
+      res.end()
+      return
+    }
+    res.writeHead(500, { "Content-Type": "application/json" })
+    res.end("{}")
+  }
+
+  handleError(fakeRes)
+  check("no writeHead after headers sent", !attempts.includes("writeHead"), `attempts: ${attempts}`)
+  check("connection closed cleanly", attempts.includes("end"), `attempts: ${attempts}`)
+
+  const freshAttempts = []
+  handleError({
+    headersSent: false,
+    writeHead: () => freshAttempts.push("writeHead"),
+    end: () => freshAttempts.push("end"),
+  })
+  check("still sends 500 when headers not yet sent", freshAttempts.includes("writeHead"), `attempts: ${freshAttempts}`)
+}
+
 console.log(failures === 0 ? "\n✅ all streaming tests passed\n" : `\n❌ ${failures} check(s) failed\n`)
 process.exit(failures === 0 ? 0 : 1)

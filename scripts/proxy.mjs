@@ -29,6 +29,9 @@ const COPILOT_INTEGRATION_ID = process.env.COPILOT_INTEGRATION_ID || "vscode-cha
 const BRAVE_API_KEY = process.env.BRAVE_API_KEY || ""
 const SERPER_API_KEY = process.env.SERPER_API_KEY || ""
 const WEB_SEARCH_MAX_RESULTS = parseInt(process.env.WEB_SEARCH_MAX_RESULTS || "5", 10)
+// Upper bound on the client-supplied web_search max_uses. Every search round is
+// a billed Copilot completion, so this caps the blast radius of one request.
+const WEB_SEARCH_MAX_USES_CAP = parseInt(process.env.WEB_SEARCH_MAX_USES_CAP || "10", 10)
 const COPILOT_REQUEST_TIMEOUT_MS = parseInt(process.env.COPILOT_REQUEST_TIMEOUT_MS || "120000", 10)
 // Retry transient Copilot failures (429 / 5xx / network / timeout) with
 // exponential backoff. Set COPILOT_MAX_RETRIES=0 to disable.
@@ -622,7 +625,16 @@ async function handleWebSearchLoop(openaiReq, token, maxSearches) {
   let currentReq = { ...openaiReq }
   let lastResponse = null
 
-  for (let iteration = 0; iteration < (maxSearches || 5) + 1; iteration++) {
+  // maxSearches comes straight from the client's web_search tool max_uses.
+  // Each iteration is a billed Copilot completion, so an unclamped value lets a
+  // single request fan out into hundreds of them. Clamp to a sane server limit.
+  const requested = Number.isFinite(maxSearches) && maxSearches > 0 ? Math.floor(maxSearches) : 5
+  const effectiveMax = Math.min(requested, WEB_SEARCH_MAX_USES_CAP)
+  if (requested > effectiveMax) {
+    console.warn(`⚠ web_search max_uses ${requested} exceeds cap, clamping to ${effectiveMax}`)
+  }
+
+  for (let iteration = 0; iteration < effectiveMax + 1; iteration++) {
     lastResponse = await collectCopilotResponse(currentReq, token)
     const choice = lastResponse.choices?.[0]
 
@@ -1213,6 +1225,20 @@ function createStreamTranslator(model, res) {
 
 // ─── Request Handler ────────────────────────────────────────────────────────
 
+// Read a request body to completion. Rejects (rather than throwing
+// asynchronously into nothing) if the client disconnects mid-upload, so every
+// caller must be inside a try/catch. A client that resets the socket partway
+// through is routine — not a reason to take the process down.
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    req.on("data", (c) => chunks.push(c))
+    req.on("end", () => resolve(Buffer.concat(chunks).toString()))
+    req.on("error", reject)
+    req.on("aborted", () => reject(new Error("client aborted request")))
+  })
+}
+
 async function handleRequest(req, res, token) {
   const url = req.url || "/"
   console.log(`[${new Date().toISOString()}] ${req.method} ${url}`)
@@ -1232,11 +1258,20 @@ async function handleRequest(req, res, token) {
 
   // Token counting
   if (url.includes("/count_tokens") || url.includes("/token")) {
-    const chunks = []
-    for await (const chunk of req) chunks.push(chunk)
-    const body = Buffer.concat(chunks).toString()
-    res.writeHead(200, { "Content-Type": "application/json" })
-    res.end(JSON.stringify({ input_tokens: estimateTokens(body) }))
+    try {
+      const body = await readRequestBody(req)
+      res.writeHead(200, { "Content-Type": "application/json" })
+      res.end(JSON.stringify({ input_tokens: estimateTokens(body) }))
+    } catch (err) {
+      // Client hung up mid-upload; nothing to reply to.
+      console.warn(`⚠ count_tokens body read failed: ${err.message}`)
+      if (!res.headersSent) {
+        res.writeHead(400, { "Content-Type": "application/json" })
+        res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: err.message } }))
+      } else {
+        res.end()
+      }
+    }
     return
   }
 
@@ -1272,9 +1307,7 @@ async function handleRequest(req, res, token) {
 
   try {
     // Parse request body
-    const chunks = []
-    for await (const chunk of req) chunks.push(chunk)
-    const body = Buffer.concat(chunks).toString()
+    const body = await readRequestBody(req)
     let anthropicReq
     try {
       anthropicReq = JSON.parse(body)
@@ -1510,6 +1543,13 @@ async function handleRequest(req, res, token) {
     }
   } catch (err) {
     console.error(`❌ Error: ${err.message}`)
+    // Headers are already on the wire for a streaming response, so writeHead
+    // would throw ERR_HTTP_HEADERS_SENT on top of the original error and
+    // corrupt the connection. Close cleanly instead.
+    if (res.headersSent) {
+      res.end()
+      return
+    }
     res.writeHead(500, { "Content-Type": "application/json" })
     res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: err.message } }))
   }
@@ -1527,7 +1567,33 @@ if (isMain) startServer()
 
 function startServer() {
   const token = loadAuth()
-  const server = createServer((req, res) => handleRequest(req, res, token))
+  const server = createServer((req, res) => {
+    // handleRequest is async: without a .catch() any rejection it does not
+    // handle internally becomes an unhandled rejection, which terminates the
+    // process under Node's default --unhandled-rejections=throw. This is the
+    // last line of defence — one aborted request must never kill the proxy.
+    handleRequest(req, res, token).catch((err) => {
+      console.error(`❌ Unhandled request error: ${err.message}`)
+      try {
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" })
+          res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "Internal proxy error" } }))
+        } else {
+          res.end()
+        }
+      } catch {
+        // Socket already gone; nothing further to do.
+      }
+    })
+  })
+
+  // A client that disconnects mid-request surfaces here too. Log and continue.
+  server.on("clientError", (err, socket) => {
+    console.warn(`⚠ Client error: ${err.message}`)
+    if (socket.writable && !socket.destroyed) {
+      socket.end("HTTP/1.1 400 Bad Request\r\n\r\n")
+    }
+  })
 
   server.on("error", (err) => {
     if (err.code === "EADDRINUSE") {
