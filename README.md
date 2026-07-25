@@ -112,6 +112,37 @@ ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY=copilot-proxy claude
 | `EXA_API_KEY` | *(none)* | Optional API key for Exa (works without one) |
 | `PARALLEL_API_KEY` | *(none)* | Optional API key for Parallel (works without one) |
 | `WEB_SEARCH_MAX_RESULTS` | `5` | Max search results per query |
+| `WEB_SEARCH_MAX_USES_CAP` | `10` | Upper bound on a request's `max_uses`. Each search round is a billed completion, so this caps how far one request can fan out |
+
+### Reliability
+
+| Variable | Default | Description |
+|---|---|---|
+| `COPILOT_REQUEST_TIMEOUT_MS` | `120000` | Per-attempt timeout. Also applied as an idle timeout to response body reads, so a stalled upstream cannot hang the proxy |
+| `COPILOT_MAX_RETRIES` | `3` | Retries for transient failures (429 / 5xx / network / timeout) with exponential backoff. Set `0` to disable |
+| `COPILOT_MIN_REQUEST_INTERVAL_MS` | `0` | Minimum gap between requests. Opt in to pace parallel subagents and avoid rate limits |
+| `COPILOT_FORWARD_REASONING` | `1` | Forward extended-thinking effort to Copilot as `reasoning_effort`. Set `0` to disable |
+
+### Advanced
+
+| Variable | Default | Description |
+|---|---|---|
+| `COPILOT_EDITOR_VERSION` | `vscode/1.99.0` | `Editor-Version` header sent to Copilot |
+| `COPILOT_INTEGRATION_ID` | `vscode-chat` | `Copilot-Integration-Id` header sent to Copilot |
+
+## Tests
+
+No dependencies or network access needed for the first suite:
+
+```bash
+node scripts/test-streaming.mjs      # translation + streaming assertions
+node scripts/test-crash-safety.mjs   # boots a proxy and attacks it over raw TCP
+```
+
+`test-streaming.mjs` covers parallel tool-call routing, image translation, the
+web-search catch scope, and the search concurrency gate. `test-crash-safety.mjs`
+verifies the proxy survives clients that disconnect mid-upload (it needs a saved
+auth token to boot, but makes no upstream calls).
 
 
 ## Windows Usage
