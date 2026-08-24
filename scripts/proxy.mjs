@@ -1634,12 +1634,15 @@ function startServer() {
     })
   })
 
-  // A client that disconnects mid-request surfaces here too. Log and continue.
+  // Expected disconnects need no HTTP response. Keep malformed-request errors
+  // visible and return the parser's conventional 400 response.
   server.on("clientError", (err, socket) => {
-    console.warn(`⚠ Client error: ${err.message}`)
-    if (socket.writable && !socket.destroyed) {
-      socket.end("HTTP/1.1 400 Bad Request\r\n\r\n")
+    if (err.code === "ECONNRESET" || !socket.writable) {
+      socket.destroy()
+      return
     }
+    console.warn(`⚠ Client error: ${err.message}`)
+    socket.end("HTTP/1.1 400 Bad Request\r\n\r\n")
   })
 
   server.on("error", (err) => {
