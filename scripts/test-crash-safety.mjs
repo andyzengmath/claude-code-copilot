@@ -5,6 +5,7 @@
 // Covers the availability fixes:
 //   #2 aborted request body must not kill the process (remote DoS)
 //   #4 error path must not writeHead() after headers are sent
+//   routine TCP resets after a completed response must not be logged as errors
 //
 // Requires ~/.claude-copilot-auth.json (the proxy loads a token at boot), but
 // makes no upstream Copilot calls — every request here fails or completes
@@ -63,6 +64,37 @@ function abortMidUpload(path) {
   })
 }
 
+function resetAfterResponsePayload(path, body, payloadPattern) {
+  return new Promise((resolve) => {
+    const s = net.connect(PORT, "127.0.0.1", () => {
+      s.write(
+        `POST ${path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: keep-alive\r\n\r\n${body}`,
+      )
+    })
+    let data = ""
+    let settled = false
+    const timeout = setTimeout(() => finish(), 4000)
+
+    function finish(reset = false) {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      if (!s.destroyed) {
+        if (reset) s.resetAndDestroy()
+        else s.destroy()
+      }
+      resolve(data)
+    }
+
+    s.on("data", (c) => {
+      data += c
+      if (payloadPattern.test(data)) finish(true)
+    })
+    s.on("end", () => finish())
+    s.on("error", () => finish())
+  })
+}
+
 const proxy = spawn(process.execPath, [proxyPath], {
   env: { ...process.env, COPILOT_PROXY_PORT: String(PORT) },
   stdio: ["ignore", "pipe", "pipe"],
@@ -83,6 +115,18 @@ await sleep(3000)
 if (exited) {
   console.log(`\n✗ proxy failed to boot (${exitInfo})\n${stderr.slice(0, 500)}`)
   process.exit(1)
+}
+
+console.log("\nroutine reset after completed response")
+{
+  const body = JSON.stringify({ messages: [{ role: "user", content: "hello world" }] })
+  const stderrBefore = stderr.length
+  const res = await resetAfterResponsePayload("/v1/messages/count_tokens", body, /"input_tokens":\s*\d+}/)
+  await sleep(400)
+  const resetLog = stderr.slice(stderrBefore)
+
+  check("client received the complete response before resetting", /"input_tokens":\s*\d+/.test(res), res.slice(0, 120))
+  check("expected ECONNRESET is not logged as a client error", !resetLog.includes("ECONNRESET"), resetLog.trim())
 }
 
 console.log("\naborted request bodies (#2 — remote DoS)")
