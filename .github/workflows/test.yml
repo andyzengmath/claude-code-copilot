@@ -33,11 +33,17 @@ jobs:
     timeout-minutes: 10
     env:
       COMPOSE_PROJECT_NAME: copilot-smoke-${{ github.run_id }}-${{ github.run_attempt }}
-      COMPOSE_FILE: docker-compose.yml:${{ runner.temp }}/copilot-docker-smoke/compose.override.json
-      COPILOT_AUTH_FILE: ${{ runner.temp }}/copilot-docker-smoke/auth.json
-      COPILOT_PROXY_KEY_FILE: ${{ runner.temp }}/copilot-docker-smoke/key.json
       COPILOT_PROXY_PORT: "18081"
     steps:
+      - name: Set runner-specific fixture paths
+        id: smoke_paths
+        shell: bash
+        run: |
+          {
+            echo "COMPOSE_FILE=docker-compose.yml:$RUNNER_TEMP/copilot-docker-smoke/compose.override.json"
+            echo "COPILOT_AUTH_FILE=$RUNNER_TEMP/copilot-docker-smoke/auth.json"
+            echo "COPILOT_PROXY_KEY_FILE=$RUNNER_TEMP/copilot-docker-smoke/key.json"
+          } >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -127,10 +133,10 @@ jobs:
             console.log("HTTP smoke checks passed without upstream API calls");
           '
       - name: Always remove the smoke Compose project
-        if: always()
+        if: always() && steps.smoke_paths.outcome == 'success'
         run: docker compose down --volumes --remove-orphans
       - name: Always remove temporary credentials
-        if: always()
+        if: always() && steps.smoke_paths.outcome == 'success'
         shell: bash
         run: |
           node --input-type=module -e '
