@@ -1,9 +1,10 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { existsSync } from "node:fs"
-import { mkdtemp, readFile, writeFile, readdir, rm, stat, chmod, mkdir } from "node:fs/promises"
+import fsPromises, { mkdtemp, readFile, writeFile, readdir, rm, stat, chmod, mkdir } from "node:fs/promises"
+import { syncBuiltinESMExports } from "node:module"
 import { homedir, tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
@@ -135,6 +136,42 @@ test("private JSON replacement is complete and leaves directory permissions and 
   await assertPrivate(filePath)
   assert.equal((await stat(dir)).mode, before)
   assert.deepEqual((await readdir(dir)).sort(), [".unrelated.tmp", "auth fixture & private.json"])
+})
+
+test("Windows credential protection removes unexpected explicit grants before publication", {
+  skip: process.platform !== "win32",
+}, async (t) => {
+  const { savePrivateJson, getProxyKey } = await credentials()
+  const { dir, filePath } = await fixture(t)
+  const originalOpen = fsPromises.open
+  const icacls = join(process.env.SystemRoot || "C:\\Windows", "System32", "icacls.exe")
+  let seeded = 0
+  const interceptedOpen = t.mock.method(fsPromises, "open", async (file, ...options) => {
+    const handle = await originalOpen(file, ...options)
+    if (typeof file === "string" && dirname(file) === dir && file.endsWith(".tmp")) {
+      try {
+        assert.equal((await handle.stat()).size, 0)
+        await execFileAsync(icacls, [file, "/grant:r", "*S-1-1-0:(R)"], { windowsHide: true })
+        seeded++
+      } catch (error) {
+        await handle.close()
+        throw error
+      }
+    }
+    return handle
+  })
+  syncBuiltinESMExports()
+  try {
+    await savePrivateJson(filePath, { access_token: TOKEN })
+    await assertPrivate(filePath)
+    const keyPath = join(dir, "key.json")
+    await getProxyKey({ filePath: keyPath })
+    await assertPrivate(keyPath)
+    assert.equal(seeded, 2)
+  } finally {
+    interceptedOpen.mock.restore()
+    syncBuiltinESMExports()
+  }
 })
 
 test("readers never observe partial JSON during replacements", async (t) => {

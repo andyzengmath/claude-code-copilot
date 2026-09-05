@@ -82,8 +82,12 @@ async function protectWindowsFile(filePath) {
   })
   try {
     const sid = await windowsSid
-    // The file is still EMPTY here. Remove inherited grants, then allow only this user.
+    // The file is still EMPTY. Reset explicit default-token grants before
+    // removing inherited access and granting only the current user.
     // execFile arguments (not shell interpolation) safely handle spaces/metacharacters.
+    await execFileAsync(join(system32, "icacls.exe"), [filePath, "/reset"], {
+      windowsHide: true, timeout: 5000,
+    })
     await execFileAsync(join(system32, "icacls.exe"), [
       filePath, "/inheritance:r", "/grant:r", `*${sid}:(F)`,
     ], { windowsHide: true, timeout: 5000 })
