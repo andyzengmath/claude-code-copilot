@@ -1,0 +1,202 @@
+name: Proxy tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Check launcher syntax
+        shell: bash
+        run: bash -n scripts/launch.sh
+      - name: Run offline tests (no install or credentials required)
+        env:
+          CLAUDE_CODE_TEST_BINARY: ""
+        run: npm test
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      COMPOSE_PROJECT_NAME: copilot-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+      COPILOT_PROXY_PORT: "18081"
+    steps:
+      - name: Set runner-specific fixture paths
+        id: smoke_paths
+        shell: bash
+        run: |
+          {
+            echo "COPILOT_AUTH_FILE=$RUNNER_TEMP/copilot-docker-smoke/auth.json"
+            echo "COPILOT_PROXY_KEY_FILE=$RUNNER_TEMP/copilot-docker-smoke/key.json"
+          } >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Create private fixture credentials
+        shell: bash
+        run: |
+          node --input-type=module -e '
+            import { mkdir } from "node:fs/promises";
+            import { dirname } from "node:path";
+            import { authFilePath, proxyKeyFilePath, savePrivateJson, getProxyKey } from "./scripts/credentials.mjs";
+            const directory = dirname(authFilePath());
+            await mkdir(directory, { recursive: true, mode: 0o700 });
+            await savePrivateJson(authFilePath(), { access_token: "docker-smoke-fixture-not-a-real-token" });
+            await getProxyKey({ filePath: proxyKeyFilePath() });
+          '
+      - name: Build and create only the smoke proxy
+        run: docker compose create --build proxy
+      - name: Block new external connections before starting the proxy
+        shell: bash
+        run: |
+          node --input-type=module -e '
+            import assert from "node:assert/strict";
+            import { appendFileSync } from "node:fs";
+            import { execFileSync } from "node:child_process";
+            const ids = execFileSync("docker", [
+              "network", "ls", "--quiet",
+              "--filter", `label=com.docker.compose.project=${process.env.COMPOSE_PROJECT_NAME}`,
+              "--filter", "label=com.docker.compose.network=default"
+            ], { encoding: "utf8" }).trim().split(/\r?\n/).filter(Boolean);
+            assert.equal(ids.length, 1);
+            const [network] = JSON.parse(execFileSync("docker", ["network", "inspect", ids[0]], { encoding: "utf8" }));
+            assert.equal(network.Driver, "bridge");
+            assert.equal(network.Internal, false);
+            assert.equal(network.EnableIPv6, false);
+            const bridge = network.Options["com.docker.network.bridge.name"] || `br-${network.Id.slice(0, 12)}`;
+            assert.match(bridge, /^[A-Za-z0-9_.-]{1,15}$/);
+            appendFileSync(process.env.GITHUB_ENV, `SMOKE_BRIDGE=${bridge}\n`);
+            execFileSync("sudo", [
+              "iptables", "-I", "DOCKER-USER", "-i", bridge,
+              "-m", "conntrack", "--ctstate", "NEW",
+              "-m", "comment", "--comment", process.env.COMPOSE_PROJECT_NAME, "-j", "REJECT"
+            ], { stdio: "inherit" });
+          '
+      - name: Start the egress-blocked proxy
+        run: docker compose start proxy
+      - name: Verify actual loopback publishing, read-only credentials, and blocked egress
+        shell: bash
+        run: |
+          node --input-type=module -e '
+            import assert from "node:assert/strict";
+            import { execFileSync } from "node:child_process";
+            import { authFilePath, proxyKeyFilePath } from "./scripts/credentials.mjs";
+            const id = execFileSync("docker", ["compose", "ps", "--quiet", "proxy"], { encoding: "utf8" }).trim();
+            assert.ok(id, "Compose did not start the proxy container");
+            const [container] = JSON.parse(execFileSync("docker", ["inspect", id], { encoding: "utf8" }));
+            assert.deepEqual(container.NetworkSettings.Ports["18080/tcp"], [
+              { HostIp: "127.0.0.1", HostPort: process.env.COPILOT_PROXY_PORT }
+            ]);
+            for (const [source, target] of [
+              [authFilePath(), "/run/secrets/copilot-auth.json"],
+              [proxyKeyFilePath(), "/run/secrets/copilot-proxy-key.json"]
+            ]) {
+              const mounts = container.Mounts.filter(mount => mount.Destination === target);
+              assert.equal(mounts.length, 1, "Missing or duplicate credential mount");
+              assert.equal(mounts[0].Type, "bind");
+              assert.equal(mounts[0].Source, source);
+              assert.equal(mounts[0].RW, false, "Credential mount must be read-only");
+            }
+            const networks = Object.values(container.NetworkSettings.Networks);
+            assert.equal(networks.length, 1);
+            const [network] = JSON.parse(execFileSync("docker", ["network", "inspect", networks[0].NetworkID], { encoding: "utf8" }));
+            assert.equal(network.Internal, false);
+            assert.equal(network.EnableIPv6, false);
+            assert.equal(process.env.SMOKE_BRIDGE,
+              network.Options["com.docker.network.bridge.name"] || `br-${network.Id.slice(0, 12)}`);
+            execFileSync("sudo", [
+              "iptables", "-C", "DOCKER-USER", "-i", process.env.SMOKE_BRIDGE,
+              "-m", "conntrack", "--ctstate", "NEW",
+              "-m", "comment", "--comment", process.env.COMPOSE_PROJECT_NAME, "-j", "REJECT"
+            ]);
+            const probe = `
+              import { connect } from "node:net";
+              const socket = connect({ host: "192.0.2.1", port: 443 });
+              await new Promise((resolve, reject) => {
+                socket.once("connect", () => reject(new Error("Unexpected external connection")));
+                socket.once("error", error =>
+                  ["ECONNREFUSED", "EHOSTUNREACH"].includes(error.code) ? resolve() : reject(error));
+                socket.setTimeout(5000, () => reject(new Error("Egress was not actively rejected")));
+              }).finally(() => socket.destroy());
+            `;
+            execFileSync("docker", ["exec", id, "node", "--input-type=module", "-e", probe], {
+              stdio: "inherit", timeout: 10000
+            });
+            console.log("Docker binding, credential mounts, and active egress rejection passed");
+          '
+      - name: Check public health, key enforcement, and local body validation
+        shell: bash
+        run: |
+          node --input-type=module -e '
+            import assert from "node:assert/strict";
+            import { setTimeout as delay } from "node:timers/promises";
+            import { getProxyKey, proxyKeyFilePath } from "./scripts/credentials.mjs";
+            const base = `http://127.0.0.1:${process.env.COPILOT_PROXY_PORT}`;
+            const deadline = Date.now() + 60000;
+            let healthy = false;
+            while (Date.now() < deadline) {
+              try {
+                const response = await fetch(`${base}/health`, { signal: AbortSignal.timeout(2000) });
+                assert.equal(response.status, 200);
+                assert.deepEqual(await response.json(), {
+                  status: "ok", provider: "github-copilot", api_key_required: true
+                });
+                healthy = true;
+                break;
+              } catch {
+                await delay(250);
+              }
+            }
+            assert.ok(healthy, "Container health did not become ready within 60 seconds");
+            const unauthorized = await fetch(`${base}/v1/models`, { signal: AbortSignal.timeout(5000) });
+            assert.equal(unauthorized.status, 401);
+            await unauthorized.arrayBuffer();
+            const key = await getProxyKey({ filePath: proxyKeyFilePath(), create: false });
+            const invalid = await fetch(`${base}/v1/messages`, {
+              method: "POST",
+              headers: { "content-type": "application/json", "x-api-key": key },
+              body: "null",
+              signal: AbortSignal.timeout(5000)
+            });
+            assert.equal(invalid.status, 400, "Null body must fail before any upstream request");
+            await invalid.arrayBuffer();
+            console.log("HTTP smoke checks passed without upstream API calls");
+          '
+      - name: Always remove the smoke Compose project
+        id: smoke_cleanup
+        if: always() && steps.smoke_paths.outcome == 'success'
+        run: docker compose down --volumes --remove-orphans
+      - name: Remove only the owned egress rule after stopping the proxy
+        if: always() && steps.smoke_cleanup.outcome == 'success' && env.SMOKE_BRIDGE != ''
+        shell: bash
+        run: |
+          rule=(-i "$SMOKE_BRIDGE" -m conntrack --ctstate NEW
+                -m comment --comment "$COMPOSE_PROJECT_NAME" -j REJECT)
+          if sudo iptables -C DOCKER-USER "${rule[@]}"; then
+            sudo iptables -D DOCKER-USER "${rule[@]}"
+          fi
+      - name: Always remove temporary credentials
+        if: always() && steps.smoke_paths.outcome == 'success'
+        shell: bash
+        run: |
+          node --input-type=module -e '
+            import { rm } from "node:fs/promises";
+            import { dirname } from "node:path";
+            import { authFilePath } from "./scripts/credentials.mjs";
+            await rm(dirname(authFilePath()), { recursive: true, force: true });
+          '
