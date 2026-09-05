@@ -3,11 +3,15 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Use Claude Code for free via GitHub Copilot — local proxy that translates Anthropic API to Copilot API",
+  "description": "Local authenticated Claude Code proxy for GitHub Copilot with native Messages transport",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "auth": "node scripts/auth.mjs",
     "proxy": "node scripts/proxy.mjs",
-    "start": "bash scripts/launch.sh"
+    "start": "bash scripts/launch.sh",
+    "test": "node --test scripts/test-auth.mjs scripts/test-chat.mjs scripts/test-streaming.mjs scripts/test-crash-safety.mjs scripts/test-runtime.mjs scripts/test-gateway.mjs scripts/test-search.mjs scripts/test-search-providers.mjs scripts/test-proxy-cli.mjs scripts/test-claude-client.mjs scripts/test-launcher.mjs"
   },
   "keywords": [
     "claude-code",
