@@ -59,6 +59,10 @@ Inside Claude Code, use `/model` to switch between available models (Claude Opus
 
 Claude Code v2.1.280 and later start on **Claude Opus 5.5** by default. The proxy routes its Claude API ID, `claude-opus-5-5`, to Copilot's `claude-opus-5.5` and lists it first in `/v1/models`. Earlier Claude Code versions default to an older model and don't support Opus 5.5; run `claude update` to upgrade. To pin a version, use its full ID (for example, `claude --model claude-opus-5-5`) or set `ANTHROPIC_DEFAULT_OPUS_MODEL`.
 
+### Auto mode
+
+Claude Code's auto mode can ask the API to run its permission classifier server-side. Copilot doesn't support that, so Claude Code shows a notice that the session isn't eligible and runs the classifier itself, sending those requests through the proxy as before. `scripts/launch.sh` sets `CLAUDE_CODE_AUTO_MODE_SERVER=0` to skip the notice; set it yourself when you start `claude` another way.
+
 ## Web Search
 
 The proxy emulates Anthropic's web search tool so Claude Code's WebSearch works automatically.

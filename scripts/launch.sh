@@ -73,4 +73,5 @@ echo ""
 
 ANTHROPIC_BASE_URL="http://localhost:$PORT" \
 ANTHROPIC_API_KEY="copilot-proxy" \
+CLAUDE_CODE_AUTO_MODE_SERVER="${CLAUDE_CODE_AUTO_MODE_SERVER:-0}" \
 claude "$@"
