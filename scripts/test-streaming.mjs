@@ -8,7 +8,7 @@
 //   #8 first tool_call delta carrying id + a leading argument fragment
 //   #6 concurrency semaphore over-admission on wakeup
 
-import { createStreamTranslator, translateContentPart, translateMessages } from "./proxy.mjs"
+import { createStreamTranslator, translateContentPart, translateMessages, translateResponseToAnthropic } from "./proxy.mjs"
 
 let failures = 0
 function check(name, cond, detail) {
@@ -134,6 +134,70 @@ console.log("\nstream terminator idempotency")
   const deltas = res.events.filter((e) => e.event === "message_delta")
   check("exactly one message_stop", stops.length === 1, `got ${stops.length}`)
   check("exactly one message_delta", deltas.length === 1, `got ${deltas.length}`)
+}
+
+// ── Copilot splits non-streaming tool turns across choices ─────────────────
+// Captured shape: Copilot's non-streaming Chat Completions response for Claude
+// models puts the text in one choice and each tool call in its own choice.
+// Reading only choices[0] kept the text, dropped every tool call, and still
+// reported stop_reason "tool_use", so Claude Code rejected the turn with
+// "The model's tool call could not be parsed".
+console.log("\nnon-streaming split choices keep text and every tool call")
+{
+  const call = (id, name, city) => ({ id, type: "function", function: { name, arguments: JSON.stringify({ city }) } })
+  const split = {
+    id: "msg_split",
+    usage: { prompt_tokens: 472, completion_tokens: 121 },
+    choices: [
+      { finish_reason: "tool_calls", message: { role: "assistant", content: "I'll check both." } },
+      { finish_reason: "tool_calls", message: { role: "assistant", tool_calls: [call("toolu_a", "get_weather", "Paris")] } },
+      { finish_reason: "tool_calls", message: { role: "assistant", tool_calls: [call("toolu_b", "get_time", "Tokyo")] } },
+    ],
+  }
+  const out = translateResponseToAnthropic(split, "claude-opus-5-5")
+  const types = out.content.map((b) => b.type).join(",")
+  check("text then both tool_use blocks", types === "text,tool_use,tool_use", `got ${types}`)
+  const tools = out.content.filter((b) => b.type === "tool_use")
+  check("tool ids, names, and inputs preserved",
+    tools[0]?.id === "toolu_a" && tools[0]?.name === "get_weather" && tools[0]?.input?.city === "Paris" &&
+    tools[1]?.id === "toolu_b" && tools[1]?.name === "get_time" && tools[1]?.input?.city === "Tokyo")
+  check("stop_reason tool_use", out.stop_reason === "tool_use", `got ${out.stop_reason}`)
+
+  const toolsOnly = translateResponseToAnthropic({ choices: split.choices.slice(1) }, "claude-opus-5-5")
+  check("tool-only split keeps both calls", toolsOnly.content.filter((b) => b.type === "tool_use").length === 2)
+
+  const truncated = translateResponseToAnthropic({
+    choices: [split.choices[0], { finish_reason: "length", message: { role: "assistant", tool_calls: [call("toolu_c", "get_time", "Oslo")] } }],
+  }, "claude-opus-5-5")
+  check("a truncated choice reports max_tokens", truncated.stop_reason === "max_tokens", `got ${truncated.stop_reason}`)
+
+  const plain = translateResponseToAnthropic({ choices: [{ finish_reason: "stop", message: { role: "assistant", content: "OK" } }] }, "claude-opus-5-5")
+  check("single-choice text is unchanged", plain.content.length === 1 && plain.content[0].text === "OK" && plain.stop_reason === "end_turn")
+}
+
+// ── Keep-alive pings while Copilot streams only reasoning ──────────────────
+// Copilot streams Claude thinking as delta.reasoning_text, which is not
+// forwarded. Long thinking left Claude Code with no bytes after message_start,
+// so its 180s stream watchdog aborted and retried without streaming. Anthropic
+// streams send `ping` events for liveness; emit one per silent interval.
+console.log("\nkeep-alive pings during reasoning-only chunks")
+{
+  const res = makeFakeRes()
+  let clock = 0
+  const t = createStreamTranslator("claude-opus-5-5", res, { heartbeatMs: 15000, now: () => clock })
+  const reasoning = () => chunk({ role: "assistant", reasoning_text: "thinking" })
+  for (const at of [0, 5000, 14000]) { clock = at; t.processChunk(reasoning()) }
+  check("message_start first, no ping before the interval",
+    res.events[0]?.event === "message_start" && !res.events.some((e) => e.event === "ping"))
+  for (const at of [15000, 20000, 30000]) { clock = at; t.processChunk(reasoning()) }
+  const pings = res.events.filter((e) => e.event === "ping")
+  check("one ping per silent interval", pings.length === 2, `got ${pings.length}`)
+  check("ping payload matches Anthropic's", pings.every((e) => e.data?.type === "ping"))
+  clock = 31000; t.processChunk(chunk({ content: "42" }))
+  clock = 50000; t.processChunk(chunk({}, "stop"))
+  clock = 90000; t.processChunk(reasoning())
+  check("text still delivered", res.events.some((e) => e.event === "content_block_delta" && e.data.delta?.text === "42"))
+  check("no ping after message_stop", res.events.at(-1)?.event === "message_stop", `got ${res.events.at(-1)?.event}`)
 }
 
 // ── Test 5: concurrency gate never over-admits (#6) ────────────────────────

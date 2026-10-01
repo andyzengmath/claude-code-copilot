@@ -636,30 +636,28 @@ async function handleWebSearchLoop(openaiReq, token, maxSearches) {
 
   for (let iteration = 0; iteration < effectiveMax + 1; iteration++) {
     lastResponse = await collectCopilotResponse(currentReq, token)
-    const choice = lastResponse.choices?.[0]
+    const turn = combineChoices(lastResponse)
 
-    const webSearchCall = choice?.message?.tool_calls?.find(
+    const webSearchCall = turn.toolCalls.find(
       (tc) => tc.function?.name === "web_search",
     )
 
     if (!webSearchCall || searchCount >= (maxSearches || 5)) {
       // No web search requested — append final content
-      if (choice?.message?.content) {
-        contentBlocks.push({ type: "text", text: choice.message.content })
+      if (turn.text) {
+        contentBlocks.push({ type: "text", text: turn.text })
       }
       // Append any non-web-search tool calls
-      if (choice?.message?.tool_calls) {
-        for (const tc of choice.message.tool_calls) {
-          if (tc.function?.name === "web_search") continue
-          let input = {}
-          try { input = JSON.parse(tc.function.arguments || "{}") } catch {}
-          contentBlocks.push({
-            type: "tool_use",
-            id: tc.id || `toolu_${Date.now()}`,
-            name: tc.function.name,
-            input,
-          })
-        }
+      for (const tc of turn.toolCalls) {
+        if (tc.function?.name === "web_search") continue
+        let input = {}
+        try { input = JSON.parse(tc.function.arguments || "{}") } catch {}
+        contentBlocks.push({
+          type: "tool_use",
+          id: tc.id || `toolu_${Date.now()}`,
+          name: tc.function.name,
+          input,
+        })
       }
       break
     }
@@ -675,7 +673,7 @@ async function handleWebSearchLoop(openaiReq, token, maxSearches) {
     }
 
     if (!searchQuery) {
-      contentBlocks.push({ type: "text", text: choice.message?.content || "" })
+      contentBlocks.push({ type: "text", text: turn.text })
       break
     }
 
@@ -705,7 +703,7 @@ async function handleWebSearchLoop(openaiReq, token, maxSearches) {
       ...currentReq.messages,
       {
         role: "assistant",
-        content: choice.message?.content || null,
+        content: turn.text || null,
         tool_calls: [webSearchCall],
       },
       {
@@ -1078,28 +1076,42 @@ function buildAnthropicUsage(openaiUsage) {
   }
 }
 
+// Copilot's non-streaming Chat Completions responses for Claude models split one
+// assistant turn across choices: the text in one choice and each tool call in
+// its own (all finishing with "tool_calls"). Combine every choice so no text or
+// tool call is dropped. A truncated choice makes the whole turn max_tokens.
+function combineChoices(openaiResponse) {
+  const choices = Array.isArray(openaiResponse?.choices) ? openaiResponse.choices : []
+  const texts = []
+  const toolCalls = []
+  for (const choice of choices) {
+    if (choice?.message?.content) texts.push(choice.message.content)
+    if (Array.isArray(choice?.message?.tool_calls)) toolCalls.push(...choice.message.tool_calls)
+  }
+  const reasons = choices.map((choice) => choice?.finish_reason).filter(Boolean)
+  const finishReason = reasons.includes("length") ? "length" : toolCalls.length ? "tool_calls" : reasons[0] ?? null
+  return { text: texts.join(""), toolCalls, finishReason }
+}
+
 function translateResponseToAnthropic(openaiResponse, model) {
-  const choice = openaiResponse.choices?.[0]
+  const { text, toolCalls, finishReason } = combineChoices(openaiResponse)
   const content = []
 
-  if (choice?.message?.content) {
-    content.push({ type: "text", text: choice.message.content })
+  if (text) {
+    content.push({ type: "text", text })
   }
 
-  if (choice?.message?.tool_calls) {
-    for (const tc of choice.message.tool_calls) {
-      let input = {}
-      try { input = JSON.parse(tc.function.arguments || "{}") } catch {}
-      content.push({
-        type: "tool_use",
-        id: tc.id || `toolu_${Date.now()}`,
-        name: tc.function.name,
-        input,
-      })
-    }
+  for (const tc of toolCalls) {
+    let input = {}
+    try { input = JSON.parse(tc.function.arguments || "{}") } catch {}
+    content.push({
+      type: "tool_use",
+      id: tc.id || `toolu_${Date.now()}`,
+      name: tc.function.name,
+      input,
+    })
   }
 
-  const finishReason = choice?.finish_reason
   let stopReason = "end_turn"
   if (finishReason === "tool_calls") stopReason = "tool_use"
   else if (finishReason === "length") stopReason = "max_tokens"
@@ -1118,13 +1130,18 @@ function translateResponseToAnthropic(openaiResponse, model) {
 
 // ─── Streaming Translation ──────────────────────────────────────────────────
 
-function createStreamTranslator(model, res) {
+// `heartbeatMs`: Copilot streams Claude's thinking as reasoning deltas, which
+// are not forwarded. Without traffic during long thinking, Claude Code's stream
+// watchdog aborts (180s) and retries non-streaming, so emit Anthropic `ping`
+// events whenever nothing has been written for this long.
+function createStreamTranslator(model, res, { heartbeatMs = 15000, now = Date.now } = {}) {
   let messageId = `msg_${Date.now()}`
   let inputTokens = 0
   let outputTokens = 0
   let cachedReadTokens = 0
   let sentStart = false
   let sentStop = false
+  let lastWriteAt = now()
   const toolCallBuffers = {}
   // Maps the provider's tool_call index (tc.index) to the Anthropic content
   // block index we assigned it. Argument fragments arrive with only tc.index,
@@ -1136,6 +1153,7 @@ function createStreamTranslator(model, res) {
 
   function sendSSE(event, data) {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+    lastWriteAt = now()
   }
 
   function sendStartIfNeeded() {
@@ -1273,6 +1291,7 @@ function createStreamTranslator(model, res) {
         return true
       }
 
+      if (!sentStop && now() - lastWriteAt >= heartbeatMs) sendSSE("ping", { type: "ping" })
       return false
     },
   }
@@ -1615,7 +1634,7 @@ async function handleRequest(req, res, token) {
 // Exported for tests (scripts/test-streaming.mjs, scripts/test-models.mjs). The
 // server below only boots when this file is executed directly, so importing it
 // has no side effects.
-export { createStreamTranslator, translateMessages, translateContentPart, mapModel, ADVERTISED_MODELS }
+export { createStreamTranslator, translateMessages, translateContentPart, translateResponseToAnthropic, mapModel, ADVERTISED_MODELS }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 
