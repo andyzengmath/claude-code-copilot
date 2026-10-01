@@ -1,4 +1,4 @@
-import { open, readFile, rename, link, unlink } from "node:fs/promises"
+import { open, readFile, rename, link, unlink, stat } from "node:fs/promises"
 import { randomBytes, randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve } from "node:path"
@@ -137,6 +137,16 @@ async function privateTemp(target, text) {
   }
 }
 
+// Windows reports replacing a directory with EPERM, the same code as a held
+// handle. A directory never becomes replaceable, so it must not be retried.
+async function isDirectory(target) {
+  try {
+    return (await stat(target)).isDirectory()
+  } catch {
+    return false
+  }
+}
+
 /** Atomic complete-JSON replacement; never changes parent directory permissions. */
 export async function savePrivateJson(filePath, value) {
   const target = checkedPath(filePath)
@@ -154,7 +164,7 @@ export async function savePrivateJson(filePath, value) {
         break
       } catch (error) {
         if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(error.code) ||
-            Date.now() >= retryDeadline) throw error
+            Date.now() >= retryDeadline || await isDirectory(target)) throw error
         await new Promise((done) => setTimeout(done, 25))
       }
     }
