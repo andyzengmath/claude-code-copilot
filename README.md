@@ -123,7 +123,14 @@ if ($LASTEXITCODE -ne 0) { throw "Unable to read the local API key" }
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:18080"
 $env:ANTHROPIC_API_KEY = $key
 $env:ANTHROPIC_AUTH_TOKEN = ""
+$env:CLAUDE_CODE_AUTO_MODE_SERVER = "0"
 claude
+```
+
+If you previously set `ANTHROPIC_API_KEY` to `copilot-proxy` as a user environment variable, the proxy now rejects it with a 401. Store the local key there instead, so new terminals pick it up:
+
+```powershell
+[Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", (node scripts\proxy.mjs --print-api-key), "User")
 ```
 
 For Docker Desktop, authenticate first, then replace direct proxy startup with:
