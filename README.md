@@ -79,6 +79,8 @@ curl --fail --silent --show-error \
 
 Use a returned supported identifier with Claude Code's `/model`. The account/integrator catalog is authoritative; an absent model does not establish your plan's entitlements. Aliases only normalize spelling within the **same version**: the proxy never silently upgrades a tier or model version.
 
+Claude Code v2.1.280 and later start on **Claude Opus 5.5** by default. Its Claude API ID, `claude-opus-5-5`, normalizes to Copilot's `claude-opus-5.5` when your catalog offers it. Earlier Claude Code versions don't support Opus 5.5; run `claude update` to upgrade.
+
 ## Docker
 
 Create both host credential files **before** starting the container. The following preserves custom paths already exported in your shell:

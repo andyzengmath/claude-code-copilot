@@ -11,8 +11,31 @@ const parsedEvents = (text) => [...text.matchAll(/^data: (.+)$/gm)].map((match) 
 test("model spelling normalization never substitutes a different version", () => {
   assert.equal(proxy.mapModel("claude-sonnet-4-5-20250929"), "claude-sonnet-4.5")
   assert.equal(proxy.mapModel("claude-opus-4-8-latest"), "claude-opus-4.8")
+  assert.equal(proxy.mapModel("claude-opus-5-5"), "claude-opus-5.5")
+  assert.equal(proxy.mapModel("claude-opus-5.5"), "claude-opus-5.5")
+  assert.equal(proxy.mapModel("claude-opus-5"), "claude-opus-5")
   assert.equal(proxy.mapModel("future-sonnet-999"), "future-sonnet-999")
   assert.equal(proxy.mapModel("claude-sonnet-4"), "claude-sonnet-4")
+})
+
+test("Claude Code's default Opus 5.5 request routes natively with adaptive settings intact", async (t) => {
+  let seen
+  const opus = (id) => ({ id, supported_endpoints: ["/v1/messages", "/chat/completions"], policy: { state: "enabled" } })
+  const f = await fixture(t, (call) => {
+    seen = call
+    return streamResponse(nativeFrames(message()))
+  }, { catalog: async () => Response.json({ data: [...models, opus("claude-opus-5"), opus("claude-opus-5.5")] }) })
+  // Shape of Claude Code 2.1.281's default-model request (no --model).
+  const body = {
+    model: "claude-opus-5-5", max_tokens: 128000, stream: true,
+    thinking: { type: "adaptive", display: "omitted" }, output_config: { effort: "medium" },
+    messages: [{ role: "user", content: "Hello" }],
+  }
+  const response = await f.request(body)
+  assert.equal(response.status, 200)
+  assert.equal(parsedEvents(await response.text()).at(-1).type, "message_stop")
+  assert.equal(seen.url.pathname, "/v1/messages")
+  assert.deepEqual(JSON.parse(seen.body), { ...body, model: "claude-opus-5.5" })
 })
 
 test("chat translator does not certify an unfinished stream", () => {
