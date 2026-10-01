@@ -42,22 +42,40 @@ export function isRoutable(model) {
 // does not recognize the model ID as a 5.5 model, including for WebSearch's
 // nested request. Downgrade the choice to auto and omit disabled thinking, which
 // matches what Claude Code itself sends for these models.
+//
+// Only well-formed values are rewritten: a forced choice that names a declared
+// tool, "any" with at least one tool, and thinking exactly {type: "disabled"}.
+// Anything else passes through unchanged, so it meets the same validation as on
+// any other model instead of being quietly repaired into an upstream call.
 function adaptiveOnly(modelInfo) {
   const supports = modelInfo?.capabilities?.supports
   return supports?.adaptive_thinking === true && supports.max_thinking_budget === undefined
 }
 
+const plainObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value)
+
+function validForcedChoice(body) {
+  const choice = body.tool_choice
+  if (!plainObject(choice) || !Array.isArray(body.tools) || !body.tools.length) return false
+  if (choice.type === "any") return choice.name === undefined
+  return choice.type === "tool" && typeof choice.name === "string" &&
+    body.tools.some((tool) => plainObject(tool) && tool.name === choice.name)
+}
+
+function plainDisabledThinking(thinking) {
+  return plainObject(thinking) && thinking.type === "disabled" && Object.keys(thinking).length === 1
+}
+
 export function adaptToModel(body, modelInfo) {
   if (!adaptiveOnly(modelInfo)) return body
-  const forced = ["tool", "any"].includes(body.tool_choice?.type)
-  const disabled = body.thinking?.type === "disabled"
+  const forced = validForcedChoice(body)
+  const disabled = plainDisabledThinking(body.thinking)
   if (!forced && !disabled) return body
-  const { thinking, tool_choice: choice, ...rest } = body
-  const result = { ...rest }
-  if (!disabled && Object.hasOwn(body, "thinking")) result.thinking = thinking
-  if (choice !== undefined) {
-    const { name, ...options } = choice
-    result.tool_choice = forced ? { ...options, type: "auto" } : choice
+  const result = { ...body }
+  if (disabled) delete result.thinking
+  if (forced) {
+    const { name, ...options } = body.tool_choice
+    result.tool_choice = { ...options, type: "auto" }
   }
   return result
 }

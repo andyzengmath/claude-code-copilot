@@ -90,6 +90,76 @@ test("models with a manual thinking budget keep forced tool choice and disabled 
   assert.deepEqual(JSON.parse(seen.body), body)
 })
 
+// The adaptation only rewrites requests that are valid as sent. A malformed
+// choice or thinking setting must reach the same validation it would on any
+// other model, rather than being quietly repaired into an upstream call.
+for (const transport of ["messages", "chat"]) {
+  test(`adaptive-only models still get a valid forced choice downgraded over ${transport}`, async (t) => {
+    let seen
+    const f = await fixture(t, (call) => {
+      seen = call
+      return transport === "chat"
+        ? Response.json({ id: "chat_fixture", choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }] })
+        : Response.json(message())
+    }, { config: { transport, forwardReasoning: false }, catalog: async () => Response.json({ data: [...models, adaptiveOnly("claude-opus-5.5")] }) })
+    const response = await f.request({
+      model: "claude-opus-5.5", thinking: { type: "disabled" },
+      tool_choice: { type: "tool", name: "read_file" },
+      tools: [{ name: "read_file", input_schema: { type: "object" } }],
+    })
+    assert.equal(response.status, 200)
+    const sent = JSON.parse(seen.body)
+    assert.equal(Object.hasOwn(sent, "thinking"), false)
+    assert.deepEqual(sent.tool_choice, transport === "chat" ? "auto" : { type: "auto" })
+  })
+
+  test(`malformed choices on adaptive-only models are not repaired over ${transport}`, async (t) => {
+    const seen = []
+    const f = await fixture(t, (call) => {
+      seen.push(JSON.parse(call.body))
+      return Response.json({ type: "error", error: { type: "invalid_request_error", message: "rejected upstream" } }, { status: 400 })
+    }, {
+      config: { transport, forwardReasoning: false },
+      catalog: async () => Response.json({ data: [...models, adaptiveOnly("claude-opus-5.5")] }),
+    })
+    const tools = [{ name: "read_file", input_schema: { type: "object" } }]
+    const choices = [{ type: "tool", name: "undeclared" }, { type: "any" }, { type: "tool" }]
+    for (const [index, tool_choice] of choices.entries()) {
+      const response = await f.request({ model: "claude-opus-5.5", tool_choice, ...(index === 1 ? {} : { tools }) })
+      assert.equal(response.status, 400)
+    }
+    if (transport === "chat") {
+      // The chat adapter validates locally, so nothing reaches Copilot.
+      assert.equal(seen.length, 0)
+    } else {
+      // Native has no local tool_choice validation: each request goes upstream
+      // unchanged and Copilot rejects it, as it would for any other model.
+      assert.deepEqual(seen.map((body) => body.tool_choice), choices)
+    }
+  })
+}
+
+test("a null tool choice on an adaptive-only model is left for validation, not a crash", async (t) => {
+  let seen
+  const f = await fixture(t, (call) => {
+    seen = call
+    return Response.json(message())
+  }, { catalog: async () => Response.json({ data: [...models, adaptiveOnly("claude-opus-5.5")] }) })
+  const response = await f.request({ model: "claude-opus-5.5", thinking: { type: "disabled" }, tool_choice: null })
+  assert.notEqual(response.status, 500)
+  if (seen) assert.equal(JSON.parse(seen.body).tool_choice, null)
+})
+
+test("thinking disabled with extra fields is not silently dropped", async (t) => {
+  let seen
+  const f = await fixture(t, (call) => {
+    seen = call
+    return Response.json(message())
+  }, { catalog: async () => Response.json({ data: [...models, adaptiveOnly("claude-opus-5.5")] }) })
+  await f.request({ model: "claude-opus-5.5", thinking: { type: "disabled", budget_tokens: 5 } })
+  assert.deepEqual(JSON.parse(seen.body).thinking, { type: "disabled", budget_tokens: 5 })
+})
+
 // Claude Code's auto mode asks the API for server-side classifier review with a
 // top-level `safeguards` field and the dangerous-tool-use beta. Copilot rejects
 // the field ("safeguards: Extra inputs are not permitted") and cannot run the
