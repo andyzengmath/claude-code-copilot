@@ -57,6 +57,8 @@ The proxy runs with `restart: always` — it stays running across reboots.
 
 Inside Claude Code, use `/model` to switch between available models (Claude Opus, Sonnet, etc.).
 
+Claude Code v2.1.280 and later start on **Claude Opus 5.5** by default. The proxy routes its Claude API ID, `claude-opus-5-5`, to Copilot's `claude-opus-5.5` and lists it first in `/v1/models`. Earlier Claude Code versions default to an older model and don't support Opus 5.5; run `claude update` to upgrade. To pin a version, use its full ID (for example, `claude --model claude-opus-5-5`) or set `ANTHROPIC_DEFAULT_OPUS_MODEL`.
+
 ## Web Search
 
 The proxy emulates Anthropic's web search tool so Claude Code's WebSearch works automatically.
@@ -132,12 +134,17 @@ ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY=copilot-proxy claude
 
 ## Tests
 
-No dependencies or network access needed for the first suite:
+No dependencies or network access needed for the first two suites:
 
 ```bash
+node scripts/test-models.mjs         # model routing + advertised model list
 node scripts/test-streaming.mjs      # translation + streaming assertions
 node scripts/test-crash-safety.mjs   # boots a proxy and attacks it over raw TCP
 ```
+
+`test-models.mjs` checks that each model ID routes to its exact Copilot version
+(for example, Opus 5.5 is never downgraded to Opus 5) and that `/v1/models`
+lists Opus 5.5 first.
 
 `test-streaming.mjs` covers parallel tool-call routing, image translation, the
 web-search catch scope, and the search concurrency gate. `test-crash-safety.mjs`

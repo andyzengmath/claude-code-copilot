@@ -760,7 +760,11 @@ function modelSupportsReasoningEffort(copilotModel) {
 }
 
 const MODEL_MAP = {
-  // Opus — Copilot supports 4.6, 4.7, 4.8, 5
+  // Opus — Copilot IDs are dotted. Opus 5.5 is the flagship and Claude Code's
+  // default model from v2.1.280 (Claude API ID `claude-opus-5-5`).
+  "claude-opus-5-5": "claude-opus-5.5",
+  "claude-opus-5.5": "claude-opus-5.5",
+  "claude-opus-5-5-latest": "claude-opus-5.5",
   "claude-opus-5": "claude-opus-5",
   "claude-opus-5-latest": "claude-opus-5",
   "claude-opus-4-8": "claude-opus-4.8",
@@ -801,6 +805,18 @@ const MODEL_MAP = {
   "claude-3-haiku-20240307": "claude-haiku-4.5",
 }
 
+// Advertised by /v1/models with Claude API IDs; Opus 5.5 leads as the default flagship.
+const ADVERTISED_MODELS = [
+  { id: "claude-opus-5-5", object: "model" },
+  { id: "claude-opus-5", object: "model" },
+  { id: "claude-opus-4-8", object: "model" },
+  { id: "claude-opus-4-7", object: "model" },
+  { id: "claude-opus-4-6", object: "model" },
+  { id: "claude-sonnet-5", object: "model" },
+  { id: "claude-sonnet-4-6", object: "model" },
+  { id: "claude-haiku-4-5", object: "model" },
+]
+
 function mapModel(model) {
   if (MODEL_MAP[model]) return MODEL_MAP[model]
   const m = model.toLowerCase()
@@ -811,12 +827,14 @@ function mapModel(model) {
     const major = m.match(/sonnet[-_ ]?(\d+)/)
     return major && major[1] === "5" ? "claude-sonnet-5" : "claude-sonnet-4.6"
   }
-  // Opus — Copilot supports 4.6, 4.7, 4.8, 5. Match the major version right
-  // after the "opus" token so "opus-5" maps to 5, but "opus-4-5"/"opus-4.5"
-  // maps by its 4.x tier (not silently upgraded to 5).
+  // Opus — match the major version right after the "opus" token plus an
+  // optional 1–2 digit minor, so "opus-5-5"/"opus-5.5" map to 5.5 and "opus-5"
+  // to 5 (neither is silently swapped for the other; an 8-digit date suffix is
+  // not a minor), while "opus-4-5"/"opus-4.5" maps by its 4.x tier (not
+  // silently upgraded to 5).
   if (m.includes("opus")) {
-    const major = m.match(/opus[-_ ]?(\d+)/)
-    if (major && major[1] === "5") return "claude-opus-5"
+    const version = m.match(/opus[-_ ]?(\d+)(?:[-.](\d{1,2})(?!\d))?/)
+    if (version && version[1] === "5") return version[2] ? `claude-opus-5.${version[2]}` : "claude-opus-5"
     if (m.includes("4.8") || m.includes("4-8")) return "claude-opus-4.8"
     if (m.includes("4.7") || m.includes("4-7")) return "claude-opus-4.7"
     return "claude-opus-4.6"
@@ -1315,17 +1333,7 @@ async function handleRequest(req, res, token) {
   // Models
   if (url.includes("/models")) {
     res.writeHead(200, { "Content-Type": "application/json" })
-    res.end(JSON.stringify({
-      data: [
-        { id: "claude-opus-5", object: "model" },
-        { id: "claude-opus-4-8", object: "model" },
-        { id: "claude-opus-4-7", object: "model" },
-        { id: "claude-opus-4-6", object: "model" },
-        { id: "claude-sonnet-5", object: "model" },
-        { id: "claude-sonnet-4-6", object: "model" },
-        { id: "claude-haiku-4-5", object: "model" },
-      ],
-    }))
+    res.end(JSON.stringify({ data: ADVERTISED_MODELS }))
     return
   }
 
@@ -1604,9 +1612,10 @@ async function handleRequest(req, res, token) {
 
 // ─── Server Setup ───────────────────────────────────────────────────────────
 
-// Exported for tests (scripts/test-streaming.mjs). The server below only boots
-// when this file is executed directly, so importing it has no side effects.
-export { createStreamTranslator, translateMessages, translateContentPart, mapModel }
+// Exported for tests (scripts/test-streaming.mjs, scripts/test-models.mjs). The
+// server below only boots when this file is executed directly, so importing it
+// has no side effects.
+export { createStreamTranslator, translateMessages, translateContentPart, mapModel, ADVERTISED_MODELS }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 
