@@ -286,10 +286,39 @@ test("the model catalog distinguishes picker visibility from routing permission"
   })
   const response = await fetch(`${f.base}/v1/models`, { headers: { authorization: `Bearer ${key}` } })
   const catalog = await response.json()
-  assert.deepEqual(catalog.data.map((entry) => entry.id), ["claude-sonnet-5", "claude-haiku-4.5"])
+  assert.deepEqual(catalog.data.map((entry) => entry.id), ["claude-sonnet-5", "claude-haiku-4-5"])
   assert.equal((await f.request({ model: "hidden-utility" })).status, 200)
   assert.equal((await f.request({ model: "claude-opus-disabled" })).status, 403)
   assert.equal(f.calls.filter((call) => call.url.pathname === "/models").length, 1)
+})
+
+// Claude Code sizes the context window, output limit and request shape from the
+// model ID. It recognizes the dashed Claude API spelling but treats Copilot's
+// dotted IDs as unknown: claude-opus-4.7 gets a 200K window instead of 1M, and
+// claude-opus-5.5 gets the pre-5.5 request shape. So advertise the dashed form,
+// which routes back to the same catalog entry, and keep the readable name.
+test("model discovery advertises Claude API spellings that route to the same catalog entry", async (t) => {
+  let seen
+  const f = await fixture(t, (call) => {
+    seen = call
+    return Response.json(message())
+  }, { catalog: async () => Response.json({ data: [
+    { ...adaptiveOnly("claude-opus-5.5"), name: "Claude Opus 5.5" },
+    { ...manualBudget("claude-opus-4.7"), name: "Claude Opus 4.7" },
+    { id: "claude-haiku-4.5", supported_endpoints: ["/v1/messages"], policy: { state: "enabled" } },
+    { id: "gpt-5.5", name: "GPT-5.5", supported_endpoints: ["/chat/completions"], policy: { state: "enabled" } },
+  ] }) })
+  const catalog = await (await fetch(`${f.base}/v1/models`, { headers: { "x-api-key": key } })).json()
+  assert.deepEqual(catalog.data.map(({ id, display_name }) => [id, display_name]), [
+    ["claude-opus-5-5", "Claude Opus 5.5"],
+    ["claude-opus-4-7", "Claude Opus 4.7"],
+    ["claude-haiku-4-5", "claude-haiku-4-5"],
+    ["gpt-5.5", "GPT-5.5"],
+  ])
+  assert.equal(catalog.first_id, "claude-opus-5-5")
+  assert.equal(catalog.last_id, "gpt-5.5")
+  assert.equal((await f.request({ model: "claude-opus-4-7" })).status, 200)
+  assert.equal(JSON.parse(seen.body).model, "claude-opus-4.7")
 })
 
 test("native SSE framing survives fragmented UTF-8 and preserves completion metadata", async (t) => {
@@ -472,7 +501,7 @@ test("model discovery caches are isolated when the credential provider changes",
   const discover = async () => (await (await fetch(`${f.base}/v1/models`, { headers: { "x-api-key": key } })).json()).data.map((model) => model.id)
   assert.deepEqual(await discover(), ["claude-sonnet-5"])
   currentToken = "second-fixture-token"
-  assert.deepEqual(await discover(), ["claude-haiku-4.5"])
+  assert.deepEqual(await discover(), ["claude-haiku-4-5"])
   currentToken = "first-fixture-token"
   assert.deepEqual(await discover(), ["claude-sonnet-5"])
   assert.equal(discoveries, 2)

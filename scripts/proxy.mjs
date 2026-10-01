@@ -6,7 +6,7 @@ import { resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { getProxyKey, readAuthToken } from "./credentials.mjs"
 import { readConfig } from "./config.mjs"
-import { adaptToModel, createModelCatalog, isRoutable, withoutSafeguards } from "./models.mjs"
+import { adaptToModel, claudeApiId, createModelCatalog, isRoutable, withoutSafeguards } from "./models.mjs"
 import { buildChatRequest, createStreamTranslator, translateResponseToAnthropic } from "./chat.mjs"
 import { abortError, ProxyError } from "./runtime.mjs"
 import { consumeSSE, createSSEWriter, NativeMessageState, parseSSEData, validateNativeContentBlock } from "./sse.mjs"
@@ -195,10 +195,11 @@ export function createProxyServer({
         const models = await catalog.get(authToken, signal)
         const visible = models.filter((model) => isRoutable(model) && model.model_picker_enabled !== false &&
           model.supported_endpoints?.some((path) => path === "/v1/messages" || path === "/chat/completions"))
-        jsonResponse(res, 200, {
-          data: visible.map((model) => ({ id: model.id, object: "model", display_name: model.name ?? model.id })),
-          has_more: false, first_id: visible[0]?.id ?? null, last_id: visible.at(-1)?.id ?? null,
+        const data = visible.map((model) => {
+          const id = claudeApiId(model.id)
+          return { id, object: "model", display_name: model.name ?? id }
         })
+        jsonResponse(res, 200, { data, has_more: false, first_id: data[0]?.id ?? null, last_id: data.at(-1)?.id ?? null })
         return
       }
       const { body } = await readRequestBody(req, { signal, maxBytes: config.maxBodyBytes, timeoutMs: config.requestTimeoutMs })

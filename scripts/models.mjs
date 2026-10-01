@@ -6,6 +6,15 @@ export function mapModel(model) {
   return match ? `claude-${match[1]}-${match[2]}${match[3] ? `.${match[3]}` : ""}` : model
 }
 
+// The Claude API spelling of a Copilot catalog ID (claude-opus-4.7 ->
+// claude-opus-4-7). Claude Code recognizes only this spelling: it treats the
+// dotted form as an unknown model, assuming a 200K window instead of 1M and an
+// older request shape. mapModel turns it back into the same catalog ID.
+export function claudeApiId(id) {
+  const match = /^claude-(opus|sonnet|haiku|fable)-(\d+)\.(\d{1,2})$/.exec(id)
+  return match ? `claude-${match[1]}-${match[2]}-${match[3]}` : id
+}
+
 export function copilotHeaders(token, config, incoming = {}) {
   const headers = {
     authorization: `Bearer ${token}`,
