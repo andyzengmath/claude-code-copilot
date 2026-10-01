@@ -147,9 +147,10 @@ node scripts/test-crash-safety.mjs   # boots a proxy and attacks it over raw TCP
 lists Opus 5.5 first.
 
 `test-streaming.mjs` covers parallel tool-call routing, image translation, the
-web-search catch scope, and the search concurrency gate. `test-crash-safety.mjs`
-verifies the proxy survives clients that disconnect mid-upload (it needs a saved
-auth token to boot, but makes no upstream calls).
+web-search catch scope, the search concurrency gate, non-streaming tool turns
+that Copilot splits across choices, and keep-alive pings during long thinking.
+`test-crash-safety.mjs` verifies the proxy survives clients that disconnect
+mid-upload (it needs a saved auth token to boot, but makes no upstream calls).
 
 
 ## Windows Usage
