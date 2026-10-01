@@ -2,5 +2,7 @@ node_modules/
 *.log
 .DS_Store
 .env
+.env.*
 .claude-copilot-auth.json
+.claude-copilot-proxy-key.json
 .omc/
