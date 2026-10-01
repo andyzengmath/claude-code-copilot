@@ -469,3 +469,18 @@ test("split choices still reject truncation, duplicates and unexplained finishes
     { choices: [{ index: 0, message: { role: "assistant", content: "a" }, finish_reason: "stop" }, { index: 0, message: { role: "assistant", content: "b" }, finish_reason: "stop" }] },
   ]) upstreamError(() => translateResponseToAnthropic(data, "model"))
 })
+
+test("a split turn with text between its tool calls keeps every part in order", () => {
+  const out = translateResponseToAnthropic(split(
+    [{ content: "Starting with Paris." }],
+    [{ tool_calls: [fn("toolu_f", "get_weather", { city: "Paris" })] }],
+    [{ content: "Now Tokyo." }],
+    [{ tool_calls: [fn("toolu_g", "get_time", { city: "Tokyo" })] }],
+  ), "model")
+  assert.equal(out.stop_reason, "tool_use")
+  assert.deepEqual(out.content.map((block) => block.text ?? block.id),
+    ["Starting with Paris.", "toolu_f", "Now Tokyo.", "toolu_g"])
+  // Text-only choices are still alternatives, not one turn: a tool_calls finish
+  // with no tool call anywhere cannot be a split turn.
+  upstreamError(() => translateResponseToAnthropic(split([{ content: "one" }], [{ content: "two" }]), "model"))
+})

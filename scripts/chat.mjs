@@ -316,11 +316,11 @@ function choices(data, streaming) {
 }
 
 // Copilot's non-streaming responses for Claude models split one assistant turn
-// across choices: the text in one choice and each tool call in its own, all
-// finishing with "tool_calls" and carrying no index. Several choices are only
-// accepted in that shape: no index field, at most one text, and a finish reason
-// shared by every choice except a truncated ("length") one. Anything else may
-// be n>1 alternatives, which must not be merged into one turn.
+// across choices: each text part and each tool call in its own choice, in turn
+// order, all finishing with "tool_calls" and carrying no index. Several choices
+// are only accepted in that shape: no index field, a shared "tool_calls" finish
+// (apart from truncated "length" parts), and at least one tool call. Anything
+// else may be n>1 alternatives, which must not be merged into one turn.
 function nonstreamChoices(data) {
   if (!object(data) || Object.hasOwn(data, "error") || !Array.isArray(data.choices) || data.choices.length <= 1) {
     return [choices(data, false)]
@@ -330,9 +330,9 @@ function nonstreamChoices(data) {
     choiceFields(choice, false)
     messageFields(choice.message, false)
   }
-  const texts = data.choices.filter((choice) => typeof choice.message.content === "string" && choice.message.content)
   const reasons = new Set(data.choices.map((choice) => choice.finish_reason).filter((reason) => reason !== "length"))
-  if (texts.length > 1 || reasons.size > 1 || (reasons.size === 1 && !reasons.has("tool_calls"))) {
+  const hasTool = data.choices.some((choice) => choice.message.tool_calls?.length)
+  if (!hasTool || reasons.size > 1 || (reasons.size === 1 && !reasons.has("tool_calls"))) {
     failUpstream("Chat completion choices are alternatives, not one split turn")
   }
   return data.choices
