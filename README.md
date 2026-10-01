@@ -157,6 +157,10 @@ Native mode preserves Anthropic headers and body fields such as thinking, budget
 
 There is **no inference replay between transports**, including after upstream errors. Change transports explicitly when needed, and use a compatible model identifier from the catalog.
 
+### Auto mode
+
+Claude Code's auto mode can ask the API to run its permission classifier server-side. Copilot doesn't support that, so Claude Code shows a notice that the session isn't eligible and runs the classifier itself, sending those requests through the proxy as before. `scripts/launch.sh` sets `CLAUDE_CODE_AUTO_MODE_SERVER=0` to skip the notice; set it yourself when you start `claude` another way.
+
 ## Web Search
 
 Ordinary Claude Code WebSearch makes nested requests containing the server tool `web_search_20250305`, which Copilot's native Messages endpoint rejects. The proxy emulates **this version** with native custom tool calls, bounded provider searches, and a final model synthesis. Each search round may consume additional Copilot requests.
