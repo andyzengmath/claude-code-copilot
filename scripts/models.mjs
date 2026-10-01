@@ -16,13 +16,60 @@ export function copilotHeaders(token, config, incoming = {}) {
     "openai-intent": "conversation-edits",
   }
   for (const name of ["anthropic-version", "anthropic-beta"]) {
-    if (typeof incoming[name] === "string") headers[name] = incoming[name]
+    const value = name === "anthropic-beta" ? forwardedBeta(incoming[name]) : incoming[name]
+    if (typeof value === "string") headers[name] = value
   }
   return headers
 }
 
 export function isRoutable(model) {
   return model.policy?.state !== "disabled"
+}
+
+// Copilot's adaptive-only models (catalog: adaptive_thinking with no manual
+// thinking budget, e.g. Opus 5.5 and Sonnet 5.5) reject a forced tool_choice
+// ("type tool and any are not supported for this model") and thinking.type
+// "disabled" with HTTP 400 on both endpoints. Claude Code sends both whenever it
+// does not recognize the model ID as a 5.5 model, including for WebSearch's
+// nested request. Downgrade the choice to auto and omit disabled thinking, which
+// matches what Claude Code itself sends for these models.
+function adaptiveOnly(modelInfo) {
+  const supports = modelInfo?.capabilities?.supports
+  return supports?.adaptive_thinking === true && supports.max_thinking_budget === undefined
+}
+
+export function adaptToModel(body, modelInfo) {
+  if (!adaptiveOnly(modelInfo)) return body
+  const forced = ["tool", "any"].includes(body.tool_choice?.type)
+  const disabled = body.thinking?.type === "disabled"
+  if (!forced && !disabled) return body
+  const { thinking, tool_choice: choice, ...rest } = body
+  const result = { ...rest }
+  if (!disabled && Object.hasOwn(body, "thinking")) result.thinking = thinking
+  if (choice !== undefined) {
+    const { name, ...options } = choice
+    result.tool_choice = forced ? { ...options, type: "auto" } : choice
+  }
+  return result
+}
+
+// Claude Code's auto mode asks for server-side classifier review with a
+// top-level `safeguards` field and the dangerous-tool-use beta. Copilot rejects
+// the field ("safeguards: Extra inputs are not permitted") and cannot produce
+// verdicts, so forwarding it only costs a failed request before Claude Code
+// retries without it. Dropping both makes Claude Code use its local classifier.
+const SAFEGUARDS_BETA = /^dangerous-tool-use-/
+
+export function withoutSafeguards(body) {
+  if (!Object.hasOwn(body, "safeguards")) return body
+  const { safeguards, ...rest } = body
+  return rest
+}
+
+export function forwardedBeta(value) {
+  if (typeof value !== "string") return undefined
+  const kept = value.split(",").map((beta) => beta.trim()).filter((beta) => beta && !SAFEGUARDS_BETA.test(beta))
+  return kept.length ? kept.join(",") : undefined
 }
 
 export function createModelCatalog({ fetchImpl, baseUrl, config, logger }) {

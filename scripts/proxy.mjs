@@ -6,7 +6,7 @@ import { resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { getProxyKey, readAuthToken } from "./credentials.mjs"
 import { readConfig } from "./config.mjs"
-import { createModelCatalog, isRoutable } from "./models.mjs"
+import { adaptToModel, createModelCatalog, isRoutable, withoutSafeguards } from "./models.mjs"
 import { buildChatRequest, createStreamTranslator, translateResponseToAnthropic } from "./chat.mjs"
 import { abortError, ProxyError } from "./runtime.mjs"
 import { consumeSSE, createSSEWriter, NativeMessageState, parseSSEData, validateNativeContentBlock } from "./sse.mjs"
@@ -204,11 +204,15 @@ export function createProxyServer({
       const { body } = await readRequestBody(req, { signal, maxBytes: config.maxBodyBytes, timeoutMs: config.requestTimeoutMs })
       validateRequest(body, countTokens)
       const searchSettings = extractWebSearchConfig(body.tools, config)
-      const preparedSearch = searchSettings ? prepareSearchRequest(body, config, searchSettings) : null
+      let preparedSearch = searchSettings ? prepareSearchRequest(body, config, searchSettings) : null
       const authToken = await getToken()
       const { model, modelInfo, transport } = await catalog.resolve(body.model, authToken, signal)
       nativeTransport = transport === "messages"
-      let request = { ...body, model }
+      // Validate the client's request as sent, then fit the upstream payload to
+      // what this model and Copilot accept.
+      const upstreamBody = (payload) => withoutSafeguards(adaptToModel(payload, modelInfo))
+      if (preparedSearch) preparedSearch = upstreamBody(preparedSearch)
+      let request = { ...upstreamBody(body), model }
       if (nativeTransport && !searchSettings) request = prepareSearchRequest(request, config, null)
       inference = true
       logger.log(`[${new Date().toISOString()}] ${req.method} ${route} | model: ${model} | transport: ${transport}${searchSettings ? " + search" : ""}`)

@@ -38,6 +38,87 @@ test("Claude Code's default Opus 5.5 request routes natively with adaptive setti
   assert.deepEqual(JSON.parse(seen.body), { ...body, model: "claude-opus-5.5" })
 })
 
+// Copilot's 5.5 models reject a forced tool_choice ("type tool and any are not
+// supported for this model") and thinking.type "disabled" with HTTP 400 on both
+// endpoints. Claude Code sends both when the model is selected by its dotted
+// Copilot ID, e.g. for WebSearch's nested request. The catalog marks these
+// models as adaptive-only: adaptive_thinking without a manual thinking budget.
+const adaptiveOnly = (id) => ({
+  id, supported_endpoints: ["/v1/messages", "/chat/completions"], policy: { state: "enabled" },
+  capabilities: { supports: { adaptive_thinking: true, tool_calls: true } },
+})
+const manualBudget = (id) => ({
+  id, supported_endpoints: ["/v1/messages", "/chat/completions"], policy: { state: "enabled" },
+  capabilities: { supports: { adaptive_thinking: true, max_thinking_budget: 32000, min_thinking_budget: 1024, tool_calls: true } },
+})
+
+test("adaptive-only models get auto tool choice and no disabled thinking", async (t) => {
+  let seen
+  const f = await fixture(t, (call) => {
+    seen = call
+    return Response.json(message([{ type: "tool_use", id: "toolu_1", name: "read_file", input: {} }], "tool_use"))
+  }, { catalog: async () => Response.json({ data: [...models, adaptiveOnly("claude-opus-5.5")] }) })
+  const body = {
+    model: "claude-opus-5.5", max_tokens: 1000,
+    thinking: { type: "disabled" },
+    tool_choice: { type: "tool", name: "read_file", disable_parallel_tool_use: true },
+    tools: [{ name: "read_file", input_schema: { type: "object" } }],
+    messages: [{ role: "user", content: "Read it" }],
+  }
+  const response = await f.request(body)
+  assert.equal(response.status, 200)
+  const sent = JSON.parse(seen.body)
+  assert.deepEqual(sent.tool_choice, { type: "auto", disable_parallel_tool_use: true })
+  assert.equal(Object.hasOwn(sent, "thinking"), false)
+  assert.deepEqual(sent.tools, body.tools)
+})
+
+test("models with a manual thinking budget keep forced tool choice and disabled thinking", async (t) => {
+  let seen
+  const f = await fixture(t, (call) => {
+    seen = call
+    return Response.json(message([{ type: "tool_use", id: "toolu_1", name: "read_file", input: {} }], "tool_use"))
+  }, { catalog: async () => Response.json({ data: [...models, manualBudget("claude-opus-5")] }) })
+  const body = {
+    model: "claude-opus-5", max_tokens: 1000,
+    thinking: { type: "disabled" },
+    tool_choice: { type: "any" },
+    tools: [{ name: "read_file", input_schema: { type: "object" } }],
+    messages: [{ role: "user", content: "Read it" }],
+  }
+  assert.equal((await f.request(body)).status, 200)
+  assert.deepEqual(JSON.parse(seen.body), body)
+})
+
+// Claude Code's auto mode asks the API for server-side classifier review with a
+// top-level `safeguards` field and the dangerous-tool-use beta. Copilot rejects
+// the field ("safeguards: Extra inputs are not permitted") and cannot run the
+// classifier, so forwarding it only costs a failed request before Claude Code
+// retries without it. Strip both so the session falls back to local review.
+test("auto mode safeguards and their beta are not forwarded to Copilot", async (t) => {
+  let seen
+  const f = await fixture(t, (call) => {
+    seen = call
+    return Response.json(message())
+  })
+  const body = { safeguards: [{ type: "dangerous_tool_use", classifier_context: { v: 1 } }] }
+  const response = await f.request(body, undefined, {
+    headers: { "x-api-key": key, "anthropic-beta": "claude-code-20250219,dangerous-tool-use-2026-09-03,effort-2025-11-24" },
+  })
+  assert.equal(response.status, 200)
+  assert.equal(Object.hasOwn(JSON.parse(seen.body), "safeguards"), false)
+  assert.equal(new Headers(seen.headers).get("anthropic-beta"), "claude-code-20250219,effort-2025-11-24")
+})
+
+test("a beta header carrying only the safeguards beta is dropped rather than sent empty", async (t) => {
+  let seen
+  const f = await fixture(t, (call) => {
+    seen = call
+    return Response.json(message())
+  })
+  await f.request({ safeguards: [] }, undefined, { headers: { "x-api-key": key, "anthropic-beta": "dangerous-tool-use-2026-09-03" } })
+  assert.equal(new Headers(seen.headers).has("anthropic-beta"), false)
+})
 test("chat translator does not certify an unfinished stream", () => {
   const frames = []
   const translator = proxy.createStreamTranslator("claude-sonnet-5", { write: (frame) => frames.push(frame) })
@@ -620,4 +701,39 @@ test("search generation requires a final output-usage report before spending on 
   assert.match((await response.json()).error.message, /usage/i)
   assert.equal(searches, 0)
   assert.equal(f.calls.filter((call) => call.url.pathname === "/v1/messages").length, 1)
+})
+
+// Claude Code 2.1.286 builds WebSearch's nested request with a forced
+// web_search choice and disabled thinking whenever it does not recognize the
+// model ID as a 5.5 model, which includes Copilot's dotted IDs. Copilot's 5.5
+// models reject both fields, so every search round must be adapted.
+test("WebSearch on an adaptive-only model sends auto choice and no disabled thinking on every round", async (t) => {
+  const sent = []
+  const f = await fixture(t, (call) => {
+    const body = JSON.parse(call.body)
+    sent.push(body)
+    const result = sent.length === 1
+      ? message([{ type: "tool_use", id: "toolu_search", name: "web_search", input: { query: "node 24 lts" } }], "tool_use")
+      : message([{ type: "text", text: "Answer" }])
+    return streamResponse(nativeFrames(result))
+  }, {
+    catalog: async () => Response.json({ data: [...models, adaptiveOnly("claude-opus-5.5")] }),
+    searchProvider: async () => [],
+  })
+  const response = await f.request({
+    model: "claude-opus-5.5", max_tokens: 64000, stream: true,
+    thinking: { type: "disabled" }, output_config: { effort: "high" },
+    system: [{ type: "text", text: "You are an assistant for performing a web search tool use" }],
+    messages: [{ role: "user", content: "Perform a web search for the query: node 24 lts" }],
+    tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 8 }],
+    tool_choice: { type: "tool", name: "web_search" },
+  })
+  assert.equal(response.status, 200)
+  assert.equal(parsedEvents(await response.text()).at(-1).type, "message_stop")
+  assert.equal(sent.length, 2)
+  for (const body of sent) {
+    assert.notEqual(body.tool_choice?.type, "tool")
+    assert.equal(Object.hasOwn(body, "thinking"), false)
+    assert.deepEqual(body.output_config, { effort: "high" })
+  }
 })
