@@ -293,6 +293,13 @@ function toolFields(tool) {
   }
 }
 
+function choiceFields(choice, streaming) {
+  const allowed = ["index", "finish_reason", "logprobs", streaming ? "delta" : "message"]
+  if (choice && Object.keys(choice).some((key) => !allowed.includes(key))) {
+    failUpstream("Chat choice contains an error or unsupported result fields")
+  }
+}
+
 function choices(data, streaming) {
   if (!object(data) || Object.hasOwn(data, "error") || !Array.isArray(data.choices)) {
     failUpstream("Chat upstream returned an error or malformed completion envelope")
@@ -304,11 +311,31 @@ function choices(data, streaming) {
   if (choice !== undefined && (!object(choice) || (choice.index !== undefined && choice.index !== 0))) {
     failUpstream("Chat completion has an invalid choice")
   }
-  const allowed = ["index", "finish_reason", "logprobs", streaming ? "delta" : "message"]
-  if (choice && Object.keys(choice).some((key) => !allowed.includes(key))) {
-    failUpstream("Chat choice contains an error or unsupported result fields")
-  }
+  choiceFields(choice, streaming)
   return choice
+}
+
+// Copilot's non-streaming responses for Claude models split one assistant turn
+// across choices: the text in one choice and each tool call in its own, all
+// finishing with "tool_calls" and carrying no index. Several choices are only
+// accepted in that shape: no index field, at most one text, and a finish reason
+// shared by every choice except a truncated ("length") one. Anything else may
+// be n>1 alternatives, which must not be merged into one turn.
+function nonstreamChoices(data) {
+  if (!object(data) || Object.hasOwn(data, "error") || !Array.isArray(data.choices) || data.choices.length <= 1) {
+    return [choices(data, false)]
+  }
+  for (const choice of data.choices) {
+    if (!object(choice) || choice.index !== undefined) failUpstream("Chat completion has an invalid choice")
+    choiceFields(choice, false)
+    messageFields(choice.message, false)
+  }
+  const texts = data.choices.filter((choice) => typeof choice.message.content === "string" && choice.message.content)
+  const reasons = new Set(data.choices.map((choice) => choice.finish_reason).filter((reason) => reason !== "length"))
+  if (texts.length > 1 || reasons.size > 1 || (reasons.size === 1 && !reasons.has("tool_calls"))) {
+    failUpstream("Chat completion choices are alternatives, not one split turn")
+  }
+  return data.choices
 }
 
 function messageFields(message, streaming) {
@@ -327,19 +354,27 @@ function messageFields(message, streaming) {
 }
 
 export function translateResponseToAnthropic(response, model) {
-  const choice = choices(response, false)
-  const message = choice.message
-  messageFields(message, false)
-  const reason = validateFinish(choice.finish_reason, message.tool_calls?.length ?? 0)
+  const parts = nonstreamChoices(response)
   const content = []
-  if (typeof message.content === "string") content.push({ type: "text", text: message.content })
   const ids = new Set()
-  for (const tool of message.tool_calls ?? []) {
-    toolHeader(tool)
-    if (ids.has(tool.id)) failUpstream("Chat tool call IDs must be unique")
-    ids.add(tool.id)
-    content.push({ type: "tool_use", id: tool.id, name: tool.function.name, input: toolInput(tool.function.arguments) })
+  for (const choice of parts) {
+    const message = choice.message
+    messageFields(message, false)
+    stopReason(choice.finish_reason)
+    if (typeof message.content === "string" && (message.content || parts.length === 1)) {
+      content.push({ type: "text", text: message.content })
+    }
+    for (const tool of message.tool_calls ?? []) {
+      toolHeader(tool)
+      if (ids.has(tool.id)) failUpstream("Chat tool call IDs must be unique")
+      ids.add(tool.id)
+      content.push({ type: "tool_use", id: tool.id, name: tool.function.name, input: toolInput(tool.function.arguments) })
+    }
   }
+  // A split turn is truncated if any part is; otherwise every part shares one
+  // finish reason, which must agree with the turn's tool calls as a whole.
+  const truncated = parts.some((choice) => choice.finish_reason === "length")
+  const reason = truncated ? "max_tokens" : validateFinish(parts[0].finish_reason, ids.size)
   if (response.id !== undefined && !present(response.id)) failUpstream("Chat completion id must be a nonempty string")
   return {
     id: response.id ?? `msg_${randomUUID()}`, type: "message", role: "assistant", model, content,

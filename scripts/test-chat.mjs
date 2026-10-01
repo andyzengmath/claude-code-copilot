@@ -427,3 +427,45 @@ test("choice-level errors and unknown result semantics are not silently ignored"
     upstreamError(() => createStreamTranslator("model", sink()).processChunk(streamed))
   }
 })
+
+// Copilot's non-streaming Chat Completions responses for Claude models split one
+// assistant turn across choices: the text in one choice and each tool call in
+// its own, all finishing with "tool_calls". Choices carry no index field.
+const split = (...messages) => ({
+  id: "chat_split",
+  choices: messages.map(([message, finish_reason = "tool_calls"]) => ({ message: { role: "assistant", ...message }, finish_reason })),
+})
+const fn = (id, name, args) => ({ id, type: "function", function: { name, arguments: JSON.stringify(args) } })
+
+test("nonstream turns that Copilot splits across choices keep text and every tool call", () => {
+  const out = translateResponseToAnthropic(split(
+    [{ content: "I'll check both." }],
+    [{ tool_calls: [fn("toolu_a", "get_weather", { city: "Paris" })] }],
+    [{ tool_calls: [fn("toolu_b", "get_time", { city: "Tokyo" })] }],
+  ), "model")
+  assert.equal(out.stop_reason, "tool_use")
+  assert.deepEqual(out.content, [
+    { type: "text", text: "I'll check both." },
+    { type: "tool_use", id: "toolu_a", name: "get_weather", input: { city: "Paris" } },
+    { type: "tool_use", id: "toolu_b", name: "get_time", input: { city: "Tokyo" } },
+  ])
+  const toolsOnly = translateResponseToAnthropic(split(
+    [{ tool_calls: [fn("toolu_a", "get_weather", { city: "Paris" })] }],
+    [{ tool_calls: [fn("toolu_b", "get_time", { city: "Tokyo" })] }],
+  ), "model")
+  assert.deepEqual(toolsOnly.content.map((block) => block.id), ["toolu_a", "toolu_b"])
+})
+
+test("split choices still reject truncation, duplicates and unexplained finishes", () => {
+  const truncated = translateResponseToAnthropic(split(
+    [{ content: "I'll check." }],
+    [{ tool_calls: [fn("toolu_c", "get_time", { city: "Oslo" })] }, "length"],
+  ), "model")
+  assert.equal(truncated.stop_reason, "max_tokens")
+  for (const data of [
+    split([{ tool_calls: [fn("toolu_d", "a", {})] }], [{ tool_calls: [fn("toolu_d", "b", {})] }]),
+    split([{ content: "one" }, "stop"], [{ content: "two" }, "stop"]),
+    split([{ content: "text" }], [{ tool_calls: [fn("toolu_e", "a", {})] }, "content_filter"]),
+    { choices: [{ index: 0, message: { role: "assistant", content: "a" }, finish_reason: "stop" }, { index: 0, message: { role: "assistant", content: "b" }, finish_reason: "stop" }] },
+  ]) upstreamError(() => translateResponseToAnthropic(data, "model"))
+})
