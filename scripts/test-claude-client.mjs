@@ -1,15 +1,29 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import test from "node:test"
-import { fixture, message, nativeFrames, streamResponse } from "./test-helpers/gateway.mjs"
+import { fixture, message, models, nativeFrames, streamResponse } from "./test-helpers/gateway.mjs"
 
 const executable = process.env.CLAUDE_CODE_TEST_BINARY
+const luna = { id: "gpt-6-luna", supported_endpoints: ["/responses", "ws:/responses"], policy: { state: "enabled" } }
+const hostedReply = {
+  id: "resp_fixture", object: "response", status: "completed", model: "gpt-6-luna",
+  output: [
+    { id: "ws_fixture", type: "web_search_call", status: "completed", action: { type: "search", query: "Node.js official downloads", sources: [{ type: "url", url: "https://nodejs.org/en/download" }] } },
+    { id: "msg_fixture", type: "message", role: "assistant", content: [{ type: "output_text", text: "Official Node.js downloads: https://nodejs.org/en/download", annotations: [] }] },
+  ],
+  usage: { input_tokens: 900, input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, output_tokens: 40 },
+}
 
-async function runClient(t, webSearch) {
+async function runClient(t, webSearch, hosted = false) {
   const frontend = []
   const backend = []
   let searches = 0
+  let hostedSearches = 0
   const f = await fixture(t, (call) => {
+    if (call.url.pathname === "/responses") {
+      hostedSearches++
+      return Response.json(hostedReply)
+    }
     const body = JSON.parse(call.body)
     if (call.url.pathname === "/v1/messages/count_tokens") return Response.json({ input_tokens: 9 })
     assert.equal(call.url.pathname, "/v1/messages")
@@ -31,6 +45,7 @@ async function runClient(t, webSearch) {
     return body.stream ? streamResponse(nativeFrames(response), { fragments: 19 }) : Response.json(response)
   }, {
     config: { requestTimeoutMs: 10000, heartbeatMs: 20 },
+    ...(hosted ? { catalog: async () => Response.json({ data: [...models, luna] }) } : {}),
     searchProvider: async () => {
       searches++
       return [{
@@ -96,9 +111,18 @@ async function runClient(t, webSearch) {
     assert.ok(nested, "ordinary Claude Code must actually invoke its nested server-search request")
     assert.deepEqual(nested.tool_choice, { type: "tool", name: "web_search" })
     assert.equal(nested.thinking, "disabled")
-    assert.ok(backend.some((call) => call.tools.some((tool) => tool.name === "web_search" && !tool.type)))
-    assert.equal(searches, 1)
-    assert.ok(backend.length >= 4)
+    if (hosted) {
+      // One hosted /responses search answers the nested request: no provider
+      // search and no Claude generation around it.
+      assert.equal(hostedSearches, 1)
+      assert.equal(searches, 0)
+      assert.equal(backend.some((call) => call.tools.some((tool) => tool.name === "web_search")), false)
+    } else {
+      assert.equal(hostedSearches, 0)
+      assert.ok(backend.some((call) => call.tools.some((tool) => tool.name === "web_search" && !tool.type)))
+      assert.equal(searches, 1)
+      assert.ok(backend.length >= 4)
+    }
   }
 }
 
@@ -107,7 +131,12 @@ test("installed Claude Code completes ordinary native inference through the real
   timeout: 60000,
 }, (t) => runClient(t, false))
 
-test("installed Claude Code completes its non-bare nested WebSearch flow through the real proxy", {
+test("installed Claude Code completes its non-bare nested WebSearch flow through provider search", {
   skip: !executable && "Set CLAUDE_CODE_TEST_BINARY to run the installed-client offline fixture",
   timeout: 60000,
 }, (t) => runClient(t, true))
+
+test("installed Claude Code completes its nested WebSearch flow through one hosted search", {
+  skip: !executable && "Set CLAUDE_CODE_TEST_BINARY to run the installed-client offline fixture",
+  timeout: 60000,
+}, (t) => runClient(t, true, true))

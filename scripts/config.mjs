@@ -1,3 +1,6 @@
+// Search providers that WEBSEARCH_PROVIDER can move to the front of the chain.
+export const PREFERRED_SEARCH_PROVIDERS = Object.freeze(["github", "exa", "parallel"])
+
 const numbers = {
   port: ["COPILOT_PROXY_PORT", 18080, 0, 65535],
   maxBodyBytes: ["COPILOT_MAX_BODY_BYTES", 32 * 1024 * 1024, 1],
@@ -18,6 +21,7 @@ const numbers = {
   searchMaxResults: ["WEB_SEARCH_MAX_RESULTS", 5, 1, 100],
   searchMaxUses: ["WEB_SEARCH_MAX_USES_CAP", 10, 1, 100],
   searchTimeoutMs: ["WEB_SEARCH_TIMEOUT_MS", 25000, 1],
+  searchTotalTimeoutMs: ["WEB_SEARCH_TOTAL_TIMEOUT_MS", 60000, 1],
   searchMaxResponseBytes: ["WEB_SEARCH_MAX_RESPONSE_BYTES", 2 * 1024 * 1024, 1],
   maxConcurrentSearches: ["WEB_SEARCH_MAX_CONCURRENT", 2, 1],
   searchCacheTtlMs: ["WEB_SEARCH_CACHE_TTL_MS", 300000, 0],
@@ -68,7 +72,7 @@ export function readConfig(env = process.env, overrides = {}) {
   if (!["auto", "messages", "chat"].includes(config.transport)) {
     throw new Error("COPILOT_TRANSPORT must be auto, messages, or chat")
   }
-  if (!["", "github", "exa", "parallel"].includes(config.websearchProvider)) {
+  if (!["", ...PREFERRED_SEARCH_PROVIDERS].includes(config.websearchProvider)) {
     throw new Error("WEBSEARCH_PROVIDER must be github, exa, parallel, or empty")
   }
   if (!["hosted", "providers"].includes(config.webSearchMode)) {

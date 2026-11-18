@@ -1,3 +1,5 @@
+import { PREFERRED_SEARCH_PROVIDERS } from "./config.mjs"
+
 const EXA_URL = "https://mcp.exa.ai/mcp"
 const PARALLEL_URL = "https://search.parallel.ai/mcp"
 const USER_AGENT = "claude-code-copilot-provider/1.0.0"
@@ -318,8 +320,10 @@ export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}
     websearchProvider: config.websearchProvider ?? "",
     searchMaxResults: config.searchMaxResults ?? 5,
     searchTimeoutMs: config.searchTimeoutMs ?? 25000,
+    searchTotalTimeoutMs: config.searchTotalTimeoutMs ?? 60000,
     searchMaxResponseBytes: config.searchMaxResponseBytes ?? 2097152,
   }
+  let githubRefusalReported = false
   const maxResults = settings.searchMaxResults
   const request = (url, options, signal) => requestText(fetchImpl, url, options, settings, signal)
   const callMcp = async (url, name, args, headers, signal, parse = mcpResults) => parse(await request(url, {
@@ -398,29 +402,44 @@ export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}
     },
   }
 
-  return async function search(query, { signal, token } = {}) {
+  return async function search(query, { signal, token, accepts } = {}) {
     signal?.throwIfAborted()
     const first = selectProvider(query, settings)
     const github = typeof githubMcpUrl === "string" && typeof token === "string" && token !== ""
-    const preferred = ["github", "exa", "parallel"].includes(settings.websearchProvider) ? [settings.websearchProvider] : []
+    const preferred = PREFERRED_SEARCH_PROVIDERS.includes(settings.websearchProvider) ? [settings.websearchProvider] : []
     // A Set keeps each provider's first position, so the preferred one is not repeated.
     const order = [...new Set([...preferred, "github", first, first === "exa" ? "parallel" : "exa",
       ...(settings.braveApiKey ? ["brave"] : []), ...(settings.serperApiKey ? ["serper"] : []),
       "lite", "instant"])].filter((name) => github || name !== "github")
+    // One deadline bounds the whole chain, so stalled providers cannot add up.
+    const deadline = AbortSignal.timeout(settings.searchTotalTimeoutMs)
+    const chain = signal ? AbortSignal.any([signal, deadline]) : deadline
     let succeeded = false
     for (const name of order) {
       signal?.throwIfAborted()
+      if (deadline.aborted) break
       const provider = providers[name]
       try {
-        const results = await provider.search(query, signal, token)
+        // Only GitHub's own search receives the Copilot sign-in.
+        const found = await provider.search(query, chain, name === "github" ? token : undefined)
         signal?.throwIfAborted()
+        // Results the domain lists exclude do not end the fallback chain.
+        const results = typeof accepts === "function" ? found.filter(accepts) : found
         if (results.length) return results
         succeeded = true
       } catch (error) {
         signal?.throwIfAborted()
+        if (deadline.aborted) break
         const detail = error instanceof ProviderFailure ? error.message : "request or response read failed"
-        logger.warn(`⚠ ${provider.label} search failed: ${detail}`)
+        if (name === "github" && /^HTTP 40[13]$/.test(detail) && !githubRefusalReported) {
+          githubRefusalReported = true
+          logger.warn(`⚠ GitHub web search was refused (${detail}), for example by organization policy; searches use third-party providers`)
+        } else logger.warn(`⚠ ${provider.label} search failed: ${detail}`)
       }
+    }
+    if (deadline.aborted) {
+      logger.warn("⚠ Web search stopped at the total search deadline")
+      throw new WebSearchError("Web search is unavailable: providers did not answer within the search deadline.", "unavailable")
     }
     if (succeeded) return []
     throw new WebSearchError("Web search is unavailable: all providers failed; check provider connectivity and configuration.", "unavailable")

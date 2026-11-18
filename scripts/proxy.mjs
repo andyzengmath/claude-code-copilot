@@ -8,11 +8,11 @@ import { getProxyKey, readAuthToken } from "./credentials.mjs"
 import { readConfig } from "./config.mjs"
 import { adaptToModel, claudeApiId, createModelCatalog, isRoutable, withoutSafeguards } from "./models.mjs"
 import { buildChatRequest, createStreamTranslator, translateResponseToAnthropic } from "./chat.mjs"
-import { abortError, ProxyError } from "./runtime.mjs"
+import { abortError, parseRetryAfterMs, ProxyError } from "./runtime.mjs"
 import { consumeSSE, createSSEWriter, NativeMessageState, parseSSEData, validateNativeContentBlock } from "./sse.mjs"
 import { createSearchProvider } from "./search-providers.mjs"
 import { createWebSearchService, extractWebSearchConfig, prepareSearchRequest, runWebSearch } from "./search.mjs"
-import { buildHostedSearchRequest, emitHostedMessage, hostedSearchIneligibility, hostedSearchMessage } from "./hosted-search.mjs"
+import { buildHostedSearchRequest, emitHostedMessage, hostedSearchIneligibility, hostedSearchMessage, hostedSearchUsage } from "./hosted-search.mjs"
 import { createUpstreamClient, errorEnvelope, errorType, responseHeaders, upstreamError } from "./upstream.mjs"
 
 export { createStreamTranslator, translateMessages, translateContentPart } from "./chat.mjs"
@@ -34,6 +34,12 @@ function authorized(req, key) {
 function jsonResponse(res, status, body, headers = {}) {
   res.writeHead(status, { ...headers, "content-type": "application/json" })
   res.end(JSON.stringify(body))
+}
+
+// Client-chosen names in logs: escaped, truncated and limited in number.
+function fieldList(names) {
+  const shown = names.slice(0, 5).map((name) => JSON.stringify(name.slice(0, 64))).join(", ")
+  return names.length > 5 ? `${shown} and ${names.length - 5} more` : shown
 }
 
 function readRequestBody(req, { signal, maxBytes, timeoutMs }) {
@@ -148,53 +154,76 @@ export function createProxyServer({
   const lifecycle = shutdownSignal ? AbortSignal.any([shutdownSignal, shutdown.signal]) : shutdown.signal
   const catalog = createModelCatalog({ fetchImpl, baseUrl, config, logger })
   const copilot = createUpstreamClient({ fetchImpl, baseUrl, config, logger })
+  // Hosted search gets its own client: one attempt with the search deadline,
+  // since provider search is the fallback, and its own admission gate, so a
+  // Retry-After for the search model never delays or rejects Claude traffic.
+  const hostedClient = createUpstreamClient({
+    fetchImpl, baseUrl, logger,
+    config: { ...config, maxRetries: 0, requestTimeoutMs: Math.min(config.requestTimeoutMs, config.searchTimeoutMs) },
+  })
   const search = createWebSearchService({
     provider: searchProvider ?? createSearchProvider({ fetchImpl, config, logger, githubMcpUrl: `${baseUrl}/mcp/` }), config, logger,
   })
   const warned = new Set()
   const warnOnce = (message) => {
     if (warned.has(message)) return
-    warned.add(message)
+    if (warned.size < 256) warned.add(message)
     logger.warn(message)
+  }
+
+  // After a refusal or rate limit, skip hosted search for a while instead of
+  // paying for a failing call before every provider search.
+  let hostedPausedUntil = 0
+  function pauseHostedSearch(error) {
+    const hint = parseRetryAfterMs(error?.headers?.["retry-after"] ?? null)
+    const pause = error?.status === 429 ? hint ?? 60000
+      : error?.status === 503 ? hint ?? 0
+      : [401, 403, 404].includes(error?.status) ? 300000 : 0
+    if (pause > 0) hostedPausedUntil = Math.max(hostedPausedUntil, Date.now() + Math.min(pause, 3600000))
+    return pause
   }
 
   // Answer a search-only request with one Copilot /responses call using the
   // hosted web_search tool. Returns { message } on success. Otherwise returns
-  // { message: null, started } so the caller falls back to provider search;
-  // `started` is set when message_start was already sent to a streaming client.
-  async function hostedSearch({ body, settings, model, token, signal, emit }) {
-    let started
+  // { message: null, usage } so the caller uses provider search; `usage` holds
+  // the tokens of a hosted answer that was received but rejected.
+  async function hostedSearch({ body, settings, model, token, signal }) {
+    const paused = hostedPausedUntil - Date.now()
+    if (paused > 0) {
+      logger.log(`  search: providers (hosted search paused for ${Math.ceil(paused / 1000)}s)`)
+      return { message: null }
+    }
     let upstream
+    let usage
     try {
       const info = (await catalog.get(token, signal)).find((entry) => entry.id === config.webSearchModel)
       if (!info || !isRoutable(info) || !info.supported_endpoints?.includes("/responses")) {
         warnOnce(`Hosted web search model ${config.webSearchModel} is unavailable for /responses; using provider search`)
         return { message: null }
       }
-      const id = `msg_${randomUUID()}`
-      if (emit) {
-        started = { id }
-        await emit("message_start", {
-          type: "message_start",
-          message: {
-            id, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
-          },
-        })
-      }
       // No incoming headers: anthropic-* headers do not apply to /responses.
-      upstream = await copilot.request("/responses", buildHostedSearchRequest(body, settings, config, info), { token, headers: {}, signal })
+      upstream = await hostedClient.request("/responses", buildHostedSearchRequest(body, settings, config, info), { token, headers: {}, signal })
       if (!upstream.response.ok) throw await upstreamError(upstream)
       let data
       try { data = JSON.parse(await upstream.text()) } catch { throw new ProxyError(502, "Copilot hosted search returned invalid JSON") }
-      const message = hostedSearchMessage(data, { id, model, settings })
+      try { usage = hostedSearchUsage(data?.usage) } catch { /* hostedSearchMessage rejects it below */ }
+      let message
+      try {
+        message = hostedSearchMessage(data, { id: `msg_${randomUUID()}`, model, settings })
+      } catch (error) {
+        error.hostedReason = error.message
+        throw error
+      }
       const searches = message.usage.server_tool_use.web_search_requests
       logger.log(`  search: hosted ${info.id} (${searches} ${searches === 1 ? "search" : "searches"})`)
-      return { message }
+      return { message, searchModel: info.id }
     } catch (error) {
       signal.throwIfAborted()
-      logger.warn(`Hosted web search failed (${error.status ?? error.name}); using provider search`)
-      return { message: null, started }
+      const pause = pauseHostedSearch(error)
+      // Upstream messages are never logged; hostedReason is written locally.
+      logger.warn(`Hosted web search failed (${error.hostedReason ?? error.status ?? error.name}); using provider search` +
+        (pause > 0 ? ` for the next ${Math.ceil(pause / 1000)}s` : ""))
+      return { message: null, usage }
     } finally {
       upstream?.dispose()
     }
@@ -266,8 +295,8 @@ export function createProxyServer({
       if (nativeTransport && !searchSettings) request = prepareSearchRequest(request, config, null)
       inference = true
       logger.log(`[${new Date().toISOString()}] ${req.method} ${route} | model: ${model} | transport: ${transport}${searchSettings ? " + search" : ""}`)
-      if (!nativeTransport && (searchSettings || countTokens)) {
-        throw new ProxyError(501, "Server search and authoritative token counting require native Messages transport", "api_error")
+      if (!nativeTransport && countTokens) {
+        throw new ProxyError(501, "Authoritative token counting requires native Messages transport", "api_error")
       }
       if (countTokens) {
         const payload = preparedSearch ? { ...preparedSearch, model } : request
@@ -284,24 +313,33 @@ export function createProxyServer({
       }
       if (searchSettings) {
         if (searchSettings.requested > searchSettings.maxUses) logger.warn(`Web search max_uses capped at ${searchSettings.maxUses}`)
-        for (const field of searchSettings.ignoredFields) warnOnce(`Ignored unsupported web_search tool field: ${field}`)
-        if (request.stream) { beginStream(res); writer = makeWriter() }
-        const emit = writer ? (type, data) => writer.event(type, data) : undefined
+        if (searchSettings.ignoredFields.length) warnOnce(`Ignored unsupported web_search tool field(s): ${fieldList(searchSettings.ignoredFields)}`)
         const ineligible = hostedSearchIneligibility(body, searchSettings, config)
         if (ineligible && config.webSearchMode === "hosted") logger.log(`  search: providers (${ineligible})`)
+        // Hosted search runs before any output, and does not use the requested
+        // model's transport, so it also serves Chat-transport models.
         const hosted = ineligible ? { message: null } : await hostedSearch({
-          body, settings: searchSettings, model: request.model, token: authToken, signal, emit,
+          body, settings: searchSettings, model: request.model, token: authToken, signal,
         })
         if (hosted.message) {
-          if (emit) await emitHostedMessage(hosted.message, emit)
-          else jsonResponse(res, 200, hosted.message)
+          const headers = { "x-copilot-search-model": hosted.searchModel }
+          if (request.stream) {
+            beginStream(res, headers)
+            writer = makeWriter()
+            await emitHostedMessage(hosted.message, (type, data) => writer.event(type, data))
+          } else jsonResponse(res, 200, hosted.message, headers)
           outcome = "complete"
           return
         }
+        if (!nativeTransport) {
+          throw new ProxyError(501, "Provider web search requires native Messages transport; this request is not eligible for hosted search", "api_error")
+        }
+        if (searchSettings.userLocation) warnOnce("Provider web search ignored the web_search user_location")
+        if (request.stream) { beginStream(res); writer = makeWriter() }
         const result = await runWebSearch({
-          request, preparedRequest: { ...preparedSearch, model }, config, signal, started: hosted.started,
+          request, preparedRequest: { ...preparedSearch, model }, config, signal, priorUsage: hosted.usage,
           search: (query, options) => search.search(query, { ...options, token: authToken }),
-          emit,
+          emit: writer ? (type, data) => writer.event(type, data) : undefined,
           generate: async (payload, onEvent) => {
             const generation = await copilot.request(`/v1/messages${url.search}`, payload, { token: authToken, headers: req.headers, signal })
             try {
@@ -412,6 +450,7 @@ export function createProxyServer({
     shutdown.abort(abortError("Proxy stopped"))
     catalog.close()
     copilot.close()
+    hostedClient.close()
     search.close()
   })
   return server

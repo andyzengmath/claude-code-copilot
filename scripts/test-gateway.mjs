@@ -876,8 +876,11 @@ for (const streaming of [true, false]) {
       assert.equal(call.url.pathname, "/responses", "no Claude generation for a hosted search")
       return Response.json(hostedReply())
     }, withLuna)
-    const response = await f.request(nestedWebSearch({ stream: streaming }))
+    const response = await f.request(nestedWebSearch({ stream: streaming }), undefined, {
+      headers: { "anthropic-version": "2023-06-01", "anthropic-beta": "fixture-beta-2026-01-01" },
+    })
     assert.equal(response.status, 200)
+    assert.equal(response.headers.get("x-copilot-search-model"), "gpt-6-luna")
     assert.equal(sent.length, 1)
     const headers = new Headers(sent[0].headers)
     assert.equal(headers.get("authorization"), `Bearer ${token}`)
@@ -929,11 +932,16 @@ test("a failed hosted search falls back to provider search with a single message
   assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages"])
 })
 
-test("provider search is used when the hosted search model, mode or domain filters do not allow hosted search", async (t) => {
+test("provider search is used when the hosted search model, mode or request does not allow hosted search", async (t) => {
+  const catalogWith = (entry) => ({ catalog: async () => Response.json({ data: [...models, entry] }) })
   for (const [name, options, request] of [
     ["model missing from the catalog", {}, nestedWebSearch()],
+    ["model disabled by policy", catalogWith({ ...lunaModel, policy: { state: "disabled" } }), nestedWebSearch()],
+    ["model without /responses", catalogWith({ ...lunaModel, supported_endpoints: ["/chat/completions"] }), nestedWebSearch()],
     ["WEB_SEARCH_MODE=providers", { ...withLuna, config: { webSearchMode: "providers" } }, nestedWebSearch()],
     ["blocked_domains", withLuna, nestedWebSearch({}, { blocked_domains: ["example.org"] })],
+    ["stop_sequences", withLuna, nestedWebSearch({ stop_sequences: ["<END>"] })],
+    ["temperature", withLuna, nestedWebSearch({ temperature: 0 })],
   ]) {
     const paths = []
     const rounds = []
@@ -959,4 +967,204 @@ test("provider search receives the account token for GitHub's own search", async
   assert.equal(response.status, 200)
   await response.text()
   assert.deepEqual(seen, [token])
+})
+
+test("a rate-limited hosted search falls back at once, pauses hosted search and never throttles Claude traffic", async (t) => {
+  const paths = []
+  const rounds = []
+  const f = await fixture(t, (call) => {
+    paths.push(call.url.pathname)
+    if (call.url.pathname === "/responses") {
+      return Response.json({ error: { message: "rate limited" } }, { status: 429, headers: { "retry-after": "60" } })
+    }
+    const body = JSON.parse(call.body)
+    return body.tools ? emulationRound(body, rounds) : streamResponse(nativeFrames(message()))
+  }, { ...withLuna, config: { maxRetries: 3 }, searchProvider: async () => [providerResult] })
+  const first = await f.request(nestedWebSearch())
+  assert.equal(first.status, 200)
+  assert.equal(parsedEvents(await first.text()).at(-1).type, "message_stop")
+  assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages"])
+  const plain = await f.request({ stream: true })
+  assert.equal(plain.status, 200)
+  assert.equal(parsedEvents(await plain.text()).at(-1).type, "message_stop")
+  paths.length = 0
+  rounds.length = 0
+  const second = await f.request(nestedWebSearch())
+  assert.equal(parsedEvents(await second.text()).at(-1).type, "message_stop")
+  assert.deepEqual(paths, ["/v1/messages", "/v1/messages"], "hosted search stays paused for the Retry-After period")
+})
+
+test("hosted search is attempted once even when Copilot retries are enabled", async (t) => {
+  const paths = []
+  const rounds = []
+  const f = await fixture(t, (call) => {
+    paths.push(call.url.pathname)
+    if (call.url.pathname === "/responses") return Response.json({ error: { message: "boom" } }, { status: 500 })
+    return emulationRound(JSON.parse(call.body), rounds)
+  }, { ...withLuna, config: { maxRetries: 3 }, searchProvider: async () => [providerResult] })
+  const response = await f.request(nestedWebSearch())
+  assert.equal(parsedEvents(await response.text()).at(-1).type, "message_stop")
+  assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages"])
+})
+
+test("a hosted answer without a completed search falls back, and its tokens are still reported", async (t) => {
+  const paths = []
+  const rounds = []
+  const f = await fixture(t, (call) => {
+    paths.push(call.url.pathname)
+    if (call.url.pathname === "/responses") return Response.json({ ...hostedReply(), output: [hostedReply().output[1]] })
+    return emulationRound(JSON.parse(call.body), rounds)
+  }, { ...withLuna, searchProvider: async () => [providerResult] })
+  const response = await f.request(nestedWebSearch({ stream: false }))
+  assert.equal(response.status, 200)
+  const body = await response.json()
+  assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages"])
+  assert.equal(body.content.at(-1).text, "Emulated answer")
+  assert.equal(body.usage.input_tokens, 900 + 2 * 9)
+  assert.equal(body.usage.output_tokens, 40 + 2 * 3)
+})
+
+test("Claude Code's 5.5 WebSearch request with automatic choice still makes the hosted model search", async (t) => {
+  let payload
+  const f = await fixture(t, (call) => {
+    payload = JSON.parse(call.body)
+    return Response.json(hostedReply())
+  }, { catalog: async () => Response.json({ data: [...models, adaptiveOnly("claude-opus-5.5"), lunaModel] }) })
+  // Shape Claude Code 2.1.303 sends for its 5.5 models (captured from the installed client).
+  const response = await f.request(nestedWebSearch({
+    model: "claude-opus-5-5", max_tokens: 128000, tool_choice: { type: "auto" }, output_config: { effort: "medium" },
+    metadata: { user_id: "fixture-user" },
+  }))
+  assert.equal(response.status, 200)
+  assert.equal(parsedEvents(await response.text()).at(-1).type, "message_stop")
+  assert.equal(payload.model, "gpt-6-luna")
+  assert.equal(payload.tool_choice, "required")
+})
+
+test("a client abort during hosted search cancels it without falling back", { timeout: 2500 }, async (t) => {
+  const paths = []
+  let hostedSignal
+  let started
+  const ready = new Promise((resolve) => { started = resolve })
+  const f = await fixture(t, (call) => {
+    paths.push(call.url.pathname)
+    hostedSignal = call.signal
+    started()
+    return new Promise(() => {})
+  }, { ...withLuna, config: { requestTimeoutMs: 10000 }, searchProvider: async () => assert.fail("no provider search after an abort") })
+  const controller = new AbortController()
+  const pending = f.request(nestedWebSearch(), undefined, { signal: controller.signal })
+  await ready
+  controller.abort()
+  await assert.rejects(pending)
+  while (!hostedSignal.aborted) await new Promise((resolve) => setTimeout(resolve, 5))
+  assert.deepEqual(paths, ["/responses"])
+})
+
+test("hosted search serves Chat-transport models, and other searches there get 501 before any output", async (t) => {
+  const paths = []
+  const f = await fixture(t, (call) => {
+    paths.push(call.url.pathname)
+    return Response.json(hostedReply())
+  }, { ...withLuna, config: { transport: "chat" } })
+  const response = await f.request(nestedWebSearch())
+  assert.equal(response.status, 200)
+  assert.equal(parsedEvents(await response.text()).at(-1).type, "message_stop")
+  const blocked = await f.request(nestedWebSearch({}, { blocked_domains: ["example.org"] }))
+  assert.equal(blocked.status, 501)
+  assert.equal((await blocked.json()).type, "error")
+  assert.deepEqual(paths, ["/responses"])
+})
+
+test("unknown search tool fields and an unused user_location are reported once, escaped and bounded", async (t) => {
+  const warnings = []
+  const rounds = []
+  const f = await fixture(t, (call) => emulationRound(JSON.parse(call.body), rounds), {
+    config: { webSearchMode: "providers" }, searchProvider: async () => [providerResult],
+    logger: { log() {}, error() {}, warn: (line) => warnings.push(line) },
+  })
+  const fields = Object.fromEntries(["a\n[2026-11-18] POST /v1/messages", "b", "c", "d", "e", "f", "g"].map((name) => [name, true]))
+  for (let attempt = 0; attempt < 2; attempt++) {
+    rounds.length = 0
+    const response = await f.request(nestedWebSearch({}, { ...fields, user_location: { type: "approximate", country: "US" } }))
+    assert.equal(parsedEvents(await response.text()).at(-1).type, "message_stop")
+  }
+  assert.deepEqual(warnings, [
+    'Ignored unsupported web_search tool field(s): "a\\n[2026-11-18] POST /v1/messages", "b", "c", "d", "e" and 2 more',
+    "Provider web search ignored the web_search user_location",
+  ])
+})
+
+test("provider search forwards only a plain custom web_search tool to Claude", async (t) => {
+  const rounds = []
+  const f = await fixture(t, (call) => emulationRound(JSON.parse(call.body), rounds), {
+    config: { webSearchMode: "providers" }, searchProvider: async () => [providerResult],
+  })
+  const response = await f.request(nestedWebSearch({}, {
+    search_profile: "default", future_hint: true, allowed_domains: ["example.com"], cache_control: { type: "ephemeral" },
+  }))
+  assert.equal(parsedEvents(await response.text()).at(-1).type, "message_stop")
+  const forwarded = rounds[0].tools.find((tool) => tool.name === "web_search")
+  assert.deepEqual(Object.keys(forwarded).sort(), ["cache_control", "description", "input_schema", "name"])
+})
+
+test("provider search asks GitHub's own search first, with the account token", async (t) => {
+  const rounds = []
+  const searches = []
+  const github = { search_result_groups: [{ search_result_type: "webResults", items: [{ title: "Node.js", url: "https://nodejs.org/en/download", snippets: ["Downloads"] }] }], error_message: null }
+  const f = await fixture(t, (call) => {
+    if (call.url.pathname !== "/mcp/") return emulationRound(JSON.parse(call.body), rounds)
+    searches.push(call)
+    return new Response(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify(github) }] } })}\n\n`,
+      { headers: { "content-type": "text/event-stream" } })
+  }, { config: { webSearchMode: "providers" } })
+  const response = await f.request(nestedWebSearch({ stream: false }))
+  assert.equal(response.status, 200)
+  const body = await response.json()
+  assert.equal(searches.length, 1)
+  assert.equal(new Headers(searches[0].headers).get("authorization"), `Bearer ${token}`)
+  assert.deepEqual(body.content.find((block) => block.type === "web_search_tool_result").content.map((result) => result.url), ["https://nodejs.org/en/download"])
+})
+
+test("Claude 5.5 IDs missing from the catalog are rejected, never routed to another version", async (t) => {
+  const f = await fixture(t, () => assert.fail("no inference dispatch for an uncatalogued version"))
+  for (const model of ["claude-sonnet-5-5", "claude-haiku-5-5"]) {
+    const response = await f.request({ model })
+    assert.equal(response.status, 400)
+    assert.match((await response.json()).error.message, /versions are not substituted/)
+  }
+  assert.ok(f.calls.every((call) => call.url.pathname === "/models"))
+})
+
+test("model discovery lists only models that serve Claude requests", async (t) => {
+  const f = await fixture(t, () => assert.fail("no inference"), withLuna)
+  const response = await fetch(`${f.base}/v1/models`, { headers: { "x-api-key": f.key } })
+  const ids = (await response.json()).data.map((model) => model.id)
+  assert.equal(ids.includes("gpt-6-luna"), false)
+  assert.ok(ids.includes("claude-sonnet-5"))
+})
+
+for (const [name, frames] of [
+  ["ends without message_stop", event("message_start", { type: "message_start", message: { ...message(), content: [], stop_reason: null } }) +
+    event("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })],
+  ["sends an error event", event("message_start", { type: "message_start", message: { ...message(), content: [], stop_reason: null } }) +
+    event("error", { type: "error", error: { type: "overloaded_error", message: "Overloaded" } })],
+]) {
+  test(`a search generation that ${name} reports an error, never a finished message`, async (t) => {
+    const f = await fixture(t, () => streamResponse(frames), {
+      config: { webSearchMode: "providers" }, searchProvider: async () => assert.fail("no search without a complete generation"),
+    })
+    const events = parsedEvents(await (await f.request(nestedWebSearch())).text())
+    assert.equal(events.at(-1).type, "error")
+    assert.equal(events.some((entry) => entry.type === "message_stop" || entry.type === "message_delta"), false)
+    if (name === "sends an error event") assert.equal(events.at(-1).error.type, "overloaded_error")
+  })
+}
+
+test("a chat stream that ends without finishing reports an error, never a finished message", async (t) => {
+  const frames = `data: ${JSON.stringify({ choices: [{ delta: { content: "partial" } }] })}\n\n`
+  const f = await fixture(t, () => streamResponse(frames), { config: { transport: "chat" } })
+  const events = parsedEvents(await (await f.request({ stream: true })).text())
+  assert.equal(events.at(-1).type, "error")
+  assert.equal(events.some((entry) => entry.type === "message_stop"), false)
 })

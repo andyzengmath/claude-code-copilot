@@ -174,21 +174,23 @@ Claude Code's auto mode can ask the API to run its permission classifier server-
 
 Ordinary Claude Code WebSearch makes nested requests containing the server tool `web_search_20250305`, which Copilot's native Messages endpoint rejects ("The use of the web search tool is not supported"). The proxy answers these requests in one of two ways.
 
-**Hosted search (default).** A search-only request, which is what Claude Code's WebSearch sends, is answered by one Copilot `/responses` call. That call runs OpenAI's server-side `web_search` tool on `WEB_SEARCH_MODEL` (default `gpt-6-luna`), the way Codex searches. The proxy returns the searches as `server_tool_use` and `web_search_tool_result` blocks, with the sources the model consulted, and the model's cited answer as text. This replaces two or more Claude generations with one call to a lightweight model: about 3–10 seconds, typically under 10,000 input tokens. Hosted search applies only when the request:
+**Hosted search (default).** A search-only request, which is what Claude Code's WebSearch sends, is answered by one Copilot `/responses` call. That call runs OpenAI's server-side `web_search` tool on `WEB_SEARCH_MODEL` (default `gpt-6-luna`), the way Codex searches. The proxy returns the searches as `server_tool_use` and `web_search_tool_result` blocks, with the sources the model consulted, the pages it opened and the pages it cited, and the model's cited answer as text. This replaces two or more Claude generations with one call to a lightweight model: about 3–10 seconds, typically under 10,000 input tokens. The hosted model is always required to search, including when Claude Code sends `tool_choice: auto`, as it does for its 5.5 models. Hosted search applies only when the request:
 
 - declares no client tools and allows at least one search (`max_uses` above 0);
-- has text-only system and message content, and `max_tokens` of at least 16;
-- has no `blocked_domains` (the hosted tool can restrict to `allowed_domains` but cannot exclude domains).
+- has text-only system and message content that ends with a user turn, and `max_tokens` of at least 16;
+- has no `blocked_domains` (the hosted tool can restrict to `allowed_domains` but cannot exclude domains);
+- uses only fields hosted search can honor: `model`, `max_tokens`, `stream`, `system`, `messages`, `tools`, `tool_choice` (not `none`), `metadata`, `thinking` (`disabled` or `adaptive`), `output_config` with only `effort`, and an empty `stop_sequences`. These are the fields Claude Code's nested WebSearch request uses; anything else, such as `temperature` or `output_config.format`, goes to provider search so that it is honored rather than dropped.
 
-The hosted search model, not Claude, writes the search summary that Claude Code passes back to the main model. The search model must appear in your Copilot catalog with the `/responses` endpoint. Copilot bills the search model's tokens at its own rates.
+The hosted search model, not Claude, writes the search summary that Claude Code passes back to the main model. Its instructions mark web content as untrusted data. The search model must appear in your Copilot catalog with the `/responses` endpoint. Copilot bills the search model's tokens at its own rates. Responses name the search model in an `x-copilot-search-model` header. Because hosted search does not call the requested model, it also works when that model uses the Chat transport.
 
-**Provider search (fallback).** Other requests, any hosted-search failure, `WEB_SEARCH_MODE=providers`, or an unavailable search model use bounded search emulation: native custom tool calls, proxy-run provider searches, and a final Claude synthesis. Each search round may consume additional Copilot requests. If a streaming hosted search fails, the same response continues with provider search.
+**Provider search (fallback).** Other requests, `WEB_SEARCH_MODE=providers`, or an unavailable search model use bounded search emulation: native custom tool calls, proxy-run provider searches, and a final Claude synthesis. Each search round may consume additional Copilot requests. Provider search needs the native Messages transport; on the Chat transport, a search that hosted search cannot answer gets HTTP 501. A hosted search also falls back when Copilot returns an error, when the search model completes no search, declines, or relies on a page outside `allowed_domains`, or when its reply is malformed. The fallback happens before any output is sent, and the response reports the tokens of a hosted answer that was received but not used. Hosted search makes one attempt with the `WEB_SEARCH_TIMEOUT_MS` deadline and has its own admission queue, so a rate limit on the search model never delays Claude requests. After HTTP 429 or 503 with `Retry-After`, the proxy skips hosted search for that period (one minute after a 429 without it), and after HTTP 401, 403 or 404 for five minutes, using provider search directly.
 
 Search input rules:
 
 - Supply at most one of `allowed_domains` or `blocked_domains`, with up to 100 hostnames. Matching enforces hostname boundaries and normalizes case, punycode, and trailing dots. Schemes, ports, paths, and wildcards are not accepted.
-- Supplying two non-null domain lists, a non-null `user_location`, or a newer/unknown server-search version is explicitly rejected, not guessed. Documented nullable options treat `null` as unset. Explicit Chat mode rejects server-search tools.
-- The `search_profile` hint that Claude Code 2.1.303 and later can send is accepted and ignored. Other unrecognized optional tool fields are ignored with a logged warning, so a new Claude Code release does not break WebSearch.
+- `user_location` (`{"type": "approximate"}` with optional `city`, `region`, two-letter `country`, and `timezone`) is passed to hosted search. Provider search cannot localize results; it ignores the location and logs a warning.
+- Supplying two non-null domain lists, a malformed `user_location`, or a newer/unknown server-search version is explicitly rejected, not guessed. Documented nullable options treat `null` as unset.
+- The `search_profile` hint that Claude Code 2.1.303 and later can send is accepted and ignored. Other unrecognized optional tool fields are ignored with one logged warning per distinct set of names, so a new Claude Code release does not break WebSearch.
 - `max_uses: 0` disables search without changing a remaining client-tool selection or `none` choice. Requiring a disabled or unavailable tool is contradictory input and returns HTTP 400 before model discovery or SSE starts.
 
 Search emulation uses native **streaming inner generations**, even for nonstreaming clients, to avoid the nonstreaming output-limit regression. Streaming clients receive content, search-result blocks, and pings progressively; nonstreaming clients receive an assembled response. Usage is aggregated across generations, and real stop reasons such as `pause_turn` and `max_tokens` are preserved rather than replaced with a fabricated successful stop.
@@ -197,9 +199,9 @@ The logical response shares one `max_tokens` allowance: each continuation receiv
 
 Prior proxy-generated search results remain usable in conversation history even when the current request's tools omit `web_search`.
 
-Provider search tries, in order: GitHub's own web search, the tool GitHub Copilot CLI uses, reached with your Copilot sign-in through `https://api.githubcopilot.com/mcp/`; Exa/Parallel MCP, using the approach in [OpenCode](https://github.com/anomalyco/opencode); Brave and Serper when their keys are set; and DuckDuckGo Lite and Instant Answer. `WEBSEARCH_PROVIDER=github`, `exa`, or `parallel` moves that provider to the front; it does not disable the others. GitHub's search may require your organization to allow Copilot web search. Configure keys as needed; provider terms, quotas, availability, and charges apply. Unauthenticated endpoints may be throttled or unavailable.
+Provider search tries, in order: GitHub's own web search, the tool GitHub Copilot CLI uses, reached with your Copilot sign-in through `https://api.githubcopilot.com/mcp/`; Exa/Parallel MCP, using the approach in [OpenCode](https://github.com/anomalyco/opencode); Brave and Serper when their keys are set; and DuckDuckGo Lite and Instant Answer. Only GitHub's search receives your Copilot sign-in. `WEBSEARCH_PROVIDER=github`, `exa`, or `parallel` moves that provider to the front; it does not disable the others. GitHub's search may require your organization to allow Copilot web search; when GitHub refuses a search (HTTP 401 or 403), the proxy logs that once, and searches continue with the third-party providers. A provider whose results the domain lists exclude does not end the chain. Configure keys as needed; provider terms, quotas, availability, and charges apply. Unauthenticated endpoints may be throttled or unavailable.
 
-Defaults bound provider searches to two concurrent operations, a 25-second provider deadline, and a ten-use request cap; the cap also limits hosted searches. Results are cached **in memory** for five minutes, up to 500 entries and 16 MiB; query logging is opt-in via `COPILOT_LOG_SEARCH_QUERIES=1`.
+Defaults bound provider searches to two concurrent operations, a 25-second deadline per provider request, a 60-second deadline per search across all providers, and a ten-use request cap; the cap also limits hosted searches. A search that cannot start because the search queue is full is reported to the model as `too_many_requests`, like any other failed search, rather than failing the response. Results are cached **in memory** for five minutes, up to 500 entries and 16 MiB, separately for each Copilot credential; query logging is opt-in via `COPILOT_LOG_SEARCH_QUERIES=1`.
 
 ## Privacy and local authentication
 
@@ -214,7 +216,7 @@ OAuth credentials and the local API key are persisted privately on disk. Model m
 ## Reliability and errors
 
 - Upload, response, and SSE event sizes are bounded. The request timeout covers upstream headers and idle-body/drain waits, not an unconditional wall-clock limit for an actively progressing stream.
-- Retries cover explicit **429, 500, 502, 503, and 504** responses only. Admission and dispatch of additional attempts must fit within the retry budget; an already-dispatched response retains its own timeout. Full `Retry-After` delays are honored when affordable or returned to the client, never shortened. Ambiguous network errors, timeouts, and response-body failures are not automatically replayed.
+- Retries cover explicit **429, 500, 502, 503, and 504** responses only. Admission and dispatch of additional attempts must fit within the retry budget; an already-dispatched response retains its own timeout. Full `Retry-After` delays are honored when affordable or returned to the client, never shortened. Ambiguous network errors, timeouts, and response-body failures are not automatically replayed. Hosted search requests are never retried; provider search is their fallback.
 - Client disconnects cancel owned upstream work, queue waits, and search work rather than allowing detached requests to continue.
 - Inference concurrency is unlimited by default (`COPILOT_MAX_CONCURRENT_REQUESTS=0`). Setting a positive limit enables bounded admission: 64 queued requests, 64 MiB queued bodies, and a 30-second queue deadline by default. Overflow/deadline failures return errors rather than growing an unbounded queue.
 - Before streaming starts, failures use an HTTP status and JSON error envelope. After SSE starts, errors are reported in-stream; clients must inspect error events, not just the initial HTTP status.
@@ -272,7 +274,8 @@ Export variables before starting Node or the launcher. Compose explicitly maps t
 | `PARALLEL_API_KEY` | *(empty)* | Parallel API key, where required by the endpoint |
 | `WEB_SEARCH_MAX_RESULTS` | `5` | Results per query |
 | `WEB_SEARCH_MAX_USES_CAP` | `10` | Cap on request search uses |
-| `WEB_SEARCH_TIMEOUT_MS` | `25000` | Provider search deadline |
+| `WEB_SEARCH_TIMEOUT_MS` | `25000` | Deadline for the hosted search call and for each provider request |
+| `WEB_SEARCH_TOTAL_TIMEOUT_MS` | `60000` | Deadline for one provider search across all fallback providers |
 | `WEB_SEARCH_MAX_RESPONSE_BYTES` | `2097152` | Maximum provider response (2 MiB) |
 | `WEB_SEARCH_MAX_CONCURRENT` | `2` | Concurrent provider searches |
 | `WEB_SEARCH_CACHE_TTL_MS` | `300000` | In-memory result TTL (5 minutes); `0` disables |
@@ -311,7 +314,7 @@ No dependency installation, home auth token, or real provider calls are required
 
 ### Optional installed-client fixtures
 
-`scripts/test-claude-client.mjs` runs two offline integration fixtures against an already installed Claude Code binary when `CLAUDE_CODE_TEST_BINARY` is set. Otherwise both tests explicitly skip, including in CI. These fixtures use the local proxy with injected model/search responses, not real Copilot or search-provider APIs.
+`scripts/test-claude-client.mjs` runs three offline integration fixtures against an already installed Claude Code binary when `CLAUDE_CODE_TEST_BINARY` is set: ordinary inference, WebSearch through provider search, and WebSearch through hosted search. Otherwise they explicitly skip, including in CI. These fixtures use the local proxy with injected model/search responses, not real Copilot or search-provider APIs.
 
 Run just these fixtures with a binary available on your PATH:
 

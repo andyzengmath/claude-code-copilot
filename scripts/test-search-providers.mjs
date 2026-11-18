@@ -2,6 +2,8 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { getEventListeners } from "node:events"
 import { createSearchProvider, WebSearchError } from "./search-providers.mjs"
+import { createWebSearchService } from "./search.mjs"
+import { readConfig } from "./config.mjs"
 
 // All traffic is intercepted by an injected fetch; no credentials or network.
 const QUERY = "private query & site:example.org"
@@ -648,28 +650,29 @@ test("a GitHub error_message is a failure that falls through even beside items",
 })
 
 test("GitHub tool, HTTP and malformed failures fall through and are never genuine empties", async () => {
-  for (const response of [
-    () => ghSse(ghPayload([ghItem()]), { isError: true }),
-    () => json({ message: "upstream service broke" }, { status: 401 }),
-    () => json({ message: "upstream service broke" }, { status: 403 }),
-    () => json({ message: "upstream service broke" }, { status: 500 }),
-    () => json({ jsonrpc: "2.0", id: 1, error: { code: -32603, message: "upstream service broke" } }),
-    () => rpc([]),
-    () => rpc([{ type: "text", text: "upstream service broke" }]),
-    () => rpc([{ type: "image", data: "abc" }]),
-    () => rpc([{ type: "text", text: JSON.stringify(ghPayload([ghItem()])) }, { type: "image", data: "abc" }]),
-    () => mcp([]),
-    () => mcp({ error_message: null }),
-    () => mcp({ search_result_groups: {} }),
-    () => mcp(ghPayload([], { error_message: "upstream service broke" })),
-    () => mcp(ghPayload([], { error_message: 42 })),
-    () => mcp(ghPayload([ghItem({ url: "javascript:alert(1)" })])),
+  const refused = (status) => [() => json({ message: "upstream service broke" }, { status }), new RegExp(`GitHub web search was refused \\(HTTP ${status}\\)`)]
+  for (const [response, warning = /GitHub search failed/] of [
+    [() => ghSse(ghPayload([ghItem()]), { isError: true })],
+    refused(401),
+    refused(403),
+    [() => json({ message: "upstream service broke" }, { status: 500 })],
+    [() => json({ jsonrpc: "2.0", id: 1, error: { code: -32603, message: "upstream service broke" } })],
+    [() => rpc([])],
+    [() => rpc([{ type: "text", text: "upstream service broke" }])],
+    [() => rpc([{ type: "image", data: "abc" }])],
+    [() => rpc([{ type: "text", text: JSON.stringify(ghPayload([ghItem()])) }, { type: "image", data: "abc" }])],
+    [() => mcp([])],
+    [() => mcp({ error_message: null })],
+    [() => mcp({ search_result_groups: {} })],
+    [() => mcp(ghPayload([], { error_message: "upstream service broke" }))],
+    [() => mcp(ghPayload([], { error_message: 42 }))],
+    [() => mcp(ghPayload([ghItem({ url: "javascript:alert(1)" })]))],
   ]) {
     const { search, calls, warnings } = githubHarness((call) => call.name === "github" ? response() : unavailable())
     await assertUnavailable(search(QUERY, { token: TOKEN }))
     assert.equal(calls[0].name, "github")
     assert.equal(calls.length, 5)
-    assert.match(warnings[0], /GitHub search failed/)
+    assert.match(warnings[0], warning)
     assert.ok(!warnings.join("\n").includes("upstream service broke"))
   }
 })
@@ -762,4 +765,34 @@ test("cancellation during the GitHub request rejects with the caller reason and 
   assert.equal(calls[0].signal.reason, reason)
   assert.equal(warnings.length, 0)
   assert.equal(getEventListeners(controller.signal, "abort").length, 0)
+})
+
+test("results the domain lists exclude do not end the fallback chain", async () => {
+  const { search: provider, calls } = githubHarness((call) => call.name === "github"
+    ? ghSse(ghPayload([ghItem({ url: "https://wrong.test/page" })]))
+    : mcp([hit()]))
+  const service = createWebSearchService({ provider, config: readConfig({}), logger: { log() {}, warn() {} } })
+  try {
+    assert.deepEqual((await service.search("node", { allowedDomains: ["example.org"], token: TOKEN })).map((r) => r.url), [URL_RESULT])
+    assert.equal(calls.length, 2)
+    assert.equal(calls[0].name, "github")
+  } finally { service.close() }
+})
+
+test("one search stops trying providers at the total search deadline", { timeout: 3000 }, async () => {
+  const { search, calls, warnings } = harness(() => new Promise(() => {}), { searchTimeoutMs: 100, searchTotalTimeoutMs: 150 })
+  await assert.rejects(search(QUERY), (error) => error instanceof WebSearchError && error.errorCode === "unavailable" && /deadline/.test(error.message))
+  assert.equal(calls.length, 2)
+  assert.ok(calls.every((call) => call.signal.aborted))
+  assert.match(warnings.at(-1), /total search deadline/)
+})
+
+test("a GitHub refusal is reported once as a possible policy denial", async () => {
+  const { search, warnings } = githubHarness((call) => call.name === "github" ? json({}, { status: 403 }) : mcp([hit()]))
+  await search(QUERY, { token: TOKEN })
+  await search(QUERY, { token: TOKEN })
+  assert.deepEqual(warnings.filter((line) => /GitHub/.test(line)), [
+    "⚠ GitHub web search was refused (HTTP 403), for example by organization policy; searches use third-party providers",
+    "⚠ GitHub search failed: HTTP 403",
+  ])
 })

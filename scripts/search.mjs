@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { domainToASCII } from "node:url"
 import { createAdmissionGate, createSharedTasks, ProxyError } from "./runtime.mjs"
 import { sumUsage } from "./sse.mjs"
@@ -24,6 +24,21 @@ function domainList(values) {
   return [...new Set(values.map(domainName))].sort()
 }
 
+// Anthropic's and OpenAI's web search tools share this approximate-location shape.
+function userLocation(value) {
+  if (value === undefined || value === null) return null
+  const invalid = () => new ProxyError(400, "user_location must be {type: \"approximate\"} with optional city, region, country and timezone strings", "invalid_request_error")
+  if (typeof value !== "object" || Array.isArray(value) || value.type !== "approximate") throw invalid()
+  const location = { type: "approximate" }
+  for (const [name, field] of Object.entries(value)) {
+    if (name === "type" || field === undefined || field === null) continue
+    if (!["city", "region", "country", "timezone"].includes(name) || typeof field !== "string" || !field.trim() ||
+        field.length > 255 || /[\x00-\x1f\x7f]/.test(field) || (name === "country" && !/^[A-Za-z]{2}$/.test(field))) throw invalid()
+    location[name] = field
+  }
+  return location
+}
+
 export function extractWebSearchConfig(tools, config) {
   const serverTools = (tools ?? []).filter((tool) => typeof tool?.type === "string" && tool.type.startsWith("web_search"))
   if (serverTools.length === 0) return null
@@ -34,7 +49,6 @@ export function extractWebSearchConfig(tools, config) {
   if (tool.name !== "web_search" || tools.some((other) => other !== tool && other.name === "web_search")) {
     throw new ProxyError(400, "The server search tool must have the unique name web_search", "invalid_request_error")
   }
-  if (tool.user_location != null) throw new ProxyError(400, "user_location is not supported by these search providers", "invalid_request_error")
   if (tool.allowed_domains != null && tool.blocked_domains != null) {
     throw new ProxyError(400, "Search cannot specify both allowed_domains and blocked_domains", "invalid_request_error")
   }
@@ -52,6 +66,7 @@ export function extractWebSearchConfig(tools, config) {
     requested, maxUses: Math.min(requested, config.searchMaxUses),
     allowedDomains: domainList(tool.allowed_domains),
     blockedDomains: domainList(tool.blocked_domains),
+    userLocation: userLocation(tool.user_location),
     ignoredFields,
   }
 }
@@ -60,6 +75,19 @@ function queryError(code, message) {
   const error = new ProxyError(400, message, "invalid_request_error")
   error.errorCode = code
   return error
+}
+
+// A search failure the model sees as a web_search_tool_result_error.
+function resultError(status, message, type, code) {
+  const error = new ProxyError(status, message, type)
+  error.errorCode = code
+  return error
+}
+
+const unavailable = (message) => resultError(502, message, "api_error", "unavailable")
+
+function hostMatches(host, domain) {
+  return host === domain || host.endsWith(`.${domain}`)
 }
 
 export function createWebSearchService({ provider, config, logger }) {
@@ -82,27 +110,49 @@ export function createWebSearchService({ provider, config, logger }) {
       const allowed = domainList(allowedDomains)
       const blocked = domainList(blockedDomains)
       if (allowed.length && blocked.length) throw queryError("invalid_input", "Cannot combine allowed and blocked search domains")
-      const key = JSON.stringify([query.trim(), allowed, blocked])
+      // Searches made with different credentials never share a request or result.
+      const account = typeof token === "string" && token ? createHash("sha256").update(token).digest("base64url").slice(0, 16) : ""
+      const key = JSON.stringify([query.trim(), allowed, blocked, account])
       const cached = cache.get(key)
       if (cached && Date.now() - cached.at < config.searchCacheTtlMs) return structuredClone(cached.results)
       if (cached) evict(key)
+      const accepts = (item) => {
+        let url
+        try { url = new URL(item?.url) } catch { return false }
+        if (!["https:", "http:"].includes(url.protocol)) return false
+        const host = url.hostname.toLowerCase().replace(/\.$/, "")
+        return (!allowed.length || allowed.some((domain) => hostMatches(host, domain))) && !blocked.some((domain) => hostMatches(host, domain))
+      }
       return flights.run(key, signal, async (sharedSignal) => {
-        const release = await gate.acquire({ signal: sharedSignal, bytes: Buffer.byteLength(key) })
+        let release
+        try {
+          release = await gate.acquire({ signal: sharedSignal, bytes: Buffer.byteLength(key) })
+        } catch (error) {
+          if (sharedSignal.aborted) throw error
+          throw resultError(429, "Too many concurrent web searches", "rate_limit_error", "too_many_requests")
+        }
         try {
           if (config.logSearchQueries) logger.log(`Web search query: ${JSON.stringify(query)}`)
           const restriction = allowed.length ? ` (${allowed.map((domain) => `site:${domain}`).join(" OR ")})` : ""
           const exclusions = blocked.map((domain) => ` -site:${domain}`).join("")
-          const candidates = await provider(query.trim() + restriction + exclusions, { signal: sharedSignal, token })
+          // Providers apply `accepts` themselves, so a provider whose results the
+          // domain lists exclude does not end the fallback chain.
+          let candidates
+          try {
+            candidates = await provider(query.trim() + restriction + exclusions, { signal: sharedSignal, token, accepts })
+          } catch (error) {
+            if (sharedSignal.aborted || error?.errorCode) throw error
+            logger.warn(`Search provider failed unexpectedly (${error?.name ?? "error"})`)
+            throw unavailable("Search provider failed")
+          }
           sharedSignal.throwIfAborted()
-          if (!Array.isArray(candidates)) throw new ProxyError(502, "Search provider returned invalid results")
-          const matches = (host, domain) => host === domain || host.endsWith(`.${domain}`)
-          const results = candidates.filter((item) => {
+          if (!Array.isArray(candidates)) throw unavailable("Search provider returned invalid results")
+          for (const item of candidates) {
             let url
-            try { url = new URL(item.url) } catch { throw new ProxyError(502, "Search provider returned an invalid URL") }
-            if (!["https:", "http:"].includes(url.protocol)) throw new ProxyError(502, "Search provider returned a non-HTTP URL")
-            const host = url.hostname.toLowerCase().replace(/\.$/, "")
-            return (!allowed.length || allowed.some((domain) => matches(host, domain))) && !blocked.some((domain) => matches(host, domain))
-          }).slice(0, config.searchMaxResults)
+            try { url = new URL(item?.url) } catch { throw unavailable("Search provider returned an invalid URL") }
+            if (!["https:", "http:"].includes(url.protocol)) throw unavailable("Search provider returned a non-HTTP URL")
+          }
+          const results = candidates.filter(accepts).slice(0, config.searchMaxResults)
           if (results.length && config.searchCacheMaxEntries > 0 && config.searchCacheTtlMs > 0) {
             for (const [oldKey, entry] of cache) {
               if (Date.now() - entry.at >= config.searchCacheTtlMs) evict(oldKey)
@@ -228,14 +278,14 @@ export function prepareSearchRequest(request, config, settings = extractWebSearc
   return body
 }
 
-// `started`: a failed hosted search already sent message_start (with this
-// message ID) to the streaming client, so continue that message.
-export async function runWebSearch({ request, preparedRequest, config, signal, generate, search, emit, started }) {
+// `priorUsage`: tokens of a rejected hosted search answer, reported in the
+// total but not charged against this response's max_tokens allowance.
+export async function runWebSearch({ request, preparedRequest, config, signal, generate, search, emit, priorUsage }) {
   const settings = extractWebSearchConfig(request.tools, config)
   if (!settings) throw new ProxyError(400, "Search emulation requires a server search tool", "invalid_request_error")
   let body = { ...(preparedRequest ?? prepareSearchRequest(request, config, settings)), stream: true }
   const output = {
-    id: started?.id ?? `msg_${randomUUID()}`, type: "message", role: "assistant", model: request.model,
+    id: `msg_${randomUUID()}`, type: "message", role: "assistant", model: request.model,
     content: [], stop_reason: null, stop_sequence: null,
     usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
   }
@@ -252,7 +302,7 @@ export async function runWebSearch({ request, preparedRequest, config, signal, g
     return { ...block, type: "server_tool_use", id: serverId(block.id) }
   }
   let searchCount = 0
-  if (emit && !started) await emit("message_start", { type: "message_start", message: structuredClone(output) })
+  if (emit) await emit("message_start", { type: "message_start", message: structuredClone(output) })
 
   async function appendResult(block) {
     const index = output.content.length
@@ -292,25 +342,35 @@ export async function runWebSearch({ request, preparedRequest, config, signal, g
         throw new ProxyError(400, "Search emulation cannot continue within the remaining output allowance while preserving the manual thinking budget. Increase max_tokens or change thinking settings.", "invalid_request_error")
       }
     }
-    const results = await Promise.all(searchCalls.map(async (call) => {
-      let content
-      if (searchCount >= settings.maxUses) {
-        content = { type: "web_search_tool_result_error", error_code: "max_uses_exceeded" }
-      } else {
-        searchCount++
-        try {
-          content = await search(call.input?.query, {
-            signal, allowedDomains: settings.allowedDomains, blockedDomains: settings.blockedDomains,
-          })
-        } catch (error) {
-          signal.throwIfAborted()
-          if (!searchErrorCodes.has(error.errorCode)) throw error
-          content = { type: "web_search_tool_result_error", error_code: error.errorCode }
+    // Results are appended in call order once every search of the round has
+    // settled, so result blocks never interleave. A fatal failure cancels the
+    // other searches, which then cannot add output after the error.
+    const round = new AbortController()
+    const roundSignal = AbortSignal.any([signal, round.signal])
+    const settled = await Promise.allSettled(searchCalls.map(async (call) => {
+      if (searchCount >= settings.maxUses) return { type: "web_search_tool_result_error", error_code: "max_uses_exceeded" }
+      searchCount++
+      try {
+        return await search(call.input?.query, {
+          signal: roundSignal, allowedDomains: settings.allowedDomains, blockedDomains: settings.blockedDomains,
+        })
+      } catch (error) {
+        if (signal.aborted || round.signal.aborted || !searchErrorCodes.has(error?.errorCode)) {
+          round.abort(error)
+          throw error
         }
+        return { type: "web_search_tool_result_error", error_code: error.errorCode }
       }
-      await appendResult({ type: "web_search_tool_result", tool_use_id: serverId(call.id), content })
-      return toolResult(call.id, content)
     }))
+    signal.throwIfAborted()
+    const failed = settled.find((outcome) => outcome.status === "rejected")
+    if (failed) throw failed.reason
+    const results = []
+    for (const [index, call] of searchCalls.entries()) {
+      const content = settled[index].value
+      await appendResult({ type: "web_search_tool_result", tool_use_id: serverId(call.id), content })
+      results.push(toolResult(call.id, content))
+    }
     if (clientCalls.length) break
     if (remaining === 0) { output.stop_reason = "max_tokens"; output.stop_sequence = null; break }
     body = {
@@ -321,6 +381,7 @@ export async function runWebSearch({ request, preparedRequest, config, signal, g
     }
     if (searchCount >= settings.maxUses) body = disableSearch(body)
   }
+  if (priorUsage) output.usage = sumUsage(output.usage, priorUsage)
   output.usage.server_tool_use = { ...output.usage.server_tool_use, web_search_requests: searchCount }
   if (emit) {
     await emit("message_delta", {

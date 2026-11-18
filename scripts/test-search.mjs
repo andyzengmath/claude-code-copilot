@@ -387,3 +387,131 @@ test("an affordable continuation preserves manual thinking and signed history wi
   })
   assert.deepEqual(limits, [4096, 3096])
 })
+
+test("user_location is validated and kept for hosted search", () => {
+  const extract = exported("extractWebSearchConfig")
+  const config = searchConfig()
+  const location = { type: "approximate", city: "Seattle", region: "Washington", country: "US", timezone: "America/Los_Angeles" }
+  assert.deepEqual(extract([{ name: "web_search", type: "web_search_20250305", user_location: location }], config).userLocation, location)
+  assert.deepEqual(extract([{ name: "web_search", type: "web_search_20250305", user_location: { type: "approximate", country: "DE", city: null } }], config).userLocation,
+    { type: "approximate", country: "DE" })
+  assert.equal(extract([{ name: "web_search", type: "web_search_20250305" }], config).userLocation, null)
+  for (const user_location of [
+    { country: "US" }, { type: "exact", country: "US" }, { type: "approximate", country: "USA" }, { type: "approximate", latitude: "1" },
+    { type: "approximate", city: "" }, { type: "approximate", city: "a\nb" }, { type: "approximate", city: 7 }, "US", [],
+  ]) {
+    assert.throws(() => extract([{ name: "web_search", type: "web_search_20250305", user_location }], config),
+      (error) => error.status === 400 && /user_location/.test(error.message))
+  }
+})
+
+test("allowed and blocked domains become site: operators and the provider's result filter", async () => {
+  const queries = []
+  const service = exported("createWebSearchService")({
+    config: searchConfig(), logger: quiet,
+    provider: async (query, { accepts }) => {
+      queries.push(query)
+      return [result("https://nodejs.org/a"), result("https://docs.github.com/b"), result("https://other.test/c")].filter(accepts)
+    },
+  })
+  try {
+    assert.deepEqual((await service.search("node lts", { allowedDomains: ["nodejs.org", "github.com"] })).map((item) => item.url),
+      ["https://nodejs.org/a", "https://docs.github.com/b"])
+    assert.deepEqual((await service.search("node lts", { blockedDomains: ["github.com"] })).map((item) => item.url),
+      ["https://nodejs.org/a", "https://other.test/c"])
+    assert.deepEqual(queries, ["node lts (site:github.com OR site:nodejs.org)", "node lts -site:github.com"])
+  } finally { service.close() }
+})
+
+test("searches with different credentials never share a request or a cached result", async () => {
+  const tokens = []
+  const service = exported("createWebSearchService")({
+    config: searchConfig(), logger: quiet,
+    provider: async (query, { token }) => { tokens.push(token); await nextTurn(); return [result()] },
+  })
+  try {
+    await Promise.all([service.search("fixture", { token: "token-a" }), service.search("fixture", { token: "token-b" })])
+    await service.search("fixture", { token: "token-a" })
+    assert.deepEqual(tokens, ["token-a", "token-b"])
+  } finally { service.close() }
+})
+
+test("a full search queue and unexpected provider failures become search errors, not failed responses", async () => {
+  let release
+  const warnings = []
+  const service = exported("createWebSearchService")({
+    config: searchConfig({ maxConcurrentSearches: 1, maxQueuedRequests: 0 }), logger: { ...quiet, warn: (line) => warnings.push(line) },
+    provider: async (query) => {
+      if (query === "slow") await new Promise((resolve) => { release = resolve })
+      if (query === "buggy") throw new TypeError("private provider detail")
+      if (query === "ftp") return [{ ...result(), url: "ftp://example.com/file" }]
+      return [result()]
+    },
+  })
+  try {
+    const slow = service.search("slow")
+    await nextTurn()
+    await assert.rejects(service.search("queued"), (error) => error.status === 429 && error.errorCode === "too_many_requests")
+    release()
+    assert.equal((await slow).length, 1)
+    await assert.rejects(service.search("buggy"), (error) => error.errorCode === "unavailable")
+    assert.deepEqual(warnings, ["Search provider failed unexpectedly (TypeError)"])
+    await assert.rejects(service.search("ftp"), (error) => error.status === 502 && error.errorCode === "unavailable")
+  } finally { service.close() }
+})
+
+test("results of one search round are appended whole and in call order", async () => {
+  const events = []
+  const output = await exported("runWebSearch")({
+    request: request(), config: searchConfig(), signal: new AbortController().signal,
+    emit: async (type, data) => {
+      await nextTurn()
+      if (type.startsWith("content_block_") && type !== "content_block_delta") events.push(`${type === "content_block_start" ? "start" : "stop"} ${data.index}`)
+    },
+    search: async (query) => {
+      if (query === "first") await nextTurn()
+      return [result(`https://example.com/${query}`)]
+    },
+    generate: async (body) => body.messages.length === 1
+      ? answer([tool("first_call", "web_search", { query: "first" }), tool("second_call", "web_search", { query: "second" })])
+      : answer([{ type: "text", text: "done" }], "end_turn"),
+  })
+  assert.deepEqual(events, ["start 2", "stop 2", "start 3", "stop 3"])
+  assert.deepEqual(output.content.filter((block) => block.type === "web_search_tool_result").map((block) => [block.tool_use_id, block.content[0].url]), [
+    ["srvtoolu_first_call", "https://example.com/first"], ["srvtoolu_second_call", "https://example.com/second"],
+  ])
+})
+
+test("a fatal search failure cancels the other searches of its round and adds no later output", async () => {
+  const failure = new Error("unexpected search failure")
+  const events = []
+  let sibling
+  await assert.rejects(exported("runWebSearch")({
+    request: request(), config: searchConfig(), signal: new AbortController().signal,
+    emit: async (type, data) => { events.push(type === "content_block_start" ? data.content_block.type : type) },
+    search: async (query, { signal }) => {
+      if (query === "broken") throw failure
+      sibling = signal
+      await new Promise((resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }))
+    },
+    generate: async () => answer([tool("slow", "web_search", { query: "slow" }), tool("bad", "web_search", { query: "broken" })]),
+  }), (error) => error === failure)
+  assert.equal(sibling.aborted, true)
+  assert.deepEqual(events, ["message_start"])
+})
+
+test("tokens of a rejected hosted answer are reported without shrinking the response's allowance", async () => {
+  const limits = []
+  const output = await exported("runWebSearch")({
+    request: request(1, { max_tokens: 100 }), config: searchConfig(), signal: new AbortController().signal,
+    priorUsage: { input_tokens: 500, output_tokens: 90, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    search: async () => [result()],
+    generate: async (body) => {
+      limits.push(body.max_tokens)
+      return limits.length === 1 ? answer([tool("s")]) : answer([{ type: "text", text: "done" }], "end_turn")
+    },
+  })
+  assert.deepEqual(limits, [100, 97])
+  assert.equal(output.usage.input_tokens, 520)
+  assert.equal(output.usage.output_tokens, 96)
+})
