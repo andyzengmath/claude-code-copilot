@@ -14,7 +14,23 @@ const mcp = (value) => rpc([{ type: "text", text: JSON.stringify(value) }])
 const hit = (url = URL_RESULT) => ({ url, title: "A title", excerpts: ["first", "second"] })
 const unavailable = () => json({ error: "private upstream details" }, { status: 503 })
 const instantEmpty = () => json({ AbstractURL: "", AbstractText: "", RelatedTopics: [] })
+const GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
+const TOKEN = "fake-github-oauth-token"
+const ghItem = (fields = {}) => ({
+  index: null, title: "Node.js — Download Node.js®", snippets: ["First snippet", "Second snippet"],
+  semantic_document: "Whole page text", url: "https://nodejs.org/en/download",
+  last_updated_date: "2026-11-10T00:00:00Z", crawled_at: "2026-11-12T00:00:00Z", language: "en",
+  raw_data: null, safety_signal: null, ...fields,
+})
+const ghPayload = (items, fields = {}) => ({
+  search_result_groups: [{ search_result_type: "webResults", items }],
+  error_message: null, no_results_message: null, cached: false, ...fields,
+})
+const ghSse = (payload, result = {}) => new Response(`event: message\ndata: ${JSON.stringify({
+  jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: JSON.stringify(payload) }], ...result },
+})}\n\n`, { headers: { "content-type": "text/event-stream" } })
 const providerName = (input) => ({
+  "api.githubcopilot.com": "github",
   "mcp.exa.ai": "exa",
   "search.parallel.ai": "parallel",
   "api.search.brave.com": "brave",
@@ -23,7 +39,7 @@ const providerName = (input) => ({
   "api.duckduckgo.com": "instant",
 })[new URL(input).hostname]
 
-function harness(respond = () => unavailable(), config = {}) {
+function harness(respond = () => unavailable(), config = {}, providerOptions = {}) {
   assert.equal(typeof createSearchProvider, "function", "provider factory must be implemented")
   const calls = []
   const warnings = []
@@ -38,9 +54,13 @@ function harness(respond = () => unavailable(), config = {}) {
       calls.push(call)
       return respond(call, calls.length)
     },
+    ...providerOptions,
   })
   return { search, calls, warnings }
 }
+
+const githubHarness = (respond, config = {}) =>
+  harness(respond, { websearchProvider: "", ...config }, { githubMcpUrl: GITHUB_MCP_URL })
 
 async function assertUnavailable(promise) {
   await assert.rejects(promise, (error) => {
@@ -537,4 +557,209 @@ test("a mocked reader that ignores abort and cancel is still deadline-bounded", 
   await assertUnavailable(search(QUERY))
   assert.equal(cancelled, 4)
   assert.equal(released, 4)
+})
+
+test("GitHub MCP maps the SSE reply and sends the token only as a bearer header", async () => {
+  const { search, calls } = githubHarness(() => ghSse(ghPayload([
+    ghItem(),
+    ghItem({
+      title: "Previous Releases", url: "https://nodejs.org/en/about/previous-releases",
+      snippets: ["Release schedule"], last_updated_date: null,
+    }),
+  ])))
+  assert.deepEqual(await search(QUERY, { token: TOKEN }), [{
+    type: "web_search_result", url: "https://nodejs.org/en/download", title: "Node.js — Download Node.js®",
+    encrypted_content: Buffer.from("First snippet\n\nSecond snippet").toString("base64"),
+    page_age: "2026-11-10T00:00:00Z",
+  }, {
+    type: "web_search_result", url: "https://nodejs.org/en/about/previous-releases", title: "Previous Releases",
+    encrypted_content: Buffer.from("Release schedule").toString("base64"), page_age: null,
+  }])
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].url.href, GITHUB_MCP_URL)
+  assert.equal(calls[0].method, "POST")
+  assert.equal(calls[0].redirect, "error")
+  assert.deepEqual(Object.fromEntries(new Headers(calls[0].headers)), {
+    accept: "application/json, text/event-stream",
+    authorization: `Bearer ${TOKEN}`,
+    "content-type": "application/json",
+    "user-agent": "claude-code-copilot-provider/1.0.0",
+    "x-mcp-readonly": "true",
+    "x-mcp-tools": "web_search",
+  })
+  assert.deepEqual(JSON.parse(calls[0].body), {
+    jsonrpc: "2.0", id: 1, method: "tools/call",
+    params: { name: "web_search", arguments: { query: QUERY } },
+  })
+})
+
+test("GitHub MCP also accepts a plain JSON-RPC reply", async () => {
+  const { search, calls } = githubHarness(() => mcp(ghPayload([ghItem()])))
+  assert.deepEqual((await search(QUERY, { token: TOKEN })).map((r) => [r.url, r.title, r.page_age]), [
+    ["https://nodejs.org/en/download", "Node.js — Download Node.js®", "2026-11-10T00:00:00Z"],
+  ])
+  assert.deepEqual(calls.map((call) => call.name), ["github"])
+})
+
+test("GitHub snippets fall back to the semantic document and are capped at 4000 characters", async () => {
+  const cases = [
+    [{ snippets: ["A".repeat(3000), "B".repeat(3000)] }, `${"A".repeat(3000)}\n\n${"B".repeat(998)}`],
+    [{ snippets: [], semantic_document: "D".repeat(4001) }, "D".repeat(4000)],
+    [{ snippets: null, semantic_document: "Page text" }, "Page text"],
+    [{ snippets: [7, "", " ", "Kept"], semantic_document: "Ignored" }, "Kept"],
+    [{ snippets: null, semantic_document: null }, ""],
+  ]
+  const { search } = githubHarness(() => ghSse(ghPayload(cases.map(([fields], index) =>
+    ghItem({ url: `https://example.org/${index}`, ...fields })))), { searchMaxResults: 10 })
+  const results = await search(QUERY, { token: TOKEN })
+  assert.deepEqual(results.map((r) => Buffer.from(r.encrypted_content, "base64").toString()),
+    cases.map(([, snippet]) => snippet))
+})
+
+test("GitHub collects every result group, filters unsafe URLs and honors max results", async () => {
+  const { search } = githubHarness(() => ghSse({
+    search_result_groups: [
+      { search_result_type: "webResults", items: [
+        ghItem({ url: "javascript:alert(1)" }), null, ghItem({ url: "https://example.org/one" }),
+      ] },
+      { search_result_type: "imageResults", items: null },
+      null,
+      { search_result_type: "newsResults", items: [
+        ghItem({ url: "http://example.org/two" }), ghItem({ url: "https://example.org/three" }),
+      ] },
+    ],
+    error_message: null, no_results_message: null, cached: false,
+  }), { searchMaxResults: 2 })
+  assert.deepEqual((await search(QUERY, { token: TOKEN })).map((r) => r.url), [
+    "https://example.org/one", "http://example.org/two",
+  ])
+})
+
+test("a GitHub error_message is a failure that falls through even beside items", async () => {
+  const { search, calls, warnings } = githubHarness((call) => call.name === "github"
+    ? ghSse(ghPayload([ghItem()], { error_message: "private upstream failure" }))
+    : mcp([hit()]))
+  assert.deepEqual((await search(QUERY, { token: TOKEN })).map((r) => r.url), [URL_RESULT])
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0].name, "github")
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /GitHub.*GitHub search error/)
+  assert.ok(!warnings[0].includes("private upstream failure"))
+})
+
+test("GitHub tool, HTTP and malformed failures fall through and are never genuine empties", async () => {
+  for (const response of [
+    () => ghSse(ghPayload([ghItem()]), { isError: true }),
+    () => json({ message: "upstream service broke" }, { status: 401 }),
+    () => json({ message: "upstream service broke" }, { status: 403 }),
+    () => json({ message: "upstream service broke" }, { status: 500 }),
+    () => json({ jsonrpc: "2.0", id: 1, error: { code: -32603, message: "upstream service broke" } }),
+    () => rpc([]),
+    () => rpc([{ type: "text", text: "upstream service broke" }]),
+    () => rpc([{ type: "image", data: "abc" }]),
+    () => rpc([{ type: "text", text: JSON.stringify(ghPayload([ghItem()])) }, { type: "image", data: "abc" }]),
+    () => mcp([]),
+    () => mcp({ error_message: null }),
+    () => mcp({ search_result_groups: {} }),
+    () => mcp(ghPayload([], { error_message: "upstream service broke" })),
+    () => mcp(ghPayload([], { error_message: 42 })),
+    () => mcp(ghPayload([ghItem({ url: "javascript:alert(1)" })])),
+  ]) {
+    const { search, calls, warnings } = githubHarness((call) => call.name === "github" ? response() : unavailable())
+    await assertUnavailable(search(QUERY, { token: TOKEN }))
+    assert.equal(calls[0].name, "github")
+    assert.equal(calls.length, 5)
+    assert.match(warnings[0], /GitHub search failed/)
+    assert.ok(!warnings.join("\n").includes("upstream service broke"))
+  }
+})
+
+test("GitHub is skipped silently without a token or MCP URL, keeping the previous order", async () => {
+  for (const [providerOptions, searchOptions, expected] of [
+    [{ githubMcpUrl: GITHUB_MCP_URL }, { token: TOKEN }, ["github", "exa", "parallel", "brave", "serper", "lite", "instant"]],
+    [{}, { token: TOKEN }, ["exa", "parallel", "brave", "serper", "lite", "instant"]],
+    [{ githubMcpUrl: GITHUB_MCP_URL }, undefined, ["exa", "parallel", "brave", "serper", "lite", "instant"]],
+    [{ githubMcpUrl: GITHUB_MCP_URL }, { token: "" }, ["exa", "parallel", "brave", "serper", "lite", "instant"]],
+  ]) {
+    const { search, calls, warnings } = harness((call) => call.name === "instant" ? instantEmpty() : unavailable(), {
+      websearchProvider: "github", braveApiKey: "fake-brave", serperApiKey: "fake-serper",
+    }, providerOptions)
+    assert.deepEqual(await search("b", searchOptions), [])
+    assert.deepEqual(calls.map((call) => call.name), expected)
+    assert.equal(warnings.some((line) => /GitHub/.test(line)), calls[0].name === "github")
+  }
+})
+
+test("GitHub runs first by default and a preferred provider moves ahead without duplicates", async () => {
+  for (const [query, websearchProvider, expected] of [
+    ["b", "", ["github", "exa", "parallel", "brave", "serper", "lite", "instant"]],
+    ["a", "", ["github", "parallel", "exa", "brave", "serper", "lite", "instant"]],
+    ["a", "github", ["github", "parallel", "exa", "brave", "serper", "lite", "instant"]],
+    ["a", "exa", ["exa", "github", "parallel", "brave", "serper", "lite", "instant"]],
+    ["b", "parallel", ["parallel", "github", "exa", "brave", "serper", "lite", "instant"]],
+  ]) {
+    const { search, calls } = githubHarness((call) => call.name === "instant" ? instantEmpty() : unavailable(), {
+      websearchProvider, braveApiKey: "fake-brave", serperApiKey: "fake-serper",
+    })
+    assert.deepEqual(await search(query, { token: TOKEN }), [])
+    assert.deepEqual(calls.map((call) => call.name), expected)
+  }
+})
+
+test("empty GitHub searches continue fallback but prevent the all-failure error", async () => {
+  for (const payload of [
+    ghPayload([], { no_results_message: "No results found" }),
+    ghPayload(null),
+    ghPayload([], { error_message: "" }),
+    { search_result_groups: [], error_message: null, no_results_message: null, cached: false },
+  ]) {
+    const { search, calls, warnings } = githubHarness((call) => call.name === "github" ? ghSse(payload) : unavailable())
+    assert.deepEqual(await search(QUERY, { token: TOKEN }), [])
+    assert.equal(calls[0].name, "github")
+    assert.equal(calls.length, 5)
+    assert.equal(warnings.some((line) => /GitHub/.test(line)), false)
+  }
+  const { search, calls } = githubHarness((call) => call.name === "github" ? ghSse(ghPayload([])) : mcp([hit()]))
+  assert.deepEqual((await search(QUERY, { token: TOKEN })).map((r) => r.url), [URL_RESULT])
+  assert.equal(calls.length, 2)
+})
+
+test("GitHub failures never log the token, the query or upstream details", async () => {
+  const leak = `${TOKEN} ${QUERY}`
+  for (const response of [
+    () => { throw new Error(leak) },
+    () => json({ message: leak }, { status: 401 }),
+    () => ghSse(ghPayload([], { error_message: leak })),
+    () => ghSse({ message: leak }, { isError: true }),
+    () => json({ jsonrpc: "2.0", id: 1, error: { code: -32603, message: leak } }),
+    () => rpc([{ type: "text", text: leak }]),
+  ]) {
+    const { search, calls, warnings } = githubHarness((call) => {
+      if (call.name === "github") return response()
+      throw new Error(leak)
+    })
+    await assert.rejects(search(QUERY, { token: TOKEN }), (error) => {
+      assert.ok(error instanceof WebSearchError)
+      assert.ok(!String(error).includes(TOKEN))
+      assert.ok(!String(error).includes(QUERY))
+      return true
+    })
+    assert.equal(calls[0].name, "github")
+    assert.match(warnings[0], /GitHub/)
+    assert.ok(!warnings.join("\n").includes(TOKEN))
+    assert.ok(!warnings.join("\n").includes(QUERY))
+  }
+})
+
+test("cancellation during the GitHub request rejects with the caller reason and never falls back", { timeout: 2000 }, async () => {
+  const controller = new AbortController()
+  const reason = new Error("caller stopped")
+  const { search, calls, warnings } = githubHarness(() => new Promise(() => {}))
+  const rejected = assert.rejects(search(QUERY, { signal: controller.signal, token: TOKEN }), (error) => error === reason)
+  controller.abort(reason)
+  await rejected
+  assert.deepEqual(calls.map((call) => call.name), ["github"])
+  assert.equal(calls[0].signal.reason, reason)
+  assert.equal(warnings.length, 0)
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0)
 })

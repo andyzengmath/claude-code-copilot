@@ -28,6 +28,24 @@ test("configuration keeps unlimited inference as default and rejects invalid num
   assert.throws(() => readConfig({ COPILOT_TRANSPORT: "guess" }), /COPILOT_TRANSPORT/)
 })
 
+test("hosted web search configuration defaults to GPT-6 Luna and validates its settings", () => {
+  const readConfig = exported("readConfig")
+  const defaults = readConfig({})
+  assert.equal(defaults.webSearchMode, "hosted")
+  assert.equal(defaults.webSearchModel, "gpt-6-luna")
+  assert.equal(defaults.webSearchContextSize, "low")
+  assert.equal(defaults.webSearchReasoningEffort, "low")
+  assert.equal(readConfig({ WEB_SEARCH_MODE: "providers" }).webSearchMode, "providers")
+  assert.equal(readConfig({ WEBSEARCH_PROVIDER: "github" }).websearchProvider, "github")
+  assert.equal(readConfig({ WEB_SEARCH_MODEL: "gpt-6.1-terra" }).webSearchModel, "gpt-6.1-terra")
+  assert.throws(() => readConfig({ WEB_SEARCH_MODE: "bing" }), /WEB_SEARCH_MODE/)
+  assert.throws(() => readConfig({ WEB_SEARCH_MODEL: "bad model" }), /WEB_SEARCH_MODEL/)
+  assert.throws(() => readConfig({ WEB_SEARCH_MODEL: "" }), /WEB_SEARCH_MODEL/)
+  assert.throws(() => readConfig({ WEB_SEARCH_CONTEXT_SIZE: "huge" }), /WEB_SEARCH_CONTEXT_SIZE/)
+  assert.throws(() => readConfig({ WEB_SEARCH_REASONING_EFFORT: "max" }), /WEB_SEARCH_REASONING_EFFORT/)
+  assert.throws(() => readConfig({ WEBSEARCH_PROVIDER: "bing" }), /WEBSEARCH_PROVIDER/)
+})
+
 test("admission transfers a permit to the FIFO waiter before a new arrival", async () => {
   const gate = exported("createAdmissionGate")({ limit: 1, maxQueued: 5, maxQueueBytes: 100, queueTimeoutMs: 1000 })
   const releaseA = await gate.acquire()

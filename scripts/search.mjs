@@ -75,7 +75,7 @@ export function createWebSearchService({ provider, config, logger }) {
     if (entry) { cachedBytes -= entry.bytes; cache.delete(key) }
   }
   return {
-    async search(query, { signal, allowedDomains, blockedDomains } = {}) {
+    async search(query, { signal, allowedDomains, blockedDomains, token } = {}) {
       signal?.throwIfAborted()
       if (typeof query !== "string" || !query.trim()) throw queryError("invalid_input", "Search query must be a nonempty string")
       if (Buffer.byteLength(query) > config.searchMaxQueryBytes) throw queryError("query_too_long", "Search query exceeds the byte limit")
@@ -92,7 +92,7 @@ export function createWebSearchService({ provider, config, logger }) {
           if (config.logSearchQueries) logger.log(`Web search query: ${JSON.stringify(query)}`)
           const restriction = allowed.length ? ` (${allowed.map((domain) => `site:${domain}`).join(" OR ")})` : ""
           const exclusions = blocked.map((domain) => ` -site:${domain}`).join("")
-          const candidates = await provider(query.trim() + restriction + exclusions, { signal: sharedSignal })
+          const candidates = await provider(query.trim() + restriction + exclusions, { signal: sharedSignal, token })
           sharedSignal.throwIfAborted()
           if (!Array.isArray(candidates)) throw new ProxyError(502, "Search provider returned invalid results")
           const matches = (host, domain) => host === domain || host.endsWith(`.${domain}`)
@@ -228,12 +228,14 @@ export function prepareSearchRequest(request, config, settings = extractWebSearc
   return body
 }
 
-export async function runWebSearch({ request, preparedRequest, config, signal, generate, search, emit }) {
+// `started`: a failed hosted search already sent message_start (with this
+// message ID) to the streaming client, so continue that message.
+export async function runWebSearch({ request, preparedRequest, config, signal, generate, search, emit, started }) {
   const settings = extractWebSearchConfig(request.tools, config)
   if (!settings) throw new ProxyError(400, "Search emulation requires a server search tool", "invalid_request_error")
   let body = { ...(preparedRequest ?? prepareSearchRequest(request, config, settings)), stream: true }
   const output = {
-    id: `msg_${randomUUID()}`, type: "message", role: "assistant", model: request.model,
+    id: started?.id ?? `msg_${randomUUID()}`, type: "message", role: "assistant", model: request.model,
     content: [], stop_reason: null, stop_sequence: null,
     usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
   }
@@ -250,7 +252,7 @@ export async function runWebSearch({ request, preparedRequest, config, signal, g
     return { ...block, type: "server_tool_use", id: serverId(block.id) }
   }
   let searchCount = 0
-  if (emit) await emit("message_start", { type: "message_start", message: structuredClone(output) })
+  if (emit && !started) await emit("message_start", { type: "message_start", message: structuredClone(output) })
 
   async function appendResult(block) {
     const index = output.content.length

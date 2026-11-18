@@ -36,6 +36,10 @@ const strings = {
   serperApiKey: ["SERPER_API_KEY", ""],
   exaApiKey: ["EXA_API_KEY", ""],
   parallelApiKey: ["PARALLEL_API_KEY", ""],
+  webSearchMode: ["WEB_SEARCH_MODE", "hosted"],
+  webSearchModel: ["WEB_SEARCH_MODEL", "gpt-6-luna"],
+  webSearchContextSize: ["WEB_SEARCH_CONTEXT_SIZE", "low"],
+  webSearchReasoningEffort: ["WEB_SEARCH_REASONING_EFFORT", "low"],
 }
 
 export function readConfig(env = process.env, overrides = {}) {
@@ -64,8 +68,20 @@ export function readConfig(env = process.env, overrides = {}) {
   if (!["auto", "messages", "chat"].includes(config.transport)) {
     throw new Error("COPILOT_TRANSPORT must be auto, messages, or chat")
   }
-  if (!["", "exa", "parallel"].includes(config.websearchProvider)) {
-    throw new Error("WEBSEARCH_PROVIDER must be exa, parallel, or empty")
+  if (!["", "github", "exa", "parallel"].includes(config.websearchProvider)) {
+    throw new Error("WEBSEARCH_PROVIDER must be github, exa, parallel, or empty")
+  }
+  if (!["hosted", "providers"].includes(config.webSearchMode)) {
+    throw new Error("WEB_SEARCH_MODE must be hosted or providers")
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(config.webSearchModel)) {
+    throw new Error("WEB_SEARCH_MODEL must be a Copilot model ID")
+  }
+  if (!["low", "medium", "high"].includes(config.webSearchContextSize)) {
+    throw new Error("WEB_SEARCH_CONTEXT_SIZE must be low, medium, or high")
+  }
+  if (!["low", "medium", "high"].includes(config.webSearchReasoningEffort)) {
+    throw new Error("WEB_SEARCH_REASONING_EFFORT must be low, medium, or high")
   }
   for (const property of Object.keys(overrides)) {
     if (!(property in config)) throw new Error(`Unknown proxy configuration: ${property}`)

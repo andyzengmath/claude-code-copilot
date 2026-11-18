@@ -836,3 +836,127 @@ test("WebSearch on an adaptive-only model sends auto choice and no disabled thin
     assert.deepEqual(body.output_config, { effort: "high" })
   }
 })
+
+// Hosted web search: Claude Code's nested WebSearch request is answered by one
+// Copilot /responses call that runs OpenAI's server-side web_search tool.
+const lunaModel = {
+  id: "gpt-6-luna", supported_endpoints: ["/responses", "ws:/responses"], policy: { state: "enabled" },
+  capabilities: { limits: { max_output_tokens: 128000 } },
+}
+const withLuna = { catalog: async () => Response.json({ data: [...models, lunaModel] }) }
+const hostedReply = () => ({
+  id: "resp_fixture", object: "response", status: "completed", model: "gpt-6-luna",
+  output: [
+    { id: "ws_1", type: "web_search_call", status: "completed", action: { type: "search", query: "node lts", sources: [{ type: "url", url: "https://nodejs.org/en/about/previous-releases" }] } },
+    { id: "msg_1", type: "message", role: "assistant", content: [{ type: "output_text", text: "Node 26 is LTS.", annotations: [] }] },
+  ],
+  usage: { input_tokens: 900, input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, output_tokens: 40 },
+})
+const nestedWebSearch = (overrides = {}, tool = {}) => ({
+  model: "claude-sonnet-5", max_tokens: 64000, stream: true,
+  system: [{ type: "text", text: "You run a web search for another Claude model." }],
+  messages: [{ role: "user", content: "Perform a web search for the query: node lts" }],
+  tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 8, search_profile: "default", ...tool }],
+  tool_choice: { type: "tool", name: "web_search" },
+  ...overrides,
+})
+const providerResult = { type: "web_search_result", url: "https://example.com/node", title: "Example", encrypted_content: Buffer.from("snippet").toString("base64"), page_age: null }
+const emulationRound = (body, rounds) => {
+  rounds.push(body)
+  return streamResponse(nativeFrames(rounds.length === 1
+    ? message([{ type: "tool_use", id: "toolu_s", name: "web_search", input: { query: "node lts" } }], "tool_use")
+    : message([{ type: "text", text: "Emulated answer" }])))
+}
+
+for (const streaming of [true, false]) {
+  test(`Claude Code's nested WebSearch is answered by one hosted GPT-6 Luna search (${streaming ? "streaming" : "JSON"})`, async (t) => {
+    const sent = []
+    const f = await fixture(t, (call) => {
+      sent.push(call)
+      assert.equal(call.url.pathname, "/responses", "no Claude generation for a hosted search")
+      return Response.json(hostedReply())
+    }, withLuna)
+    const response = await f.request(nestedWebSearch({ stream: streaming }))
+    assert.equal(response.status, 200)
+    assert.equal(sent.length, 1)
+    const headers = new Headers(sent[0].headers)
+    assert.equal(headers.get("authorization"), `Bearer ${token}`)
+    assert.equal(headers.get("anthropic-beta"), null)
+    assert.equal(headers.get("anthropic-version"), null)
+    const payload = JSON.parse(sent[0].body)
+    assert.equal(payload.model, "gpt-6-luna")
+    assert.equal(payload.tool_choice, "required")
+    assert.deepEqual(payload.tools, [{ type: "web_search", search_context_size: "low" }])
+    const expectedContent = [
+      { type: "server_tool_use", id: "srvtoolu_ws_1", name: "web_search", input: { query: "node lts" } },
+      { type: "web_search_tool_result", tool_use_id: "srvtoolu_ws_1", content: [{ type: "web_search_result", url: "https://nodejs.org/en/about/previous-releases", title: "nodejs.org", encrypted_content: "", page_age: null }] },
+      { type: "text", text: "Node 26 is LTS." },
+    ]
+    if (streaming) {
+      const events = parsedEvents(await response.text())
+      assert.deepEqual(events.map((event) => event.type), [
+        "message_start", "content_block_start", "content_block_delta", "content_block_stop",
+        "content_block_start", "content_block_stop", "content_block_start", "content_block_delta", "content_block_stop",
+        "message_delta", "message_stop",
+      ])
+      assert.equal(events.at(-2).delta.stop_reason, "end_turn")
+      assert.deepEqual(events.at(-2).usage.server_tool_use, { web_search_requests: 1 })
+      assert.equal(events.at(-2).usage.output_tokens, 40)
+    } else {
+      const body = await response.json()
+      assert.deepEqual(body.content, expectedContent)
+      assert.equal(body.stop_reason, "end_turn")
+      assert.equal(body.usage.input_tokens, 900)
+    }
+  })
+}
+
+test("a failed hosted search falls back to provider search with a single message_start", async (t) => {
+  const paths = []
+  const rounds = []
+  const f = await fixture(t, (call) => {
+    paths.push(call.url.pathname)
+    if (call.url.pathname === "/responses") return Response.json({ error: { message: "hosted search unavailable" } }, { status: 500 })
+    return emulationRound(JSON.parse(call.body), rounds)
+  }, { ...withLuna, searchProvider: async () => [providerResult] })
+  const response = await f.request(nestedWebSearch())
+  assert.equal(response.status, 200)
+  const events = parsedEvents(await response.text())
+  assert.equal(events.filter((event) => event.type === "message_start").length, 1)
+  assert.equal(events.at(-1).type, "message_stop")
+  assert.ok(events.some((event) => event.content_block?.type === "web_search_tool_result" && event.content_block.content[0]?.url === providerResult.url))
+  assert.ok(events.some((event) => event.delta?.text === "Emulated answer"))
+  assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages"])
+})
+
+test("provider search is used when the hosted search model, mode or domain filters do not allow hosted search", async (t) => {
+  for (const [name, options, request] of [
+    ["model missing from the catalog", {}, nestedWebSearch()],
+    ["WEB_SEARCH_MODE=providers", { ...withLuna, config: { webSearchMode: "providers" } }, nestedWebSearch()],
+    ["blocked_domains", withLuna, nestedWebSearch({}, { blocked_domains: ["example.org"] })],
+  ]) {
+    const paths = []
+    const rounds = []
+    const f = await fixture(t, (call) => {
+      paths.push(call.url.pathname)
+      return emulationRound(JSON.parse(call.body), rounds)
+    }, { ...options, searchProvider: async () => [providerResult] })
+    const response = await f.request(request)
+    assert.equal(response.status, 200, name)
+    assert.equal(parsedEvents(await response.text()).at(-1).type, "message_stop", name)
+    assert.deepEqual(paths, ["/v1/messages", "/v1/messages"], name)
+  }
+})
+
+test("provider search receives the account token for GitHub's own search", async (t) => {
+  const seen = []
+  const rounds = []
+  const f = await fixture(t, (call) => emulationRound(JSON.parse(call.body), rounds), {
+    config: { webSearchMode: "providers" },
+    searchProvider: async (query, options) => { seen.push(options.token); return [providerResult] },
+  })
+  const response = await f.request(nestedWebSearch())
+  assert.equal(response.status, 200)
+  await response.text()
+  assert.deepEqual(seen, [token])
+})

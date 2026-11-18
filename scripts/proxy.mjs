@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { timingSafeEqual } from "node:crypto"
+import { randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
 import { createServer } from "node:http"
 import { resolve } from "node:path"
@@ -12,6 +12,7 @@ import { abortError, ProxyError } from "./runtime.mjs"
 import { consumeSSE, createSSEWriter, NativeMessageState, parseSSEData, validateNativeContentBlock } from "./sse.mjs"
 import { createSearchProvider } from "./search-providers.mjs"
 import { createWebSearchService, extractWebSearchConfig, prepareSearchRequest, runWebSearch } from "./search.mjs"
+import { buildHostedSearchRequest, emitHostedMessage, hostedSearchIneligibility, hostedSearchMessage } from "./hosted-search.mjs"
 import { createUpstreamClient, errorEnvelope, errorType, responseHeaders, upstreamError } from "./upstream.mjs"
 
 export { createStreamTranslator, translateMessages, translateContentPart } from "./chat.mjs"
@@ -148,8 +149,56 @@ export function createProxyServer({
   const catalog = createModelCatalog({ fetchImpl, baseUrl, config, logger })
   const copilot = createUpstreamClient({ fetchImpl, baseUrl, config, logger })
   const search = createWebSearchService({
-    provider: searchProvider ?? createSearchProvider({ fetchImpl, config, logger }), config, logger,
+    provider: searchProvider ?? createSearchProvider({ fetchImpl, config, logger, githubMcpUrl: `${baseUrl}/mcp/` }), config, logger,
   })
+  const warned = new Set()
+  const warnOnce = (message) => {
+    if (warned.has(message)) return
+    warned.add(message)
+    logger.warn(message)
+  }
+
+  // Answer a search-only request with one Copilot /responses call using the
+  // hosted web_search tool. Returns { message } on success. Otherwise returns
+  // { message: null, started } so the caller falls back to provider search;
+  // `started` is set when message_start was already sent to a streaming client.
+  async function hostedSearch({ body, settings, model, token, signal, emit }) {
+    let started
+    let upstream
+    try {
+      const info = (await catalog.get(token, signal)).find((entry) => entry.id === config.webSearchModel)
+      if (!info || !isRoutable(info) || !info.supported_endpoints?.includes("/responses")) {
+        warnOnce(`Hosted web search model ${config.webSearchModel} is unavailable for /responses; using provider search`)
+        return { message: null }
+      }
+      const id = `msg_${randomUUID()}`
+      if (emit) {
+        started = { id }
+        await emit("message_start", {
+          type: "message_start",
+          message: {
+            id, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+          },
+        })
+      }
+      // No incoming headers: anthropic-* headers do not apply to /responses.
+      upstream = await copilot.request("/responses", buildHostedSearchRequest(body, settings, config, info), { token, headers: {}, signal })
+      if (!upstream.response.ok) throw await upstreamError(upstream)
+      let data
+      try { data = JSON.parse(await upstream.text()) } catch { throw new ProxyError(502, "Copilot hosted search returned invalid JSON") }
+      const message = hostedSearchMessage(data, { id, model, settings })
+      const searches = message.usage.server_tool_use.web_search_requests
+      logger.log(`  search: hosted ${info.id} (${searches} ${searches === 1 ? "search" : "searches"})`)
+      return { message }
+    } catch (error) {
+      signal.throwIfAborted()
+      logger.warn(`Hosted web search failed (${error.status ?? error.name}); using provider search`)
+      return { message: null, started }
+    } finally {
+      upstream?.dispose()
+    }
+  }
 
   async function handle(req, res) {
     const controller = new AbortController()
@@ -235,11 +284,24 @@ export function createProxyServer({
       }
       if (searchSettings) {
         if (searchSettings.requested > searchSettings.maxUses) logger.warn(`Web search max_uses capped at ${searchSettings.maxUses}`)
+        for (const field of searchSettings.ignoredFields) warnOnce(`Ignored unsupported web_search tool field: ${field}`)
         if (request.stream) { beginStream(res); writer = makeWriter() }
+        const emit = writer ? (type, data) => writer.event(type, data) : undefined
+        const ineligible = hostedSearchIneligibility(body, searchSettings, config)
+        if (ineligible && config.webSearchMode === "hosted") logger.log(`  search: providers (${ineligible})`)
+        const hosted = ineligible ? { message: null } : await hostedSearch({
+          body, settings: searchSettings, model: request.model, token: authToken, signal, emit,
+        })
+        if (hosted.message) {
+          if (emit) await emitHostedMessage(hosted.message, emit)
+          else jsonResponse(res, 200, hosted.message)
+          outcome = "complete"
+          return
+        }
         const result = await runWebSearch({
-          request, preparedRequest: { ...preparedSearch, model }, config, signal,
-          search: (query, options) => search.search(query, options),
-          emit: writer ? (type, data) => writer.event(type, data) : undefined,
+          request, preparedRequest: { ...preparedSearch, model }, config, signal, started: hosted.started,
+          search: (query, options) => search.search(query, { ...options, token: authToken }),
+          emit,
           generate: async (payload, onEvent) => {
             const generation = await copilot.request(`/v1/messages${url.search}`, payload, { token: authToken, headers: req.headers, signal })
             try {

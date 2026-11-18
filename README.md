@@ -15,7 +15,7 @@ The default transport uses Copilot's native `/v1/messages` endpoint when the acc
 ## Features
 
 - **Native Messages** — Preserves Anthropic request semantics and streaming, subject to actual Copilot support; no automatic replay through another transport.
-- **Bounded WebSearch emulation** — Handles Claude Code's `web_search_20250305` requests using custom tools, provider searches, and final synthesis.
+- **Hosted WebSearch** — Answers Claude Code's `web_search_20250305` requests with one Copilot `/responses` call that runs OpenAI's server-side web search on GPT-6 Luna. Falls back to bounded search emulation through GitHub's own search, Exa/Parallel, and DuckDuckGo.
 - **Authenticated local endpoint** — Persistent random API key; loopback binding by default.
 - **Docker support** — Loopback-only host publishing, read-only credential mounts, and automatic container restart.
 - **Zero runtime dependencies** — Node.js built-ins; no `npm install` needed for the proxy or tests.
@@ -172,23 +172,34 @@ Claude Code's auto mode can ask the API to run its permission classifier server-
 
 ## Web Search
 
-Ordinary Claude Code WebSearch makes nested requests containing the server tool `web_search_20250305`, which Copilot's native Messages endpoint rejects. The proxy emulates **this version** with native custom tool calls, bounded provider searches, and a final model synthesis. Each search round may consume additional Copilot requests.
+Ordinary Claude Code WebSearch makes nested requests containing the server tool `web_search_20250305`, which Copilot's native Messages endpoint rejects ("The use of the web search tool is not supported"). The proxy answers these requests in one of two ways.
+
+**Hosted search (default).** A search-only request, which is what Claude Code's WebSearch sends, is answered by one Copilot `/responses` call. That call runs OpenAI's server-side `web_search` tool on `WEB_SEARCH_MODEL` (default `gpt-6-luna`), the way Codex searches. The proxy returns the searches as `server_tool_use` and `web_search_tool_result` blocks, with the sources the model consulted, and the model's cited answer as text. This replaces two or more Claude generations with one call to a lightweight model: about 3–10 seconds, typically under 10,000 input tokens. Hosted search applies only when the request:
+
+- declares no client tools and allows at least one search (`max_uses` above 0);
+- has text-only system and message content, and `max_tokens` of at least 16;
+- has no `blocked_domains` (the hosted tool can restrict to `allowed_domains` but cannot exclude domains).
+
+The hosted search model, not Claude, writes the search summary that Claude Code passes back to the main model. The search model must appear in your Copilot catalog with the `/responses` endpoint. Copilot bills the search model's tokens at its own rates.
+
+**Provider search (fallback).** Other requests, any hosted-search failure, `WEB_SEARCH_MODE=providers`, or an unavailable search model use bounded search emulation: native custom tool calls, proxy-run provider searches, and a final Claude synthesis. Each search round may consume additional Copilot requests. If a streaming hosted search fails, the same response continues with provider search.
 
 Search input rules:
 
 - Supply at most one of `allowed_domains` or `blocked_domains`, with up to 100 hostnames. Matching enforces hostname boundaries and normalizes case, punycode, and trailing dots. Schemes, ports, paths, and wildcards are not accepted.
 - Supplying two non-null domain lists, a non-null `user_location`, or a newer/unknown server-search version is explicitly rejected, not guessed. Documented nullable options treat `null` as unset. Explicit Chat mode rejects server-search tools.
+- The `search_profile` hint that Claude Code 2.1.303 and later can send is accepted and ignored. Other unrecognized optional tool fields are ignored with a logged warning, so a new Claude Code release does not break WebSearch.
 - `max_uses: 0` disables search without changing a remaining client-tool selection or `none` choice. Requiring a disabled or unavailable tool is contradictory input and returns HTTP 400 before model discovery or SSE starts.
 
-Search uses native **streaming inner generations**, even for nonstreaming clients, to avoid the nonstreaming output-limit regression. Streaming clients receive content, search-result blocks, and pings progressively; nonstreaming clients receive an assembled response. Usage is aggregated across generations, and real stop reasons such as `pause_turn` and `max_tokens` are preserved rather than replaced with a fabricated successful stop.
+Search emulation uses native **streaming inner generations**, even for nonstreaming clients, to avoid the nonstreaming output-limit regression. Streaming clients receive content, search-result blocks, and pings progressively; nonstreaming clients receive an assembled response. Usage is aggregated across generations, and real stop reasons such as `pause_turn` and `max_tokens` are preserved rather than replaced with a fabricated successful stop.
 
 The logical response shares one `max_tokens` allowance: each continuation receives only the remaining output budget, based on the upstream's reported output usage. No hidden generation starts after that allowance is exhausted; the response stops with `max_tokens`. Manual thinking keeps its requested per-generation budget. If the remaining allowance cannot accommodate the normal manual-thinking constraints, emulation returns an explicit error rather than disabling thinking, increasing the allowance, or assuming an interleaved-thinking exception.
 
 Prior proxy-generated search results remain usable in conversation history even when the current request's tools omit `web_search`.
 
-Search providers include Exa/Parallel MCP (using the approach in [OpenCode](https://github.com/anomalyco/opencode)), optional Brave/Serper APIs, and DuckDuckGo fallbacks. `WEBSEARCH_PROVIDER=exa` or `parallel` selects the preferred MCP provider; it does not guarantee exclusive routing or disable fallbacks. Configure keys as needed; provider terms, quotas, availability, and charges apply. Unauthenticated endpoints may be throttled or unavailable.
+Provider search tries, in order: GitHub's own web search, the tool GitHub Copilot CLI uses, reached with your Copilot sign-in through `https://api.githubcopilot.com/mcp/`; Exa/Parallel MCP, using the approach in [OpenCode](https://github.com/anomalyco/opencode); Brave and Serper when their keys are set; and DuckDuckGo Lite and Instant Answer. `WEBSEARCH_PROVIDER=github`, `exa`, or `parallel` moves that provider to the front; it does not disable the others. GitHub's search may require your organization to allow Copilot web search. Configure keys as needed; provider terms, quotas, availability, and charges apply. Unauthenticated endpoints may be throttled or unavailable.
 
-Defaults bound searches to two concurrent operations, a 25-second provider deadline, and a ten-use request cap. Results are cached **in memory** for five minutes, up to 500 entries and 16 MiB; query logging is opt-in via `COPILOT_LOG_SEARCH_QUERIES=1`.
+Defaults bound provider searches to two concurrent operations, a 25-second provider deadline, and a ten-use request cap; the cap also limits hosted searches. Results are cached **in memory** for five minutes, up to 500 entries and 16 MiB; query logging is opt-in via `COPILOT_LOG_SEARCH_QUERIES=1`.
 
 ## Privacy and local authentication
 
@@ -198,7 +209,7 @@ Every non-health route requires the persistent local key in `x-api-key` or `Auth
 {"status":"ok","provider":"github-copilot","api_key_required":true}
 ```
 
-OAuth credentials and the local API key are persisted privately on disk. Model metadata and query results are cached in memory; query logging is disabled by default, but operational/error logs can still be emitted. Prompts go to GitHub Copilot; search queries go to configured or fallback search providers. Their data handling policies apply. Do not put secrets in queries, publish credential files, or assume that a local proxy means data stays on your machine.
+OAuth credentials and the local API key are persisted privately on disk. Model metadata and query results are cached in memory; query logging is disabled by default, but operational/error logs can still be emitted. Prompts go to GitHub Copilot. Hosted search sends the search request, including Claude Code's search prompt, to Copilot's `/responses` endpoint, where the search model runs OpenAI's web search. Provider search sends queries to GitHub's search first and then to configured or fallback providers. Their data handling policies apply. Do not put secrets in queries, publish credential files, or assume that a local proxy means data stays on your machine.
 
 ## Reliability and errors
 
@@ -250,7 +261,11 @@ Export variables before starting Node or the launcher. Compose explicitly maps t
 
 | Variable | Default | Description |
 |---|---|---|
-| `WEBSEARCH_PROVIDER` | *(empty)* | Automatic MCP selection; `exa` or `parallel` sets preference |
+| `WEB_SEARCH_MODE` | `hosted` | `hosted` answers eligible searches with one Copilot `/responses` call; `providers` always uses provider search emulation |
+| `WEB_SEARCH_MODEL` | `gpt-6-luna` | Copilot model for hosted search; must list the `/responses` endpoint in your catalog |
+| `WEB_SEARCH_CONTEXT_SIZE` | `low` | Hosted search context size: `low`, `medium`, or `high` (more context is slower and uses more tokens) |
+| `WEB_SEARCH_REASONING_EFFORT` | `low` | Hosted search model reasoning effort: `low`, `medium`, or `high` |
+| `WEBSEARCH_PROVIDER` | *(empty)* | Provider search order: GitHub first, then Exa/Parallel; `github`, `exa`, or `parallel` moves that provider to the front |
 | `BRAVE_API_KEY` | *(empty)* | Brave Search API key |
 | `SERPER_API_KEY` | *(empty)* | Serper API key |
 | `EXA_API_KEY` | *(empty)* | Exa API key, where required by the endpoint |
@@ -292,7 +307,7 @@ Run all suites using Node's built-in test runner on Node.js 22+:
 npm test
 ```
 
-No dependency installation, home auth token, or real provider calls are required. Tests use injected auth, temporary credentials, local fixtures, and ephemeral ports. The aggregate command explicitly lists the suites so Windows does not depend on shell glob expansion. Proxy CLI tests cover real `--print-api-key` and startup with temporary credentials; launcher tests use Bash (Git Bash on Windows) and curl, and skip if Bash is unavailable. CI runs the suites on Node.js 22 and 24 on Linux and Windows without installing Claude Code, plus an isolated Ubuntu Docker smoke test with fixture credentials.
+No dependency installation, home auth token, or real provider calls are required. Tests use injected auth, temporary credentials, local fixtures, and ephemeral ports. The aggregate command explicitly lists the suites so Windows does not depend on shell glob expansion. Proxy CLI tests cover real `--print-api-key` and startup with temporary credentials; launcher tests use Bash (Git Bash on Windows) and curl, and skip if Bash is unavailable. CI runs the suites on Node.js 22, 24, and 26 on Linux and Windows without installing Claude Code, plus an isolated Ubuntu Docker smoke test with fixture credentials.
 
 ### Optional installed-client fixtures
 

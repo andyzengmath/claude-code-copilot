@@ -215,6 +215,25 @@ function mcpResults(text, maxResults) {
   }, maxResults)
 }
 
+function githubResults(text, maxResults) {
+  const content = mcpReply(text)
+  if (!content.length) throw malformed()
+  const items = content.flatMap((item) => {
+    if (!isObject(item) || item.type !== "text" || typeof item.text !== "string") throw malformed()
+    const data = parseJson(item.text)
+    if (!isObject(data)) throw malformed()
+    if (data.error_message) throw new ProviderFailure("GitHub search error")
+    if (!Array.isArray(data.search_result_groups)) throw malformed()
+    return data.search_result_groups.flatMap((group) => isObject(group) && Array.isArray(group.items) ? group.items : [])
+  })
+  return validResults(items, (item) => {
+    const snippets = Array.isArray(item.snippets)
+      ? item.snippets.filter((value) => typeof value === "string" && value.trim()) : []
+    const snippet = snippets.length ? snippets.join("\n\n") : item.semantic_document
+    return result(item.url, item.title, typeof snippet === "string" ? snippet.slice(0, 4000) : "", item.last_updated_date)
+  }, maxResults)
+}
+
 function decodeHtml(text) {
   const entities = { amp: "&", quot: '"', apos: "'", lt: "<", gt: ">", nbsp: " " }
   return text.replace(/&(#x[0-9a-f]+|#\d+|amp|quot|apos|lt|gt|nbsp);/gi, (whole, entity) => {
@@ -290,7 +309,7 @@ function instantResults(text, maxResults) {
   return validResults(candidates, (item) => result(item.url, item.title, item.snippet), maxResults)
 }
 
-export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}, logger = console } = {}) {
+export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}, logger = console, githubMcpUrl } = {}) {
   const settings = {
     braveApiKey: config.braveApiKey ?? "",
     serperApiKey: config.serperApiKey ?? "",
@@ -303,12 +322,18 @@ export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}
   }
   const maxResults = settings.searchMaxResults
   const request = (url, options, signal) => requestText(fetchImpl, url, options, settings, signal)
-  const callMcp = async (url, name, args, headers, signal) => mcpResults(await request(url, {
+  const callMcp = async (url, name, args, headers, signal, parse = mcpResults) => parse(await request(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...headers },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
   }, signal), maxResults)
   const providers = {
+    github: {
+      label: "GitHub",
+      search: (query, signal, token) => callMcp(githubMcpUrl, "web_search", { query }, {
+        Authorization: `Bearer ${token}`, "User-Agent": USER_AGENT, "X-MCP-Tools": "web_search", "X-MCP-Readonly": "true",
+      }, signal, githubResults),
+    },
     exa: {
       label: "Exa",
       search: (query, signal) => callMcp(
@@ -373,18 +398,21 @@ export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}
     },
   }
 
-  return async function search(query, { signal } = {}) {
+  return async function search(query, { signal, token } = {}) {
     signal?.throwIfAborted()
     const first = selectProvider(query, settings)
-    const order = [first, first === "exa" ? "parallel" : "exa",
+    const github = typeof githubMcpUrl === "string" && typeof token === "string" && token !== ""
+    const preferred = ["github", "exa", "parallel"].includes(settings.websearchProvider) ? [settings.websearchProvider] : []
+    // A Set keeps each provider's first position, so the preferred one is not repeated.
+    const order = [...new Set([...preferred, "github", first, first === "exa" ? "parallel" : "exa",
       ...(settings.braveApiKey ? ["brave"] : []), ...(settings.serperApiKey ? ["serper"] : []),
-      "lite", "instant"]
+      "lite", "instant"])].filter((name) => github || name !== "github")
     let succeeded = false
     for (const name of order) {
       signal?.throwIfAborted()
       const provider = providers[name]
       try {
-        const results = await provider.search(query, signal)
+        const results = await provider.search(query, signal, token)
         signal?.throwIfAborted()
         if (results.length) return results
         succeeded = true
