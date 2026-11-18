@@ -49,8 +49,11 @@ export async function upstreamError(upstream) {
   return error
 }
 
-export function createUpstreamClient({ fetchImpl, baseUrl, config, logger }) {
-  const gate = createAdmissionGate({
+// `gate`: share another client's admission gate, so that concurrency and
+// spacing limits cover both clients. `cooldown: false` keeps this client's
+// Retry-After responses from pausing that gate.
+export function createUpstreamClient({ fetchImpl, baseUrl, config, logger, gate: sharedGate, cooldown = true }) {
+  const gate = sharedGate ?? createAdmissionGate({
     limit: config.maxConcurrentRequests,
     maxQueued: config.maxQueuedRequests,
     maxQueueBytes: config.maxQueueBytes,
@@ -58,6 +61,7 @@ export function createUpstreamClient({ fetchImpl, baseUrl, config, logger }) {
     minIntervalMs: config.minRequestIntervalMs,
   })
   return {
+    gate,
     async request(path, body, { token, headers: incoming, signal }) {
       const serialized = JSON.stringify(body)
       const bytes = Buffer.byteLength(serialized)
@@ -106,7 +110,7 @@ export function createUpstreamClient({ fetchImpl, baseUrl, config, logger }) {
         }
         const { response } = upstream
         const hint = parseRetryAfterMs(response.headers.get("retry-after"))
-        if ((response.status === 429 || response.status === 503) && hint !== null) gate.cooldown(hint)
+        if (cooldown && (response.status === 429 || response.status === 503) && hint !== null) gate.cooldown(hint)
         const delay = hint ?? Math.floor(Math.min(1000 * 2 ** attempt, 8000) * (0.5 + Math.random() * 0.5))
         if (!retryable.has(response.status) || attempt === config.maxRetries || performance.now() + delay > deadline) {
           return { ...upstream, dispose }
@@ -118,6 +122,6 @@ export function createUpstreamClient({ fetchImpl, baseUrl, config, logger }) {
       }
       throw new ProxyError(502, "Copilot retry budget exhausted")
     },
-    close() { gate.close() },
+    close() { if (!sharedGate) gate.close() },
   }
 }

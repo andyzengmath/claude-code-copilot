@@ -1028,6 +1028,46 @@ test("hosted search is attempted once even when Copilot retries are enabled", as
   assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages"])
 })
 
+for (const [name, status, headers, paused] of [
+  ["a 401", 401, {}, true],
+  ["a 403", 403, {}, true],
+  ["a 404", 404, {}, true],
+  ["a 429 without Retry-After", 429, {}, true],
+  ["a 429 with a short Retry-After", 429, { "retry-after": "5" }, true],
+  ["a 500", 500, {}, false],
+]) {
+  test(`after ${name}, the next search ${paused ? "skips hosted search at once" : "tries hosted search again"}`, async (t) => {
+    const paths = []
+    const rounds = []
+    const f = await fixture(t, (call) => {
+      paths.push(call.url.pathname)
+      if (call.url.pathname === "/responses") return Response.json({ error: { message: "refused" } }, { status, headers })
+      return emulationRound(JSON.parse(call.body), rounds)
+    }, { ...withLuna, searchProvider: async () => [providerResult] })
+    await (await f.request(nestedWebSearch())).text()
+    paths.length = 0
+    rounds.length = 0
+    const started = Date.now()
+    const second = await f.request(nestedWebSearch())
+    assert.equal(parsedEvents(await second.text()).at(-1).type, "message_stop")
+    assert.ok(Date.now() - started < 2000, "the next search is not delayed by the hosted failure")
+    assert.deepEqual(paths, paused ? ["/v1/messages", "/v1/messages"] : ["/responses", "/v1/messages", "/v1/messages"])
+  })
+}
+
+test("hosted search shares the configured spacing between Copilot requests", async (t) => {
+  const sent = []
+  const f = await fixture(t, (call) => {
+    sent.push({ path: call.url.pathname, at: performance.now() })
+    return call.url.pathname === "/responses" ? Response.json(hostedReply()) : Response.json(message())
+  }, { ...withLuna, config: { minRequestIntervalMs: 400 } })
+  assert.equal((await f.request()).status, 200)
+  const response = await f.request(nestedWebSearch())
+  assert.equal(parsedEvents(await response.text()).at(-1).type, "message_stop")
+  assert.deepEqual(sent.map((call) => call.path), ["/v1/messages", "/responses"])
+  assert.ok(sent[1].at - sent[0].at >= 350, `hosted search waited ${Math.round(sent[1].at - sent[0].at)} ms`)
+})
+
 test("a hosted answer without a completed search falls back, and its tokens are still reported", async (t) => {
   const paths = []
   const rounds = []

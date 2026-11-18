@@ -187,6 +187,14 @@ test("pages the model opened or cited are listed even when no search returned th
   // Sources may be absent; the cited pages still reach Claude Code as links.
   const citedOnly = map({ ...lunaResponse(), output: [search("ws_1", "query"), answer("Answer", [["https://nodejs.org/x?utm_source=openai", "X"]])] })
   assert.deepEqual(results(citedOnly), [[{ type: "web_search_result", url: "https://nodejs.org/x", title: "X", encrypted_content: "", page_age: null }]])
+  // Hash routes name different pages; anchors and text fragments do not, and links keep them.
+  const fragments = map({ ...lunaResponse(), output: [search("ws_1", "query", ["https://docs.example.org/guide"]), answer("Answer", [
+    ["https://docs.example.org/?utm_source=openai#/api/widgets", "Widgets"], ["https://docs.example.org/?utm_source=openai#/api/users", "Users"],
+    ["https://docs.example.org/guide?utm_source=openai#install", "Guide"], ["https://docs.example.org/faq?utm_source=openai#:~:text=LTS", "FAQ"],
+  ])] })
+  assert.deepEqual(results(fragments)[0].map((result) => result.url), [
+    "https://docs.example.org/guide", "https://docs.example.org/#/api/widgets", "https://docs.example.org/#/api/users", "https://docs.example.org/faq#:~:text=LTS",
+  ])
 })
 
 test("allowed domains admit subdomains, and any page outside them sends the request to provider search", () => {

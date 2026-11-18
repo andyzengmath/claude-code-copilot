@@ -787,6 +787,14 @@ test("one search stops trying providers at the total search deadline", { timeout
   assert.match(warnings.at(-1), /total search deadline/)
 })
 
+test("a genuine empty result stands when a later provider runs past the total deadline", { timeout: 3000 }, async () => {
+  const { search, calls, warnings } = githubHarness((call) => call.name === "github" ? ghSse(ghPayload([])) : new Promise(() => {}),
+    { searchTimeoutMs: 1000, searchTotalTimeoutMs: 150 })
+  assert.deepEqual(await search(QUERY, { token: TOKEN }), [])
+  assert.equal(calls.length, 2)
+  assert.match(warnings.at(-1), /total search deadline/)
+})
+
 test("a GitHub refusal is reported once as a possible policy denial", async () => {
   const { search, warnings } = githubHarness((call) => call.name === "github" ? json({}, { status: 403 }) : mcp([hit()]))
   await search(QUERY, { token: TOKEN })

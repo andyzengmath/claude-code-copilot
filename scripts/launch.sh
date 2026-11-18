@@ -75,25 +75,32 @@ healthy() {
     PROBE_URL="$1" PROXY_API_KEY="$API_KEY" node -e '
         const { createHmac, randomBytes, timingSafeEqual } = require("node:crypto");
         const http = require("node:http");
-        setTimeout(() => process.exit(1), 2500).unref();
-        const nonce = randomBytes(16).toString("hex");
-        const request = http.get(new URL(`/health?nonce=${nonce}`, process.env.PROBE_URL), { timeout: 2000, agent: false }, (response) => {
-            let text = "";
-            response.setEncoding("utf8");
-            response.on("data", (chunk) => { text += chunk; if (text.length > 4096) process.exit(1); });
-            response.on("end", () => {
-                let health;
-                try { health = JSON.parse(text); } catch { process.exit(1); }
-                if (response.statusCode !== 200 || health?.status !== "ok" || health.provider !== "github-copilot") process.exit(1);
-                // Proxies from before the local API key report no api_key_required.
-                if (health.api_key_required !== true) process.exit(2);
-                const expected = createHmac("sha256", process.env.PROXY_API_KEY).update(`claude-code-copilot health ${nonce}`).digest();
-                const proof = Buffer.from(typeof health.key_proof === "string" ? health.key_proof : "", "hex");
-                process.exit(proof.length === expected.length && timingSafeEqual(proof, expected) ? 0 : 1);
+        setTimeout(() => process.exit(1), 4500).unref();
+        const get = (path) => new Promise((resolve) => {
+            const request = http.get(new URL(path, process.env.PROBE_URL), { timeout: 2000, agent: false }, (response) => {
+                let text = "";
+                response.setEncoding("utf8");
+                response.on("data", (chunk) => { text += chunk; if (text.length > 4096) process.exit(1); });
+                response.on("end", () => {
+                    let body = null;
+                    try { body = JSON.parse(text); } catch {}
+                    resolve({ status: response.statusCode, body });
+                });
             });
+            request.on("timeout", () => request.destroy());
+            request.on("error", () => process.exit(1));
         });
-        request.on("timeout", () => request.destroy());
-        request.on("error", () => process.exit(1));
+        (async () => {
+            const nonce = randomBytes(16).toString("hex");
+            let { status, body } = await get(`/health?nonce=${nonce}`);
+            // Proxies from before the local API key answer only the exact path /health.
+            if (status === 404) ({ status, body } = await get("/health"));
+            if (status !== 200 || body?.status !== "ok" || body.provider !== "github-copilot") process.exit(1);
+            if (body.api_key_required !== true) process.exit(2);
+            const expected = createHmac("sha256", process.env.PROXY_API_KEY).update(`claude-code-copilot health ${nonce}`).digest();
+            const proof = Buffer.from(typeof body.key_proof === "string" ? body.key_proof : "", "hex");
+            process.exit(proof.length === expected.length && timingSafeEqual(proof, expected) ? 0 : 1);
+        })();
     ' 2>/dev/null || status=$?
     if [ "$status" = 2 ]; then LEGACY_PROXY=true; fi
     return "$status"

@@ -154,11 +154,12 @@ export function createProxyServer({
   const lifecycle = shutdownSignal ? AbortSignal.any([shutdownSignal, shutdown.signal]) : shutdown.signal
   const catalog = createModelCatalog({ fetchImpl, baseUrl, config, logger })
   const copilot = createUpstreamClient({ fetchImpl, baseUrl, config, logger })
-  // Hosted search gets its own client: one attempt with the search deadline,
-  // since provider search is the fallback, and its own admission gate, so a
-  // Retry-After for the search model never delays or rejects Claude traffic.
+  // Hosted search makes one attempt with the search deadline, since provider
+  // search is the fallback. It shares the admission gate, so the configured
+  // concurrency and spacing limits cover all Copilot requests, but its
+  // Retry-After pauses only hosted search, never the gate Claude requests use.
   const hostedClient = createUpstreamClient({
-    fetchImpl, baseUrl, logger,
+    fetchImpl, baseUrl, logger, gate: copilot.gate, cooldown: false,
     config: { ...config, maxRetries: 0, requestTimeoutMs: Math.min(config.requestTimeoutMs, config.searchTimeoutMs) },
   })
   const search = createWebSearchService({

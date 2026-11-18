@@ -170,13 +170,15 @@ test("launcher shell tracing cannot print the local API key", options, async (t)
 for (const status of [404, 500, 200]) {
   test(`launcher rejects ${status === 200 ? "old unauthenticated" : status} health without stopping that service`, options, async (t) => {
     const server = createServer((req, res) => {
-      if (req.url.startsWith("/health")) {
+      // The old proxy on main answers only the exact paths /health and /.
+      const health = status === 200 ? req.url === "/health" || req.url === "/" : req.url.startsWith("/health")
+      if (health) {
         res.writeHead(status, { "content-type": "application/json" })
         res.end(JSON.stringify({
           status: "ok", provider: "github-copilot", ...(status === 200 ? {} : { api_key_required: true }),
         }))
       } else {
-        res.writeHead(400)
+        res.writeHead(status === 200 ? 404 : 400)
         res.end("{}")
       }
     })

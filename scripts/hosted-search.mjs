@@ -93,10 +93,19 @@ function httpUrl(value) {
 }
 
 // Citation URLs gain utm_source=openai; compare them with sources without it.
+// Anchors and text fragments point into the same page, but hash routes such as
+// #/api/users name different pages of a single-page app.
 function urlKey(url) {
   const copy = new URL(url.href)
-  copy.searchParams.delete("utm_source")
-  copy.hash = ""
+  if (copy.searchParams.has("utm_source")) copy.searchParams.delete("utm_source")
+  if (!/^#!?\//.test(copy.hash)) copy.hash = ""
+  return copy.href
+}
+
+// The link to show for a cited or opened page: as given, without utm_source.
+function cleanHref(url) {
+  const copy = new URL(url.href)
+  if (copy.searchParams.has("utm_source")) copy.searchParams.delete("utm_source")
   return copy.href
 }
 
@@ -219,7 +228,7 @@ export function hostedSearchMessage(response, { id, model, settings }) {
   for (const url of [...pageReads, ...citations]) {
     if (!lastResults || extra >= MAX_SOURCES_PER_SEARCH || listed.has(urlKey(url))) continue
     listed.add(urlKey(url))
-    lastResults.push(resultFor(url, urlKey(url)))
+    lastResults.push(resultFor(url, cleanHref(url)))
     extra++
   }
   if (!truncated && !content.some((block) => block.type === "text")) {

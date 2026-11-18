@@ -437,11 +437,11 @@ export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}
         } else logger.warn(`⚠ ${provider.label} search failed: ${detail}`)
       }
     }
-    if (deadline.aborted) {
-      logger.warn("⚠ Web search stopped at the total search deadline")
-      throw new WebSearchError("Web search is unavailable: providers did not answer within the search deadline.", "unavailable")
-    }
+    // A provider's genuine empty result stands even if a later one ran out of time.
+    if (deadline.aborted) logger.warn("⚠ Web search stopped at the total search deadline")
     if (succeeded) return []
-    throw new WebSearchError("Web search is unavailable: all providers failed; check provider connectivity and configuration.", "unavailable")
+    throw new WebSearchError(deadline.aborted
+      ? "Web search is unavailable: providers did not answer within the search deadline."
+      : "Web search is unavailable: all providers failed; check provider connectivity and configuration.", "unavailable")
   }
 }
