@@ -399,9 +399,10 @@ export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}
     const github = typeof githubMcpUrl === "string" && typeof token === "string" && token !== ""
     const preferred = PREFERRED_SEARCH_PROVIDERS.includes(settings.websearchProvider) ? [settings.websearchProvider] : []
     // A Set keeps each provider's first position, so the preferred one is not repeated.
+    // WEB_SEARCH_THIRD_PARTY=0 leaves only GitHub's search.
     const order = [...new Set([...preferred, "github", first, first === "exa" ? "parallel" : "exa",
       ...(settings.braveApiKey ? ["brave"] : []), ...(settings.serperApiKey ? ["serper"] : []),
-      "lite", "instant"])].filter((name) => github || name !== "github")
+      "lite", "instant"])].filter((name) => name === "github" ? github : settings.webSearchThirdParty)
     // One deadline bounds the whole chain, so stalled providers cannot add up.
     const deadline = AbortSignal.timeout(settings.searchTotalTimeoutMs)
     const chain = signal ? AbortSignal.any([signal, deadline]) : deadline
@@ -424,7 +425,9 @@ export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}
         const detail = error instanceof ProviderFailure ? error.message : "request or response read failed"
         if (name === "github" && /^HTTP 40[13]$/.test(detail) && !githubRefusalReported) {
           githubRefusalReported = true
-          logger.warn(`⚠ GitHub web search was refused (${detail}), for example by organization policy; searches use third-party providers`)
+          logger.warn(`⚠ GitHub web search was refused (${detail}), for example by organization policy; ${settings.webSearchThirdParty
+            ? "searches use third-party providers (WEB_SEARCH_THIRD_PARTY=0 prevents this)"
+            : "third-party providers are disabled (WEB_SEARCH_THIRD_PARTY=0), so provider search fails"}`)
         } else logger.warn(`⚠ ${provider.label} search failed: ${detail}`)
       }
     }
@@ -433,6 +436,9 @@ export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}
     if (succeeded) return []
     throw new WebSearchError(deadline.aborted
       ? "Web search is unavailable: providers did not answer within the search deadline."
-      : "Web search is unavailable: all providers failed; check provider connectivity and configuration.", "unavailable")
+      : settings.webSearchThirdParty
+        ? "Web search is unavailable: all providers failed; check provider connectivity and configuration."
+        : "Web search is unavailable: GitHub search failed or is unavailable, and WEB_SEARCH_THIRD_PARTY=0 disables the other providers.",
+    "unavailable")
   }
 }

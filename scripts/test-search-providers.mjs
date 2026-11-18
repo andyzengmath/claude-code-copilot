@@ -806,7 +806,27 @@ test("a GitHub refusal is reported once as a possible policy denial", async () =
   await search(QUERY, { token: TOKEN })
   await search(QUERY, { token: TOKEN })
   assert.deepEqual(warnings.filter((line) => /GitHub/.test(line)), [
-    "⚠ GitHub web search was refused (HTTP 403), for example by organization policy; searches use third-party providers",
+    "⚠ GitHub web search was refused (HTTP 403), for example by organization policy; searches use third-party providers (WEB_SEARCH_THIRD_PARTY=0 prevents this)",
     "⚠ GitHub search failed: HTTP 403",
   ])
+})
+
+test("WEB_SEARCH_THIRD_PARTY=0 sends queries only to GitHub's search", async () => {
+  const githubOnly = { websearchProvider: "", webSearchThirdParty: false, exaApiKey: "fake-exa",
+    parallelApiKey: "fake-parallel", braveApiKey: "fake-brave", serperApiKey: "fake-serper" }
+  const found = githubHarness((call) => call.name === "github" ? ghSse(ghPayload([ghItem()])) : mcp([hit()]), githubOnly)
+  assert.deepEqual((await found.search(QUERY, { token: TOKEN })).map((r) => r.url), ["https://nodejs.org/en/download"])
+  for (const [status, warning] of [
+    [403, /refused \(HTTP 403\).*third-party providers are disabled \(WEB_SEARCH_THIRD_PARTY=0\)/],
+    [500, /GitHub search failed: HTTP 500/],
+  ]) {
+    const { search, calls, warnings } = githubHarness(() => json({}, { status }), githubOnly)
+    await assert.rejects(search(QUERY, { token: TOKEN }), (error) => error instanceof WebSearchError &&
+      error.errorCode === "unavailable" && /WEB_SEARCH_THIRD_PARTY=0/.test(error.message))
+    assert.deepEqual(calls.map((call) => call.name), ["github"])
+    assert.match(warnings[0], warning)
+  }
+  const { search, calls } = harness(() => mcp([hit()]), githubOnly)
+  await assert.rejects(search(QUERY, { token: TOKEN }), /WEB_SEARCH_THIRD_PARTY=0/)
+  assert.deepEqual(calls, [])
 })
