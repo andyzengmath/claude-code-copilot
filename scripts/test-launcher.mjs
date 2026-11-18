@@ -170,7 +170,7 @@ test("launcher shell tracing cannot print the local API key", options, async (t)
 for (const status of [404, 500, 200]) {
   test(`launcher rejects ${status === 200 ? "old unauthenticated" : status} health without stopping that service`, options, async (t) => {
     const server = createServer((req, res) => {
-      if (req.url === "/health") {
+      if (req.url.startsWith("/health")) {
         res.writeHead(status, { "content-type": "application/json" })
         res.end(JSON.stringify({
           status: "ok", provider: "github-copilot", ...(status === 200 ? {} : { api_key_required: true }),
@@ -189,8 +189,33 @@ for (const status of [404, 500, 200]) {
     assert.notEqual(result.code, 0)
     assert.equal(existsSync(env.TEST_CLIENT_RESULT), false)
     assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, status)
+    if (status === 200) {
+      assert.match(result.stderr, /older claude-code-copilot proxy/)
+      assert.match(result.stderr, /docker rm -f claude-copilot-proxy/)
+    }
   })
 }
+
+test("launcher never sends its key to a listener that cannot prove it holds the key", options, async (t) => {
+  const seen = []
+  const server = createServer((req, res) => {
+    seen.push({ url: req.url, key: req.headers["x-api-key"] ?? req.headers.authorization ?? null })
+    res.writeHead(req.url.startsWith("/health") ? 200 : 400, { "content-type": "application/json" })
+    res.end(JSON.stringify({ status: "ok", provider: "github-copilot", api_key_required: true, key_proof: "00".repeat(32) }))
+  })
+  server.listen(0, "127.0.0.1")
+  await once(server, "listening")
+  t.after(async () => { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)) })
+  const { env } = await setup(t, server.address().port)
+  const result = await launch(t, env)
+  assert.notEqual(result.code, 0)
+  assert.equal(existsSync(env.TEST_CLIENT_RESULT), false)
+  assert.ok(seen.length > 0)
+  for (const request of seen) {
+    assert.equal(request.key, null)
+    assert.match(request.url, /^\/health\?nonce=[0-9a-f]{32}$/)
+  }
+})
 
 test("a Docker startup command failure reaches the working Node fallback despite set-e", options, async (t) => {
   const port = await availablePort()

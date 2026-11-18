@@ -15,7 +15,7 @@ PROXY_PID=""
 # Keep Compose's .env interpolation and direct Node startup on the probed address.
 export COPILOT_PROXY_PORT="$PORT" COPILOT_PROXY_HOST="$HOST"
 
-for dependency in node curl claude; do
+for dependency in node claude; do
     if ! command -v "$dependency" > /dev/null 2>&1; then
         echo "✗ Required command not found: $dependency" >&2
         exit 1
@@ -64,31 +64,39 @@ DIRECT_BASE_URL="http://$URL_HOST:$PORT"
 DOCKER_BASE_URL="http://127.0.0.1:$PORT"
 BASE_URL="$DIRECT_BASE_URL"
 
+LEGACY_PROXY=false
+
+# The proxy proves that it holds our key by answering a fresh nonce with an
+# HMAC under the key, so the key is never sent to, and Claude Code is never
+# pointed at, a listener that does not already hold it. The key reaches node
+# through its environment: other local users can read command lines, not it.
 healthy() {
-    if ! curl --noproxy '*' --fail --silent --connect-timeout 1 --max-time 2 \
-        --max-filesize 4096 "$1/health" 2>/dev/null |
-        node -e '
+    local status=0
+    PROBE_URL="$1" PROXY_API_KEY="$API_KEY" node -e '
+        const { createHmac, randomBytes, timingSafeEqual } = require("node:crypto");
+        const http = require("node:http");
+        setTimeout(() => process.exit(1), 2500).unref();
+        const nonce = randomBytes(16).toString("hex");
+        const request = http.get(new URL(`/health?nonce=${nonce}`, process.env.PROBE_URL), { timeout: 2000, agent: false }, (response) => {
             let text = "";
-            process.stdin.setEncoding("utf8");
-            process.stdin.on("data", chunk => { text += chunk; if (text.length > 4096) process.exit(1); });
-            process.stdin.on("end", () => {
-                try {
-                    const h = JSON.parse(text);
-                    process.exit(h.status === "ok" && h.provider === "github-copilot" && h.api_key_required === true ? 0 : 1);
-                } catch { process.exit(1); }
+            response.setEncoding("utf8");
+            response.on("data", (chunk) => { text += chunk; if (text.length > 4096) process.exit(1); });
+            response.on("end", () => {
+                let health;
+                try { health = JSON.parse(text); } catch { process.exit(1); }
+                if (response.statusCode !== 200 || health?.status !== "ok" || health.provider !== "github-copilot") process.exit(1);
+                // Proxies from before the local API key report no api_key_required.
+                if (health.api_key_required !== true) process.exit(2);
+                const expected = createHmac("sha256", process.env.PROXY_API_KEY).update(`claude-code-copilot health ${nonce}`).digest();
+                const proof = Buffer.from(typeof health.key_proof === "string" ? health.key_proof : "", "hex");
+                process.exit(proof.length === expected.length && timingSafeEqual(proof, expected) ? 0 : 1);
             });
-        '; then
-        return 1
-    fi
-    local status
-    # A null Messages body fails locally after key validation, without a Copilot call.
-    if ! status="$(curl --noproxy '*' --silent --connect-timeout 1 --max-time 2 \
-        --output /dev/null --write-out '%{http_code}' --request POST \
-        --header "x-api-key: $API_KEY" --header 'content-type: application/json' \
-        --data 'null' "$1/v1/messages" 2>/dev/null)"; then
-        return 1
-    fi
-    [ "$status" = "400" ]
+        });
+        request.on("timeout", () => request.destroy());
+        request.on("error", () => process.exit(1));
+    ' 2>/dev/null || status=$?
+    if [ "$status" = 2 ]; then LEGACY_PROXY=true; fi
+    return "$status"
 }
 
 # Detect an occupied port even when HTTP health is broken, old, or not HTTP at all.
@@ -103,8 +111,15 @@ port_open() {
     ' "$1" "$PORT" 2>/dev/null
 }
 incompatible_service() {
-    echo "✗ Port $PORT is already in use by an incompatible service or a proxy with a different local key." >&2
-    echo "  Restart that proxy with this version and its local key, or choose COPILOT_PROXY_PORT." >&2
+    if [ "$LEGACY_PROXY" = true ]; then
+        echo "✗ Port $PORT is used by an older claude-code-copilot proxy that accepts requests without an API key." >&2
+        echo "  Stop it, then run this launcher again to start the current version:" >&2
+        echo "    Docker:  docker rm -f claude-copilot-proxy" >&2
+        echo "    Node:    stop the node scripts/proxy.mjs process that listens on port $PORT" >&2
+    else
+        echo "✗ Port $PORT is already in use by an incompatible service or a proxy with a different local key." >&2
+        echo "  Restart that proxy with this version and its local key, or choose COPILOT_PROXY_PORT." >&2
+    fi
     echo "  No existing process or container has been stopped." >&2
 }
 wait_ready() {

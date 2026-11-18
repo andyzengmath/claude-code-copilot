@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { createHmac } from "node:crypto"
 import { once } from "node:events"
 import { createServer } from "node:http"
 import { gzipSync } from "node:zlib"
@@ -266,6 +267,16 @@ test("health is public but inference and model discovery require the local key",
     assert.equal(response.headers.has("access-control-allow-origin"), false)
   }
   assert.equal(f.calls.length, 0)
+})
+
+test("health proves possession of the local key only for a well-formed nonce", async (t) => {
+  const f = await fixture(t, () => assert.fail("no upstream calls"))
+  const nonce = "0123456789abcdef0123456789abcdef"
+  const proven = await (await fetch(`${f.base}/health?nonce=${nonce}`)).json()
+  assert.equal(proven.key_proof, createHmac("sha256", f.key).update(`claude-code-copilot health ${nonce}`).digest("hex"))
+  for (const query of ["", "?nonce=short", `?nonce=${nonce.toUpperCase()}`]) {
+    assert.deepEqual(await (await fetch(`${f.base}/health${query}`)).json(), { status: "ok", provider: "github-copilot", api_key_required: true })
+  }
 })
 
 test("routing is exact and malformed bodies are rejected before upstream dispatch", async (t) => {

@@ -26,7 +26,7 @@ The default transport uses Copilot's native `/v1/messages` endpoint when the acc
 - [Node.js](https://nodejs.org/) **22+**, including for authentication and local-key creation before Docker startup.
 - Optional [Docker](https://www.docker.com/) with the `docker compose` plugin.
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed (`npm install -g @anthropic-ai/claude-code`)
-- Bash and curl for the launcher. On Windows, PowerShell setup below does not require Bash.
+- Bash for the launcher. On Windows, PowerShell setup below does not require Bash.
 
 ## Quick Start
 
@@ -48,7 +48,7 @@ The auth script guides you through GitHub's device-code flow. The OAuth token is
 ./scripts/launch.sh
 ```
 
-The launcher reads/creates a persistent local API key, verifies a compatible running proxy and matching key, or tries Docker before Node. It waits up to 30 seconds for readiness and cleans up its Node child if startup fails. A ready Node proxy remains available when Claude Code exits so other sessions are not interrupted; use the printed Bash `kill` command to stop it explicitly. Existing proxies and Docker containers are never stopped by the launcher. Export configuration variables before launching; the launcher does not source `.env`.
+The launcher reads/creates a persistent local API key, verifies a compatible running proxy that proves it holds the same key, or tries Docker before Node. The proof is an HMAC of a fresh nonce, so the launcher never sends its key to a listener that does not already hold it. It waits up to 30 seconds for readiness and cleans up its Node child if startup fails. A ready Node proxy remains available when Claude Code exits so other sessions are not interrupted; use the printed Bash `kill` command to stop it explicitly. Existing proxies and Docker containers are never stopped by the launcher. Export configuration variables before launching; the launcher does not source `.env`.
 
 **Manual Node startup:**
 
@@ -69,12 +69,11 @@ claude
 
 ### 3. Select your model
 
-Discover model identifiers through the authenticated catalog:
+Discover model identifiers through the authenticated catalog. `printf` is a shell builtin, so the key reaches curl through stdin rather than a command line other local users can list:
 
 ```bash
-curl --fail --silent --show-error \
-  -H "x-api-key: $ANTHROPIC_API_KEY" \
-  "$ANTHROPIC_BASE_URL/v1/models"
+printf 'x-api-key: %s\n' "$ANTHROPIC_API_KEY" |
+  curl --fail --silent --show-error -H @- "$ANTHROPIC_BASE_URL/v1/models"
 ```
 
 Use a returned supported identifier with Claude Code's `/model`. The account/integrator catalog is authoritative; an absent model does not establish your plan's entitlements. Aliases only normalize spelling within the **same version**: the proxy never silently upgrades a tier or model version.
@@ -211,6 +210,8 @@ Every non-health route requires the persistent local key in `x-api-key` or `Auth
 {"status":"ok","provider":"github-copilot","api_key_required":true}
 ```
 
+With `?nonce=` followed by 32 to 128 lowercase hex characters, the response also includes `key_proof`: an HMAC-SHA256 of the nonce under the local key. The launcher checks it before it sends the key, so a process that occupies the port cannot collect the key or Claude Code's prompts.
+
 OAuth credentials and the local API key are persisted privately on disk. Model metadata and query results are cached in memory; query logging is disabled by default, but operational/error logs can still be emitted. Prompts go to GitHub Copilot. Hosted search sends the search request, including Claude Code's search prompt, to Copilot's `/responses` endpoint, where the search model runs OpenAI's web search. Provider search sends queries to GitHub's search first and then to configured or fallback providers. Their data handling policies apply. Do not put secrets in queries, publish credential files, or assume that a local proxy means data stays on your machine.
 
 ## Reliability and errors
@@ -295,7 +296,10 @@ Export variables before starting Node or the launcher. Compose explicitly maps t
 
 ## Migration and troubleshooting
 
-- **Upgrading from the old proxy:** the literal `copilot-proxy` API key no longer works. Restart the old process/container, capture the generated key with `--print-api-key`, and update `ANTHROPIC_API_KEY`. The launcher intentionally refuses older health payloads, even if they return HTTP 200.
+- **Upgrading from the old proxy:** the literal `copilot-proxy` API key no longer works, and the old proxy accepts requests without any key, so stop it before starting this version. The launcher detects it and prints these steps.
+  - Docker: `docker rm -f claude-copilot-proxy`, then run `./scripts/launch.sh`, or export `COPILOT_AUTH_FILE` and `COPILOT_PROXY_KEY_FILE` as shown under [Docker](#docker) and run `docker compose up -d --build --force-recreate --no-deps proxy`.
+  - Node: stop the old `node scripts/proxy.mjs` process, then start the new one.
+  - Then capture the generated key with `--print-api-key` and update `ANTHROPIC_API_KEY`.
 - **401 from the local proxy:** use the same key file as the running service and send `x-api-key` or Bearer auth. Health is intentionally public and does not validate your key.
 - **401 from Copilot:** rerun `node scripts/auth.mjs` with the intended `COPILOT_AUTH_FILE`, then restart your proxy. Do not delete unrelated credentials.
 - **Port occupied / incompatible service:** identify the owning process/container and stop or restart only that resource, or choose a different `COPILOT_PROXY_PORT`. The launcher never kills a shared proxy or restarts unrelated Docker services.
@@ -310,7 +314,7 @@ Run all suites using Node's built-in test runner on Node.js 22+:
 npm test
 ```
 
-No dependency installation, home auth token, or real provider calls are required. Tests use injected auth, temporary credentials, local fixtures, and ephemeral ports. The aggregate command explicitly lists the suites so Windows does not depend on shell glob expansion. Proxy CLI tests cover real `--print-api-key` and startup with temporary credentials; launcher tests use Bash (Git Bash on Windows) and curl, and skip if Bash is unavailable. CI runs the suites on Node.js 22, 24, and 26 on Linux and Windows without installing Claude Code, plus an isolated Ubuntu Docker smoke test with fixture credentials.
+No dependency installation, home auth token, or real provider calls are required. Tests use injected auth, temporary credentials, local fixtures, and ephemeral ports. The aggregate command explicitly lists the suites so Windows does not depend on shell glob expansion. Proxy CLI tests cover real `--print-api-key` and startup with temporary credentials; launcher tests use Bash (Git Bash on Windows) and skip if Bash is unavailable. CI runs the suites on Node.js 22, 24, and 26 on Linux and Windows without installing Claude Code, plus an isolated Ubuntu Docker smoke test with fixture credentials.
 
 ### Optional installed-client fixtures
 

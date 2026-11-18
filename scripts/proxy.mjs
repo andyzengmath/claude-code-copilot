@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { randomUUID, timingSafeEqual } from "node:crypto"
+import { randomUUID, timingSafeEqual, createHmac } from "node:crypto"
 import { once } from "node:events"
 import { createServer } from "node:http"
 import { resolve } from "node:path"
@@ -256,7 +256,12 @@ export function createProxyServer({
       const route = url.pathname
       if (health) {
         if (!["GET", "HEAD"].includes(req.method)) throw new ProxyError(405, "Method not allowed", "invalid_request_error", { allow: "GET, HEAD" })
-        jsonResponse(res, 200, { status: "ok", provider: "github-copilot", api_key_required: true })
+        // With a nonce, prove possession of the local key without revealing it,
+        // so the launcher never sends its key to a server that does not hold it.
+        const nonce = url.searchParams.get("nonce")
+        const proof = nonce && /^[0-9a-f]{32,128}$/.test(nonce)
+          ? { key_proof: createHmac("sha256", key).update(`claude-code-copilot health ${nonce}`).digest("hex") } : {}
+        jsonResponse(res, 200, { status: "ok", provider: "github-copilot", api_key_required: true, ...proof })
         return
       }
       if (!["/v1/messages", "/v1/messages/count_tokens", "/v1/models"].includes(route)) {

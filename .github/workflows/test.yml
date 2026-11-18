@@ -144,6 +144,7 @@ jobs:
         run: |
           node --input-type=module -e '
             import assert from "node:assert/strict";
+            import { createHmac } from "node:crypto";
             import { setTimeout as delay } from "node:timers/promises";
             import { getProxyKey, proxyKeyFilePath } from "./scripts/credentials.mjs";
             const base = `http://127.0.0.1:${process.env.COPILOT_PROXY_PORT}`;
@@ -167,6 +168,11 @@ jobs:
             assert.equal(unauthorized.status, 401);
             await unauthorized.arrayBuffer();
             const key = await getProxyKey({ filePath: proxyKeyFilePath(), create: false });
+            const nonce = "0123456789abcdef0123456789abcdef";
+            const proven = await fetch(`${base}/health?nonce=${nonce}`, { signal: AbortSignal.timeout(5000) });
+            assert.equal((await proven.json()).key_proof,
+              createHmac("sha256", key).update(`claude-code-copilot health ${nonce}`).digest("hex"),
+              "The container must prove it holds the mounted local key");
             const invalid = await fetch(`${base}/v1/messages`, {
               method: "POST",
               headers: { "content-type": "application/json", "x-api-key": key },
