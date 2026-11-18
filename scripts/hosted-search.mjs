@@ -122,8 +122,15 @@ function count(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null
 }
 
+// The query of a hosted search call's action; undefined for page reads and empty searches.
+function searchQuery(action) {
+  if (!plainObject(action) || action.type !== "search") return undefined
+  return [action.query, ...(Array.isArray(action.queries) ? action.queries : [])]
+    .find((value) => typeof value === "string" && value.trim())
+}
+
 // Token usage of a Responses payload in Anthropic's shape; throws for invalid usage.
-export function hostedSearchUsage(usage) {
+function hostedSearchUsage(usage) {
   const input = count(usage?.input_tokens)
   const output = count(usage?.output_tokens)
   const detail = (value) => value === undefined || value === null ? 0 : count(value)
@@ -136,6 +143,16 @@ export function hostedSearchUsage(usage) {
     input_tokens: input - cached - written, output_tokens: output,
     cache_read_input_tokens: cached, cache_creation_input_tokens: written,
   }
+}
+
+// Tokens and searches of a hosted answer that was received but not used;
+// undefined when its usage is invalid.
+export function rejectedHostedUsage(response) {
+  let usage
+  try { usage = hostedSearchUsage(response?.usage) } catch { return undefined }
+  const output = Array.isArray(response.output) ? response.output : []
+  const searches = output.filter((item) => item?.type === "web_search_call" && searchQuery(item.action)).length
+  return { ...usage, server_tool_use: { web_search_requests: searches } }
 }
 
 // Map a Responses API result onto an Anthropic web search message. Throws a
@@ -191,8 +208,7 @@ export function hostedSearchMessage(response, { id, model, settings }) {
         if (url) pageReads.push(permitted(url))
         continue
       }
-      const query = [action.query, ...(Array.isArray(action.queries) ? action.queries : [])]
-        .find((value) => typeof value === "string" && value.trim())
+      const query = searchQuery(action)
       if (!query) continue
       searches++
       const toolId = `srvtoolu_${typeof item.id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(item.id) ? item.id : `hosted_${searches}`}`

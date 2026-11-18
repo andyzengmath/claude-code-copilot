@@ -278,8 +278,9 @@ export function prepareSearchRequest(request, config, settings = extractWebSearc
   return body
 }
 
-// `priorUsage`: tokens of a rejected hosted search answer, reported in the
-// total but not charged against this response's max_tokens allowance.
+// `priorUsage`: tokens and searches of a rejected hosted search answer,
+// reported in the total but not charged against this response's max_tokens
+// allowance or its max_uses.
 export async function runWebSearch({ request, preparedRequest, config, signal, generate, search, emit, priorUsage }) {
   const settings = extractWebSearchConfig(request.tools, config)
   if (!settings) throw new ProxyError(400, "Search emulation requires a server search tool", "invalid_request_error")
@@ -382,7 +383,8 @@ export async function runWebSearch({ request, preparedRequest, config, signal, g
     if (searchCount >= settings.maxUses) body = disableSearch(body)
   }
   if (priorUsage) output.usage = sumUsage(output.usage, priorUsage)
-  output.usage.server_tool_use = { ...output.usage.server_tool_use, web_search_requests: searchCount }
+  const priorSearches = priorUsage?.server_tool_use?.web_search_requests ?? 0
+  output.usage.server_tool_use = { ...output.usage.server_tool_use, web_search_requests: priorSearches + searchCount }
   if (emit) {
     await emit("message_delta", {
       type: "message_delta",

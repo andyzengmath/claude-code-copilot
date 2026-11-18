@@ -12,7 +12,7 @@ import { abortError, parseRetryAfterMs, ProxyError } from "./runtime.mjs"
 import { consumeSSE, createSSEWriter, NativeMessageState, parseSSEData, validateNativeContentBlock } from "./sse.mjs"
 import { createSearchProvider } from "./search-providers.mjs"
 import { createWebSearchService, extractWebSearchConfig, prepareSearchRequest, runWebSearch } from "./search.mjs"
-import { buildHostedSearchRequest, emitHostedMessage, hostedSearchIneligibility, hostedSearchMessage, hostedSearchUsage } from "./hosted-search.mjs"
+import { buildHostedSearchRequest, emitHostedMessage, hostedSearchIneligibility, hostedSearchMessage, rejectedHostedUsage } from "./hosted-search.mjs"
 import { createUpstreamClient, errorEnvelope, errorType, responseHeaders, upstreamError } from "./upstream.mjs"
 
 export { createStreamTranslator, translateMessages, translateContentPart } from "./chat.mjs"
@@ -187,7 +187,7 @@ export function createProxyServer({
   // Answer a search-only request with one Copilot /responses call using the
   // hosted web_search tool. Returns { message } on success. Otherwise returns
   // { message: null, usage } so the caller uses provider search; `usage` holds
-  // the tokens of a hosted answer that was received but rejected.
+  // the tokens and searches of a hosted answer that was received but rejected.
   async function hostedSearch({ body, settings, model, token, signal }) {
     const paused = hostedPausedUntil - Date.now()
     if (paused > 0) {
@@ -195,7 +195,7 @@ export function createProxyServer({
       return { message: null }
     }
     let upstream
-    let usage
+    let data
     try {
       const info = (await catalog.get(token, signal)).find((entry) => entry.id === config.webSearchModel)
       if (!info || !isRoutable(info) || !info.supported_endpoints?.includes("/responses")) {
@@ -205,9 +205,7 @@ export function createProxyServer({
       // No incoming headers: anthropic-* headers do not apply to /responses.
       upstream = await hostedClient.request("/responses", buildHostedSearchRequest(body, settings, config, info), { token, headers: {}, signal })
       if (!upstream.response.ok) throw await upstreamError(upstream)
-      let data
       try { data = JSON.parse(await upstream.text()) } catch { throw new ProxyError(502, "Copilot hosted search returned invalid JSON") }
-      try { usage = hostedSearchUsage(data?.usage) } catch { /* hostedSearchMessage rejects it below */ }
       let message
       try {
         message = hostedSearchMessage(data, { id: `msg_${randomUUID()}`, model, settings })
@@ -224,7 +222,7 @@ export function createProxyServer({
       // Upstream messages are never logged; hostedReason is written locally.
       logger.warn(`Hosted web search failed (${error.hostedReason ?? error.status ?? error.name}); using provider search` +
         (pause > 0 ? ` for the next ${Math.ceil(pause / 1000)}s` : ""))
-      return { message: null, usage }
+      return { message: null, usage: rejectedHostedUsage(data) }
     } finally {
       upstream?.dispose()
     }

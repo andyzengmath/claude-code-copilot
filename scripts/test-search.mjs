@@ -500,18 +500,21 @@ test("a fatal search failure cancels the other searches of its round and adds no
   assert.deepEqual(events, ["message_start"])
 })
 
-test("tokens of a rejected hosted answer are reported without shrinking the response's allowance", async () => {
+test("tokens and searches of a rejected hosted answer are reported without shrinking the response's allowance", async () => {
   const limits = []
+  let searched = 0
   const output = await exported("runWebSearch")({
     request: request(1, { max_tokens: 100 }), config: searchConfig(), signal: new AbortController().signal,
-    priorUsage: { input_tokens: 500, output_tokens: 90, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
-    search: async () => [result()],
+    priorUsage: { input_tokens: 500, output_tokens: 90, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, server_tool_use: { web_search_requests: 2 } },
+    search: async () => { searched++; return [result()] },
     generate: async (body) => {
       limits.push(body.max_tokens)
       return limits.length === 1 ? answer([tool("s")]) : answer([{ type: "text", text: "done" }], "end_turn")
     },
   })
   assert.deepEqual(limits, [100, 97])
+  assert.equal(searched, 1)
   assert.equal(output.usage.input_tokens, 520)
   assert.equal(output.usage.output_tokens, 96)
+  assert.deepEqual(output.usage.server_tool_use, { web_search_requests: 3 })
 })
