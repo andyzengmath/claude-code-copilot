@@ -386,7 +386,9 @@ export function createProxyServer({
         const terminal = await consumeSSE(upstream, async (frame) => {
           let done = false
           if (frame.data !== null) done = state.accept(parseSSEData(frame), frame.event)
-          await writer.write(frame.raw)
+          // An event cut off at EOF still needs its blank line, or the next
+          // event written (such as an error) would join its last line.
+          await writer.write(frame.unterminated ? `${frame.raw}\n\n` : frame.raw)
           return done
         }, config.maxEventBytes)
         if (!terminal) throw new ProxyError(502, "Copilot stream ended before a complete message_stop")

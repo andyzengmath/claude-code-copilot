@@ -125,6 +125,17 @@ test("readAuthToken reads only the specified fixture and rejects absent/invalid 
   assert.equal(await readAuthToken(filePath), TOKEN)
 })
 
+test("a credential file other users can read, as older versions wrote it, is restricted when read", {
+  skip: process.platform === "win32" && "POSIX permissions only",
+}, async (t) => {
+  const { readAuthToken } = await credentials()
+  const { filePath } = await fixture(t)
+  await writeFile(filePath, JSON.stringify({ access_token: TOKEN }))
+  await chmod(filePath, 0o644)
+  assert.equal(await readAuthToken(filePath), TOKEN)
+  assert.equal((await stat(filePath)).mode & 0o777, 0o600)
+})
+
 test("private JSON replacement is complete and leaves directory permissions and unrelated files intact", async (t) => {
   const { savePrivateJson, readAuthToken } = await credentials()
   const { dir, filePath } = await fixture(t)

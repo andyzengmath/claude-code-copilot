@@ -1,4 +1,4 @@
-import { open, readFile, rename, link, unlink, stat } from "node:fs/promises"
+import { chmod, open, readFile, rename, link, unlink, stat } from "node:fs/promises"
 import { randomBytes, randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve } from "node:path"
@@ -38,6 +38,23 @@ function storageError(message, code) {
   return error
 }
 
+// Older versions wrote the token with default permissions (often 0644).
+// Restrict such a file to its owner once per process, or say how to.
+const modeChecked = new Set()
+async function restrictLegacyMode(target) {
+  if (process.platform === "win32" || modeChecked.has(target)) return
+  modeChecked.add(target)
+  let mode
+  try { mode = (await stat(target)).mode } catch { return }
+  if ((mode & 0o077) === 0) return
+  try {
+    await chmod(target, 0o600)
+    console.warn(`Restricted ${target} to owner-only access; other users could read it.`)
+  } catch (error) {
+    console.warn(`Warning: other users can read ${target}, and it could not be restricted (${error.code || "error"}). Run: chmod 600 on that file.`)
+  }
+}
+
 async function readPrivateString(filePath, field, label) {
   const target = checkedPath(filePath)
   let text
@@ -51,6 +68,7 @@ async function readPrivateString(filePath, field, label) {
       error.code,
     )
   }
+  await restrictLegacyMode(target)
   let value
   try {
     value = JSON.parse(text)

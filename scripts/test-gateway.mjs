@@ -431,6 +431,16 @@ test("unexpected native EOF emits an error, never a fabricated successful stop",
   assert.equal(events.some((frame) => frame.type === "message_stop"), false)
 })
 
+test("a native stream cut off inside an event still ends with a parseable error event", async (t) => {
+  const delta = { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "!" } }
+  const frames = event("message_start", { type: "message_start", message: { ...message(), content: [], stop_reason: null } }) +
+    event("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }) +
+    `event: content_block_delta\ndata: ${JSON.stringify(delta)}`
+  const f = await fixture(t, () => streamResponse(frames))
+  const events = parsedEvents(await (await f.request({ stream: true })).text())
+  assert.deepEqual(events.map((entry) => entry.type), ["message_start", "content_block_start", "content_block_delta", "error"])
+})
+
 test("an upstream SSE error is terminal and preserved exactly once", async (t) => {
   const error = { type: "error", error: { type: "overloaded_error", message: "busy" } }
   const f = await fixture(t, () => streamResponse(event("error", error), { keepOpen: true }))

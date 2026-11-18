@@ -40,7 +40,7 @@ export class SSEDecoder {
     if (Buffer.byteLength(this.buffer) + Buffer.byteLength(this.raw) > this.maxEventBytes) {
       throw new ProxyError(502, "Upstream SSE event exceeds the size limit")
     }
-    if (final && this.raw) this.flush(frames)
+    if (final && this.raw) this.flush(frames, true)
     return frames
   }
 
@@ -57,8 +57,9 @@ export class SSEDecoder {
     else if (name === "data") this.data.push(value)
   }
 
-  flush(frames) {
-    frames.push({ event: this.event, data: this.data.length ? this.data.join("\n") : null, raw: this.raw })
+  // `unterminated`: the stream ended before this event's blank line.
+  flush(frames, unterminated = false) {
+    frames.push({ event: this.event, data: this.data.length ? this.data.join("\n") : null, raw: this.raw, ...(unterminated ? { unterminated } : {}) })
     this.raw = ""
     this.event = ""
     this.data = []
