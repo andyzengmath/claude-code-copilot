@@ -92,22 +92,25 @@ function httpUrl(value) {
   } catch { return null }
 }
 
-// Citation URLs gain utm_source=openai; compare them with sources without it.
+// Citation URLs gain utm_source=openai. Remove it without re-encoding the
+// rest of the query, so a citation matches its source and keeps its form.
+function withoutTracking(url) {
+  const copy = new URL(url.href)
+  const params = copy.search.slice(1).split("&").filter((part) => part && !/^utm_source(?:=|$)/.test(part))
+  copy.search = params.length ? `?${params.join("&")}` : ""
+  return copy
+}
+
 // Anchors and text fragments point into the same page, but hash routes such as
 // #/api/users name different pages of a single-page app.
 function urlKey(url) {
-  const copy = new URL(url.href)
-  if (copy.searchParams.has("utm_source")) copy.searchParams.delete("utm_source")
+  const copy = withoutTracking(url)
   if (!/^#!?\//.test(copy.hash)) copy.hash = ""
   return copy.href
 }
 
 // The link to show for a cited or opened page: as given, without utm_source.
-function cleanHref(url) {
-  const copy = new URL(url.href)
-  if (copy.searchParams.has("utm_source")) copy.searchParams.delete("utm_source")
-  return copy.href
-}
+const cleanHref = (url) => withoutTracking(url).href
 
 function hostAllowed(url, allowedDomains) {
   if (!allowedDomains.length) return true

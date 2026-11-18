@@ -195,6 +195,13 @@ test("pages the model opened or cited are listed even when no search returned th
   assert.deepEqual(results(fragments)[0].map((result) => result.url), [
     "https://docs.example.org/guide", "https://docs.example.org/#/api/widgets", "https://docs.example.org/#/api/users", "https://docs.example.org/faq#:~:text=LTS",
   ])
+  // A query that URLSearchParams would re-encode still matches its tracked citation.
+  const encoded = map({ ...lunaResponse(), output: [search("ws_1", "query", ["https://example.com/docs?q=node/lts,24"]), answer("Answer", [
+    ["https://example.com/docs?q=node/lts,24&utm_source=openai", "Docs page"], ["https://example.com/other?utm_source=openai&v=a:b", "Other"],
+  ])] })
+  assert.deepEqual(results(encoded)[0].map((result) => [result.url, result.title]), [
+    ["https://example.com/docs?q=node/lts,24", "Docs page"], ["https://example.com/other?v=a:b", "Other"],
+  ])
 })
 
 test("allowed domains admit subdomains, and any page outside them sends the request to provider search", () => {
