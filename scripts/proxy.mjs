@@ -173,6 +173,180 @@ export function createProxyServer({
   }
   const hostedSearch = createHostedSearch({ catalog, client: hostedClient, config, logger, warnOnce })
 
+  // Start an SSE response; handle() closes its writer.
+  function startStream(ctx, headers) {
+    beginStream(ctx.res, headers)
+    ctx.writer = createSSEWriter(ctx.res, {
+      signal: ctx.signal, timeoutMs: config.requestTimeoutMs, heartbeatMs: config.heartbeatMs,
+      onError: (error) => { ctx.controller.abort(error); ctx.res.destroy() },
+    })
+    ctx.writer.startPings()
+  }
+
+  // handle() disposes the response, including after an error.
+  async function send(ctx, path, payload, token) {
+    ctx.upstream = await copilot.request(path, payload, { token, headers: ctx.req.headers, signal: ctx.signal })
+    if (!ctx.upstream.response.ok) throw await upstreamError(ctx.upstream)
+    return ctx.upstream
+  }
+
+  function healthCheck({ req, res }, url) {
+    if (!["GET", "HEAD"].includes(req.method)) throw new ProxyError(405, "Method not allowed", "invalid_request_error", { allow: "GET, HEAD" })
+    // With a nonce, prove possession of the local key without revealing it,
+    // so the launcher never sends its key to a server that does not hold it.
+    const nonce = url.searchParams.get("nonce")
+    const proof = nonce && /^[0-9a-f]{32,128}$/.test(nonce)
+      ? { key_proof: createHmac("sha256", key).update(`claude-code-copilot health ${nonce}`).digest("hex") } : {}
+    jsonResponse(res, 200, { status: "ok", provider: "github-copilot", api_key_required: true, ...proof })
+  }
+
+  async function listModels({ res, signal }) {
+    const models = await catalog.get(await getToken(), signal)
+    const visible = models.filter((model) => isRoutable(model) && model.model_picker_enabled !== false &&
+      model.supported_endpoints?.some((path) => path === "/v1/messages" || path === "/chat/completions"))
+    const data = visible.map((model) => {
+      const id = claudeApiId(model.id)
+      return { id, object: "model", display_name: model.name ?? id }
+    })
+    jsonResponse(res, 200, { data, has_more: false, first_id: data[0]?.id ?? null, last_id: data.at(-1)?.id ?? null })
+  }
+
+  // /v1/messages, or /v1/messages/count_tokens when `countOnly` is set.
+  async function handleMessages(ctx, url, countOnly) {
+    const { req, signal } = ctx
+    const { body } = await readRequestBody(req, { signal, maxBytes: config.maxBodyBytes, timeoutMs: config.requestTimeoutMs })
+    validateRequest(body, countOnly)
+    const searchSettings = extractWebSearchConfig(body.tools, config)
+    let preparedSearch = searchSettings ? prepareSearchRequest(body, config, searchSettings) : null
+    const token = await getToken()
+    const { model, modelInfo, transport } = await catalog.resolve(body.model, token, signal)
+    ctx.nativeTransport = transport === "messages"
+    // Validate the client's request as sent, then fit the upstream payload to
+    // what this model and Copilot accept.
+    const upstreamBody = (payload) => withoutSafeguards(adaptToModel(payload, modelInfo))
+    if (preparedSearch) preparedSearch = { ...upstreamBody(preparedSearch), model }
+    let request = { ...upstreamBody(body), model }
+    if (ctx.nativeTransport && !searchSettings) request = prepareSearchRequest(request, config, null)
+    ctx.inference = true
+    logger.log(`[${new Date().toISOString()}] ${req.method} ${url.pathname} | model: ${model} | transport: ${transport}${searchSettings ? " + search" : ""}`)
+    if (countOnly) {
+      if (!ctx.nativeTransport) {
+        throw new ProxyError(501, "Authoritative token counting requires native Messages transport", "api_error")
+      }
+      await countTokens(ctx, { payload: preparedSearch ?? request, queryString: url.search, token })
+    } else if (searchSettings) {
+      await searchMessages(ctx, { body, request, preparedSearch, settings: searchSettings, queryString: url.search, token })
+    } else {
+      await forwardMessages(ctx, { body, request, model, modelInfo, queryString: url.search, token })
+    }
+  }
+
+  async function countTokens(ctx, { payload, queryString, token }) {
+    const upstream = await send(ctx, `/v1/messages/count_tokens${queryString}`, payload, token)
+    const text = await upstream.text()
+    let data
+    try { data = JSON.parse(text) } catch { throw new ProxyError(502, "Copilot returned invalid token-count JSON") }
+    if (!Number.isSafeInteger(data?.input_tokens) || data.input_tokens < 0) throw new ProxyError(502, "Copilot returned an invalid token count")
+    ctx.res.writeHead(upstream.response.status, responseHeaders(upstream.response.headers))
+    ctx.res.end(text)
+    ctx.outcome = "complete"
+  }
+
+  // A request with the server web_search tool: hosted search when it can
+  // answer, otherwise provider search emulation on the requested model.
+  async function searchMessages(ctx, { body, request, preparedSearch, settings, queryString, token }) {
+    if (settings.requested > settings.maxUses) logger.warn(`Web search max_uses capped at ${settings.maxUses}`)
+    if (settings.ignoredFields.length) warnOnce(`Ignored unsupported web_search tool field(s): ${fieldList(settings.ignoredFields)}`)
+    const ineligible = hostedSearchIneligibility(body, settings, config)
+    if (ineligible && config.webSearchMode === "hosted") logger.log(`  search: providers (${ineligible})`)
+    // Hosted search runs before any output, and does not use the requested
+    // model's transport, so it also serves Chat-transport models.
+    const hosted = ineligible ? { message: null } : await hostedSearch({
+      body, settings, model: request.model, token, signal: ctx.signal,
+    })
+    if (hosted.message) {
+      const headers = { "x-copilot-search-model": hosted.searchModel }
+      if (request.stream) {
+        startStream(ctx, headers)
+        await emitHostedMessage(hosted.message, (type, data) => ctx.writer.event(type, data))
+      } else jsonResponse(ctx.res, 200, hosted.message, headers)
+      ctx.outcome = "complete"
+      return
+    }
+    if (!ctx.nativeTransport) {
+      throw new ProxyError(501, "Provider web search requires native Messages transport; this request is not eligible for hosted search", "api_error")
+    }
+    if (settings.userLocation) warnOnce("Provider web search ignored the web_search user_location")
+    if (request.stream) startStream(ctx)
+    const { writer } = ctx
+    const result = await runWebSearch({
+      request, preparedRequest: preparedSearch, config, signal: ctx.signal, priorUsage: hosted.usage,
+      search: (query, options) => search.search(query, { ...options, token }),
+      emit: writer ? (type, data) => writer.event(type, data) : undefined,
+      generate: async (payload, onEvent) => {
+        const generation = await copilot.request(`/v1/messages${queryString}`, payload, { token, headers: ctx.req.headers, signal: ctx.signal })
+        try {
+          if (!generation.response.ok) throw await upstreamError(generation)
+          return await nativeMessage(generation, onEvent, config)
+        } finally { generation.dispose() }
+      },
+    })
+    if (!writer) jsonResponse(ctx.res, 200, result)
+    ctx.outcome = "complete"
+  }
+
+  // Any other Messages request, on the model's own transport.
+  async function forwardMessages(ctx, { body, request, model, modelInfo, queryString, token }) {
+    const { res, nativeTransport } = ctx
+    const payload = nativeTransport ? request : buildChatRequest(request, { model, modelInfo, forwardReasoning: config.forwardReasoning })
+    const upstream = await send(ctx, nativeTransport ? `/v1/messages${queryString}` : "/chat/completions", payload, token)
+    if (!request.stream) {
+      const text = await upstream.text()
+      let data
+      try { data = JSON.parse(text) } catch { throw new ProxyError(502, "Copilot returned invalid response JSON") }
+      if (nativeTransport) {
+        if (data?.type !== "message" || !Array.isArray(data.content) || typeof data.stop_reason !== "string") {
+          throw new ProxyError(502, "Copilot returned an incomplete native message")
+        }
+        for (const block of data.content) validateNativeContentBlock(block)
+        res.writeHead(upstream.response.status, responseHeaders(upstream.response.headers))
+        res.end(text)
+      } else jsonResponse(res, 200, translateResponseToAnthropic(data, body.model), responseHeaders(upstream.response.headers))
+      ctx.outcome = "complete"
+      return
+    }
+    if (!upstream.response.headers.get("content-type")?.includes("text/event-stream")) {
+      throw new ProxyError(502, "Copilot returned a non-SSE payload for a streaming request")
+    }
+    startStream(ctx, responseHeaders(upstream.response.headers))
+    const { writer } = ctx
+    if (nativeTransport) {
+      const state = new NativeMessageState()
+      const terminal = await consumeSSE(upstream, async (frame) => {
+        let done = false
+        if (frame.data !== null) done = state.accept(parseSSEData(frame), frame.event)
+        // An event cut off at EOF still needs its blank line, or the next
+        // event written (such as an error) would join its last line.
+        await writer.write(frame.unterminated ? `${frame.raw}\n\n` : frame.raw)
+        return done
+      }, config.maxEventBytes)
+      if (!terminal) throw new ProxyError(502, "Copilot stream ended before a complete message_stop")
+      ctx.outcome = state.error ? "upstream error" : "complete"
+    } else {
+      const frames = []
+      const translator = createStreamTranslator(body.model, { write(frame) { frames.push(frame); return true } })
+      const flush = async () => { for (const frame of frames.splice(0)) await writer.write(frame) }
+      const terminal = await consumeSSE(upstream, async (frame) => {
+        if (frame.data === null) return false
+        const done = translator.processChunk(frame.data === "[DONE]" ? "[DONE]" : parseSSEData(frame))
+        await flush()
+        return done
+      }, config.maxEventBytes)
+      if (!terminal) { translator.processChunk(null); await flush() }
+      ctx.outcome = "complete"
+    }
+  }
+
   async function handle(req, res) {
     const controller = new AbortController()
     const signal = AbortSignal.any([controller.signal, lifecycle])
@@ -180,32 +354,14 @@ export function createProxyServer({
     req.on("error", (error) => controller.abort(error))
     res.on("error", (error) => controller.abort(error))
     res.once("close", () => { if (!res.writableFinished) controller.abort(abortError()) })
-    let writer
-    let upstream
-    let nativeTransport = false
-    let inference = false
-    let outcome = "failed"
-    const makeWriter = () => {
-      const stream = createSSEWriter(res, {
-        signal, timeoutMs: config.requestTimeoutMs, heartbeatMs: config.heartbeatMs,
-        onError: (error) => { controller.abort(error); res.destroy() },
-      })
-      stream.startPings()
-      return stream
-    }
+    // Request state that the route helpers share with the error handling and cleanup below.
+    const ctx = { req, res, signal, controller, writer: null, upstream: null, nativeTransport: false, inference: false, outcome: "failed" }
     try {
       signal.throwIfAborted()
       const url = new URL(req.url, "http://localhost")
-      const health = url.pathname === "/health" || url.pathname === "/"
       const route = url.pathname
-      if (health) {
-        if (!["GET", "HEAD"].includes(req.method)) throw new ProxyError(405, "Method not allowed", "invalid_request_error", { allow: "GET, HEAD" })
-        // With a nonce, prove possession of the local key without revealing it,
-        // so the launcher never sends its key to a server that does not hold it.
-        const nonce = url.searchParams.get("nonce")
-        const proof = nonce && /^[0-9a-f]{32,128}$/.test(nonce)
-          ? { key_proof: createHmac("sha256", key).update(`claude-code-copilot health ${nonce}`).digest("hex") } : {}
-        jsonResponse(res, 200, { status: "ok", provider: "github-copilot", api_key_required: true, ...proof })
+      if (route === "/health" || route === "/") {
+        healthCheck(ctx, url)
         return
       }
       if (!["/v1/messages", "/v1/messages/count_tokens", "/v1/models"].includes(route)) {
@@ -213,156 +369,24 @@ export function createProxyServer({
       }
       if (!authorized(req, key)) throw new ProxyError(401, "A valid local proxy API key is required", "authentication_error")
       const modelsRoute = route === "/v1/models"
-      const countTokens = route === "/v1/messages/count_tokens"
       if (req.method !== (modelsRoute ? "GET" : "POST")) {
         throw new ProxyError(405, "Method not allowed", "invalid_request_error", { allow: modelsRoute ? "GET" : "POST" })
       }
-      if (modelsRoute) {
-        const authToken = await getToken()
-        const models = await catalog.get(authToken, signal)
-        const visible = models.filter((model) => isRoutable(model) && model.model_picker_enabled !== false &&
-          model.supported_endpoints?.some((path) => path === "/v1/messages" || path === "/chat/completions"))
-        const data = visible.map((model) => {
-          const id = claudeApiId(model.id)
-          return { id, object: "model", display_name: model.name ?? id }
-        })
-        jsonResponse(res, 200, { data, has_more: false, first_id: data[0]?.id ?? null, last_id: data.at(-1)?.id ?? null })
-        return
-      }
-      const { body } = await readRequestBody(req, { signal, maxBytes: config.maxBodyBytes, timeoutMs: config.requestTimeoutMs })
-      validateRequest(body, countTokens)
-      const searchSettings = extractWebSearchConfig(body.tools, config)
-      let preparedSearch = searchSettings ? prepareSearchRequest(body, config, searchSettings) : null
-      const authToken = await getToken()
-      const { model, modelInfo, transport } = await catalog.resolve(body.model, authToken, signal)
-      nativeTransport = transport === "messages"
-      // Validate the client's request as sent, then fit the upstream payload to
-      // what this model and Copilot accept.
-      const upstreamBody = (payload) => withoutSafeguards(adaptToModel(payload, modelInfo))
-      if (preparedSearch) preparedSearch = upstreamBody(preparedSearch)
-      let request = { ...upstreamBody(body), model }
-      if (nativeTransport && !searchSettings) request = prepareSearchRequest(request, config, null)
-      inference = true
-      logger.log(`[${new Date().toISOString()}] ${req.method} ${route} | model: ${model} | transport: ${transport}${searchSettings ? " + search" : ""}`)
-      if (!nativeTransport && countTokens) {
-        throw new ProxyError(501, "Authoritative token counting requires native Messages transport", "api_error")
-      }
-      if (countTokens) {
-        const payload = preparedSearch ? { ...preparedSearch, model } : request
-        upstream = await copilot.request(`/v1/messages/count_tokens${url.search}`, payload, { token: authToken, headers: req.headers, signal })
-        if (!upstream.response.ok) throw await upstreamError(upstream)
-        const text = await upstream.text()
-        let data
-        try { data = JSON.parse(text) } catch { throw new ProxyError(502, "Copilot returned invalid token-count JSON") }
-        if (!Number.isSafeInteger(data?.input_tokens) || data.input_tokens < 0) throw new ProxyError(502, "Copilot returned an invalid token count")
-        res.writeHead(upstream.response.status, responseHeaders(upstream.response.headers))
-        res.end(text)
-        outcome = "complete"
-        return
-      }
-      if (searchSettings) {
-        if (searchSettings.requested > searchSettings.maxUses) logger.warn(`Web search max_uses capped at ${searchSettings.maxUses}`)
-        if (searchSettings.ignoredFields.length) warnOnce(`Ignored unsupported web_search tool field(s): ${fieldList(searchSettings.ignoredFields)}`)
-        const ineligible = hostedSearchIneligibility(body, searchSettings, config)
-        if (ineligible && config.webSearchMode === "hosted") logger.log(`  search: providers (${ineligible})`)
-        // Hosted search runs before any output, and does not use the requested
-        // model's transport, so it also serves Chat-transport models.
-        const hosted = ineligible ? { message: null } : await hostedSearch({
-          body, settings: searchSettings, model: request.model, token: authToken, signal,
-        })
-        if (hosted.message) {
-          const headers = { "x-copilot-search-model": hosted.searchModel }
-          if (request.stream) {
-            beginStream(res, headers)
-            writer = makeWriter()
-            await emitHostedMessage(hosted.message, (type, data) => writer.event(type, data))
-          } else jsonResponse(res, 200, hosted.message, headers)
-          outcome = "complete"
-          return
-        }
-        if (!nativeTransport) {
-          throw new ProxyError(501, "Provider web search requires native Messages transport; this request is not eligible for hosted search", "api_error")
-        }
-        if (searchSettings.userLocation) warnOnce("Provider web search ignored the web_search user_location")
-        if (request.stream) { beginStream(res); writer = makeWriter() }
-        const result = await runWebSearch({
-          request, preparedRequest: { ...preparedSearch, model }, config, signal, priorUsage: hosted.usage,
-          search: (query, options) => search.search(query, { ...options, token: authToken }),
-          emit: writer ? (type, data) => writer.event(type, data) : undefined,
-          generate: async (payload, onEvent) => {
-            const generation = await copilot.request(`/v1/messages${url.search}`, payload, { token: authToken, headers: req.headers, signal })
-            try {
-              if (!generation.response.ok) throw await upstreamError(generation)
-              return await nativeMessage(generation, onEvent, config)
-            } finally { generation.dispose() }
-          },
-        })
-        if (!writer) jsonResponse(res, 200, result)
-        outcome = "complete"
-        return
-      }
-      const payload = nativeTransport ? request : buildChatRequest(request, { model, modelInfo, forwardReasoning: config.forwardReasoning })
-      const path = nativeTransport ? `/v1/messages${url.search}` : "/chat/completions"
-      upstream = await copilot.request(path, payload, { token: authToken, headers: req.headers, signal })
-      if (!upstream.response.ok) throw await upstreamError(upstream)
-      if (!request.stream) {
-        const text = await upstream.text()
-        let data
-        try { data = JSON.parse(text) } catch { throw new ProxyError(502, "Copilot returned invalid response JSON") }
-        if (nativeTransport) {
-          if (data?.type !== "message" || !Array.isArray(data.content) || typeof data.stop_reason !== "string") {
-            throw new ProxyError(502, "Copilot returned an incomplete native message")
-          }
-          for (const block of data.content) validateNativeContentBlock(block)
-          res.writeHead(upstream.response.status, responseHeaders(upstream.response.headers))
-          res.end(text)
-        } else jsonResponse(res, 200, translateResponseToAnthropic(data, body.model), responseHeaders(upstream.response.headers))
-        outcome = "complete"
-        return
-      }
-      if (!upstream.response.headers.get("content-type")?.includes("text/event-stream")) {
-        throw new ProxyError(502, "Copilot returned a non-SSE payload for a streaming request")
-      }
-      beginStream(res, responseHeaders(upstream.response.headers))
-      writer = makeWriter()
-      if (nativeTransport) {
-        const state = new NativeMessageState()
-        const terminal = await consumeSSE(upstream, async (frame) => {
-          let done = false
-          if (frame.data !== null) done = state.accept(parseSSEData(frame), frame.event)
-          // An event cut off at EOF still needs its blank line, or the next
-          // event written (such as an error) would join its last line.
-          await writer.write(frame.unterminated ? `${frame.raw}\n\n` : frame.raw)
-          return done
-        }, config.maxEventBytes)
-        if (!terminal) throw new ProxyError(502, "Copilot stream ended before a complete message_stop")
-        outcome = state.error ? "upstream error" : "complete"
-      } else {
-        const frames = []
-        const translator = createStreamTranslator(body.model, { write(frame) { frames.push(frame); return true } })
-        const flush = async () => { for (const frame of frames.splice(0)) await writer.write(frame) }
-        const terminal = await consumeSSE(upstream, async (frame) => {
-          if (frame.data === null) return false
-          const done = translator.processChunk(frame.data === "[DONE]" ? "[DONE]" : parseSSEData(frame))
-          await flush()
-          return done
-        }, config.maxEventBytes)
-        if (!terminal) { translator.processChunk(null); await flush() }
-        outcome = "complete"
-      }
+      if (modelsRoute) await listModels(ctx)
+      else await handleMessages(ctx, url, route === "/v1/messages/count_tokens")
     } catch (error) {
       if (signal.aborted || res.destroyed) {
         if (!res.destroyed) res.destroy()
         return
       }
-      if (inference) logger.error(`Proxy request failed: ${error.status ?? 500} ${error.name}`)
-      if (writer && res.headersSent) {
-        writer.stopPings()
-        await writer.event("error", errorEnvelope(error))
+      if (ctx.inference) logger.error(`Proxy request failed: ${error.status ?? 500} ${error.name}`)
+      if (ctx.writer && res.headersSent) {
+        ctx.writer.stopPings()
+        await ctx.writer.event("error", errorEnvelope(error))
       } else if (!res.headersSent) {
         const status = Number.isInteger(error.status) ? error.status : 500
         const headers = { ...error.headers, ...(!req.complete ? { connection: "close" } : {}) }
-        if (nativeTransport && error.rawBody !== undefined) {
+        if (ctx.nativeTransport && error.rawBody !== undefined) {
           res.writeHead(status, headers)
           res.end(error.rawBody)
         } else {
@@ -373,11 +397,11 @@ export function createProxyServer({
         }
       } else res.destroy()
     } finally {
-      upstream?.dispose()
-      if (writer) await writer.close()
+      ctx.upstream?.dispose()
+      if (ctx.writer) await ctx.writer.close()
       if (!res.destroyed && !res.writableEnded) res.end()
       controller.abort(abortError("Request finished"))
-      if (inference) logger.log(`  <- ${outcome}`)
+      if (ctx.inference) logger.log(`  <- ${ctx.outcome}`)
     }
   }
 
