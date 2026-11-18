@@ -559,7 +559,11 @@ test("Windows ACL setup failure refuses secret writes and cleans owned temporary
   await credentials()
   const { filePath, dir } = await fixture(t)
   await writeFile(filePath, "original fixture")
+  // Initialize Node's random generator before SystemRoot changes: on Node 26,
+  // OpenSSL locates Windows' entropy source through SystemRoot on first use.
   const code = `import assert from "node:assert/strict";
+    import { randomUUID } from "node:crypto";
+    randomUUID();
     process.env.SystemRoot = process.env.COPILOT_TEST_ROOT;
     const { savePrivateJson } = await import(process.env.COPILOT_TEST_MODULE);
     await assert.rejects(savePrivateJson(process.env.COPILOT_TEST_FILE, {access_token:"never-written-fixture"}),
