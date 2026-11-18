@@ -82,6 +82,12 @@ test("exports the requested error and provider factory", () => {
   assert.equal(error.errorCode, "unavailable")
 })
 
+test("provider settings get the proxy's configuration defaults and validation", () => {
+  assert.throws(() => createSearchProvider({ config: { searchMaxResults: 0 } }), /WEB_SEARCH_MAX_RESULTS/)
+  assert.throws(() => createSearchProvider({ config: { websearchProvider: "brave" } }), /WEBSEARCH_PROVIDER/)
+  assert.throws(() => createSearchProvider({ config: { searchTimeout: 50 } }), /Unknown proxy configuration/)
+})
+
 test("MCP JSON returns the original result shape and default request arguments", async () => {
   const { search, calls } = harness(() => mcp({ results: [{ ...hit(), publish_date: "2026-01-02" }] }))
   assert.deepEqual(await search(QUERY), [{

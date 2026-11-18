@@ -1,4 +1,4 @@
-import { PREFERRED_SEARCH_PROVIDERS } from "./config.mjs"
+import { PREFERRED_SEARCH_PROVIDERS, readConfig } from "./config.mjs"
 
 const EXA_URL = "https://mcp.exa.ai/mcp"
 const PARALLEL_URL = "https://search.parallel.ai/mcp"
@@ -312,17 +312,8 @@ function instantResults(text, maxResults) {
 }
 
 export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}, logger = console, githubMcpUrl } = {}) {
-  const settings = {
-    braveApiKey: config.braveApiKey ?? "",
-    serperApiKey: config.serperApiKey ?? "",
-    exaApiKey: config.exaApiKey ?? "",
-    parallelApiKey: config.parallelApiKey ?? "",
-    websearchProvider: config.websearchProvider ?? "",
-    searchMaxResults: config.searchMaxResults ?? 5,
-    searchTimeoutMs: config.searchTimeoutMs ?? 25000,
-    searchTotalTimeoutMs: config.searchTotalTimeoutMs ?? 60000,
-    searchMaxResponseBytes: config.searchMaxResponseBytes ?? 2097152,
-  }
+  // A partial configuration gets the proxy's own defaults and validation.
+  const settings = readConfig({}, config)
   let githubRefusalReported = false
   const maxResults = settings.searchMaxResults
   const request = (url, options, signal) => requestText(fetchImpl, url, options, settings, signal)
