@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { randomUUID, timingSafeEqual, createHmac } from "node:crypto"
+import { timingSafeEqual, createHmac } from "node:crypto"
 import { once } from "node:events"
 import { createServer } from "node:http"
 import { resolve } from "node:path"
@@ -8,11 +8,11 @@ import { getProxyKey, readAuthToken } from "./credentials.mjs"
 import { readConfig } from "./config.mjs"
 import { adaptToModel, claudeApiId, createModelCatalog, isRoutable, withoutSafeguards } from "./models.mjs"
 import { buildChatRequest, createStreamTranslator, translateResponseToAnthropic } from "./chat.mjs"
-import { abortError, parseRetryAfterMs, ProxyError } from "./runtime.mjs"
+import { abortError, ProxyError } from "./runtime.mjs"
 import { consumeSSE, createSSEWriter, NativeMessageState, parseSSEData, validateNativeContentBlock } from "./sse.mjs"
 import { createSearchProvider } from "./search-providers.mjs"
 import { createWebSearchService, extractWebSearchConfig, prepareSearchRequest, runWebSearch } from "./search.mjs"
-import { buildHostedSearchRequest, emitHostedMessage, hostedSearchIneligibility, hostedSearchMessage, rejectedHostedUsage } from "./hosted-search.mjs"
+import { createHostedSearch, emitHostedMessage, hostedSearchIneligibility } from "./hosted-search.mjs"
 import { createUpstreamClient, errorEnvelope, errorType, responseHeaders, upstreamError } from "./upstream.mjs"
 
 export { createStreamTranslator, translateMessages, translateContentPart } from "./chat.mjs"
@@ -171,62 +171,7 @@ export function createProxyServer({
     if (warned.size < 256) warned.add(message)
     logger.warn(message)
   }
-
-  // After a refusal or rate limit, skip hosted search for a while instead of
-  // paying for a failing call before every provider search.
-  let hostedPausedUntil = 0
-  function pauseHostedSearch(error) {
-    const hint = parseRetryAfterMs(error?.headers?.["retry-after"] ?? null)
-    const pause = error?.status === 429 ? hint ?? 60000
-      : error?.status === 503 ? hint ?? 0
-      : [401, 403, 404].includes(error?.status) ? 300000 : 0
-    if (pause > 0) hostedPausedUntil = Math.max(hostedPausedUntil, Date.now() + Math.min(pause, 3600000))
-    return pause
-  }
-
-  // Answer a search-only request with one Copilot /responses call using the
-  // hosted web_search tool. Returns { message } on success. Otherwise returns
-  // { message: null, usage } so the caller uses provider search; `usage` holds
-  // the tokens and searches of a hosted answer that was received but rejected.
-  async function hostedSearch({ body, settings, model, token, signal }) {
-    const paused = hostedPausedUntil - Date.now()
-    if (paused > 0) {
-      logger.log(`  search: providers (hosted search paused for ${Math.ceil(paused / 1000)}s)`)
-      return { message: null }
-    }
-    let upstream
-    let data
-    try {
-      const info = (await catalog.get(token, signal)).find((entry) => entry.id === config.webSearchModel)
-      if (!info || !isRoutable(info) || !info.supported_endpoints?.includes("/responses")) {
-        warnOnce(`Hosted web search model ${config.webSearchModel} is unavailable for /responses; using provider search`)
-        return { message: null }
-      }
-      // No incoming headers: anthropic-* headers do not apply to /responses.
-      upstream = await hostedClient.request("/responses", buildHostedSearchRequest(body, settings, config, info), { token, headers: {}, signal })
-      if (!upstream.response.ok) throw await upstreamError(upstream)
-      try { data = JSON.parse(await upstream.text()) } catch { throw new ProxyError(502, "Copilot hosted search returned invalid JSON") }
-      let message
-      try {
-        message = hostedSearchMessage(data, { id: `msg_${randomUUID()}`, model, settings })
-      } catch (error) {
-        error.hostedReason = error.message
-        throw error
-      }
-      const searches = message.usage.server_tool_use.web_search_requests
-      logger.log(`  search: hosted ${info.id} (${searches} ${searches === 1 ? "search" : "searches"})`)
-      return { message, searchModel: info.id }
-    } catch (error) {
-      signal.throwIfAborted()
-      const pause = pauseHostedSearch(error)
-      // Upstream messages are never logged; hostedReason is written locally.
-      logger.warn(`Hosted web search failed (${error.hostedReason ?? error.status ?? error.name}); using provider search` +
-        (pause > 0 ? ` for the next ${Math.ceil(pause / 1000)}s` : ""))
-      return { message: null, usage: rejectedHostedUsage(data) }
-    } finally {
-      upstream?.dispose()
-    }
-  }
+  const hostedSearch = createHostedSearch({ catalog, client: hostedClient, config, logger, warnOnce })
 
   async function handle(req, res) {
     const controller = new AbortController()
