@@ -38,10 +38,12 @@ export function extractWebSearchConfig(tools, config) {
   if (tool.allowed_domains != null && tool.blocked_domains != null) {
     throw new ProxyError(400, "Search cannot specify both allowed_domains and blocked_domains", "invalid_request_error")
   }
-  const supported = new Set(["type", "name", "max_uses", "allowed_domains", "blocked_domains", "user_location", "cache_control"])
-  for (const name of Object.keys(tool)) {
-    if (!supported.has(name)) throw new ProxyError(400, `Search emulation does not support tool field ${name}`, "invalid_request_error")
-  }
+  // search_profile is an optional hint from Claude Code 2.1.303+ that only
+  // Anthropic's search service interprets. Other unrecognized fields are ignored
+  // and reported rather than rejected: Claude Code adds optional fields over
+  // time, and rejecting them breaks WebSearch outright.
+  const supported = new Set(["type", "name", "max_uses", "allowed_domains", "blocked_domains", "user_location", "cache_control", "search_profile"])
+  const ignoredFields = Object.keys(tool).filter((name) => !supported.has(name)).sort()
   const requested = tool.max_uses ?? 5
   if (!Number.isSafeInteger(requested) || requested < 0) {
     throw new ProxyError(400, "web_search max_uses must be a nonnegative integer", "invalid_request_error")
@@ -50,6 +52,7 @@ export function extractWebSearchConfig(tools, config) {
     requested, maxUses: Math.min(requested, config.searchMaxUses),
     allowedDomains: domainList(tool.allowed_domains),
     blockedDomains: domainList(tool.blocked_domains),
+    ignoredFields,
   }
 }
 

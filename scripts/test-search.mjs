@@ -283,6 +283,17 @@ test("documented nullable search options mean unset rather than unsupported rest
   }
 })
 
+// Claude Code 2.1.303 can add search_profile to its nested WebSearch tool, and
+// later releases may add more optional fields. Rejecting them broke WebSearch.
+test("optional search tool hints are accepted; unrecognized fields are ignored and reported", () => {
+  const extract = exported("extractWebSearchConfig")
+  const profiled = extract([{ name: "web_search", type: "web_search_20250305", max_uses: 8, search_profile: "default" }], searchConfig())
+  assert.equal(profiled.maxUses, 8)
+  assert.deepEqual(profiled.ignoredFields, [])
+  const future = extract([{ name: "web_search", type: "web_search_20250305", future_hint: true, another: 1 }], searchConfig())
+  assert.deepEqual(future.ignoredFields, ["another", "future_hint"])
+})
+
 test("zero-use search cannot silently erase a required tool choice when no tools remain", async () => {
   for (const tool_choice of [{ type: "any" }, { type: "tool", name: "unavailable" }]) {
     await assert.rejects(exported("runWebSearch")({
