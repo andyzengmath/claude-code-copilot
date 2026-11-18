@@ -1,4 +1,4 @@
-import { chmod, open, readFile, rename, link, unlink, stat } from "node:fs/promises"
+import { chmod, open, readFile, rename, link, unlink, stat, mkdir, rmdir } from "node:fs/promises"
 import { randomBytes, randomUUID } from "node:crypto"
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve } from "node:path"
@@ -89,7 +89,8 @@ export async function readAuthToken(filePath = authFilePath()) {
 }
 
 let windowsSid
-async function protectWindowsFile(filePath) {
+// `permissions` is "(F)" for a file, or "(OI)(CI)(F)" for a directory whose new entries inherit it.
+async function protectWindowsPath(path, permissions) {
   const system32 = join(process.env.SystemRoot || "C:\\Windows", "System32")
   windowsSid ??= execFileAsync(join(system32, "whoami.exe"), ["/user", "/fo", "csv", "/nh"], {
     windowsHide: true, timeout: 5000,
@@ -100,14 +101,14 @@ async function protectWindowsFile(filePath) {
   })
   try {
     const sid = await windowsSid
-    // The file is still EMPTY. Reset explicit default-token grants before
-    // removing inherited access and granting only the current user.
+    // Nothing secret has been written yet. Reset explicit default-token grants
+    // before removing inherited access and granting only the current user.
     // execFile arguments (not shell interpolation) safely handle spaces/metacharacters.
-    await execFileAsync(join(system32, "icacls.exe"), [filePath, "/reset"], {
+    await execFileAsync(join(system32, "icacls.exe"), [path, "/reset"], {
       windowsHide: true, timeout: 5000,
     })
     await execFileAsync(join(system32, "icacls.exe"), [
-      filePath, "/inheritance:r", "/grant:r", `*${sid}:(F)`,
+      path, "/inheritance:r", "/grant:r", `*${sid}:${permissions}`,
     ], { windowsHide: true, timeout: 5000 })
   } catch (error) {
     if (!error.code && !error.killed && !error.signal) throw error
@@ -124,6 +125,14 @@ async function removeOwnedTemp(filePath) {
   }
 }
 
+async function removeOwnedDirectory(directory) {
+  try {
+    await rmdir(directory)
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error
+  }
+}
+
 function jsonText(value) {
   try {
     const text = JSON.stringify(value, null, 2)
@@ -135,23 +144,51 @@ function jsonText(value) {
   }
 }
 
-async function privateTemp(target, text) {
-  const temporary = join(dirname(target), `.${basename(target)}.${randomUUID()}.tmp`)
+async function writePrivateFile(filePath, text, protect) {
   // Exclusive creation also ensures cleanup can never remove someone else's temp file.
-  const handle = await open(temporary, "wx", 0o600)
+  const handle = await open(filePath, "wx", 0o600)
   try {
     try {
-      if (process.platform === "win32") await protectWindowsFile(temporary)
-      else await handle.chmod(0o600)
+      await protect(handle)
       await handle.writeFile(text, "utf8")
       await handle.sync()
     } finally {
       await handle.close()
     }
-    return temporary
   } catch (error) {
-    await removeOwnedTemp(temporary)
+    await removeOwnedTemp(filePath)
     throw error
+  }
+}
+
+/** Writes `text` to a new private temporary file; returns its path and how to remove it. */
+async function privateTemp(target, text) {
+  const name = `.${basename(target)}.${randomUUID()}.tmp`
+  if (process.platform !== "win32") {
+    const path = join(dirname(target), name)
+    await writePrivateFile(path, text, (handle) => handle.chmod(0o600))
+    return { path, cleanup: () => removeOwnedTemp(path) }
+  }
+  // A new Windows file starts with its folder's inherited ACL, and a handle
+  // opened before that ACL is replaced keeps its access. So the file is
+  // created in a staging directory that is private before the file exists.
+  const staging = join(dirname(target), name)
+  const path = join(staging, "credential.tmp")
+  await mkdir(staging)
+  try {
+    await protectWindowsPath(staging, "(OI)(CI)(F)")
+    // Protect the file itself too, so its ACL stays private outside the staging directory.
+    await writePrivateFile(path, text, () => protectWindowsPath(path, "(F)"))
+  } catch (error) {
+    await removeOwnedDirectory(staging)
+    throw error
+  }
+  return {
+    path,
+    cleanup: async () => {
+      await removeOwnedTemp(path)
+      await removeOwnedDirectory(staging)
+    },
   }
 }
 
@@ -178,7 +215,7 @@ export async function savePrivateJson(filePath, value) {
     const retryDeadline = Date.now() + 10000
     for (;;) {
       try {
-        await rename(temporary, target)
+        await rename(temporary.path, target)
         break
       } catch (error) {
         if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(error.code) ||
@@ -187,7 +224,7 @@ export async function savePrivateJson(filePath, value) {
       }
     }
   } finally {
-    await removeOwnedTemp(temporary)
+    await temporary.cleanup()
   }
 }
 
@@ -204,12 +241,12 @@ export async function getProxyKey({ filePath = proxyKeyFilePath(), create = true
     try {
       // Hard-link publication is atomic and MUST NOT overwrite an existing winner.
       // Unsupported filesystems fail explicitly rather than risking divergent keys.
-      await link(temporary, target)
+      await link(temporary.path, target)
     } catch (error) {
       if (error.code !== "EEXIST") throw error
     }
     return await readPrivateString(target, "api_key", "proxy API key")
   } finally {
-    await removeOwnedTemp(temporary)
+    await temporary.cleanup()
   }
 }

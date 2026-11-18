@@ -4,7 +4,7 @@ import { existsSync } from "node:fs"
 import fsPromises, { mkdtemp, readFile, writeFile, readdir, rm, stat, chmod, mkdir } from "node:fs/promises"
 import { syncBuiltinESMExports } from "node:module"
 import { homedir, tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
@@ -83,11 +83,7 @@ function hangingRequest(init) {
   })
 }
 
-async function assertPrivate(filePath) {
-  if (process.platform !== "win32") {
-    assert.equal((await stat(filePath)).mode & 0o777, 0o600)
-    return
-  }
+async function windowsAcl(filePath) {
   // Pass the fixture path through the environment, never interpolate it into a shell command.
   const { stdout } = await execFileAsync("powershell.exe", [
     "-NoProfile", "-NonInteractive", "-Command",
@@ -95,12 +91,21 @@ async function assertPrivate(filePath) {
     "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; " +
     "$rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])); " +
     "[pscustomobject]@{ Protected = $acl.AreAccessRulesProtected; " +
-    "OnlyCurrentUser = (@($rules | Where-Object { $_.IdentityReference.Value -ne $sid -or $_.IsInherited }).Count -eq 0); " +
+    "OtherPrincipals = @($rules | Where-Object { $_.IdentityReference.Value -ne $sid }).Count; " +
+    "Inherited = @($rules | Where-Object { $_.IsInherited }).Count; " +
     "RuleCount = $rules.Count } | ConvertTo-Json -Compress",
   ], { env: { ...process.env, COPILOT_TEST_ACL_PATH: filePath } })
-  const acl = JSON.parse(stdout)
+  return JSON.parse(stdout)
+}
+
+async function assertPrivate(filePath) {
+  if (process.platform !== "win32") {
+    assert.equal((await stat(filePath)).mode & 0o777, 0o600)
+    return
+  }
+  const acl = await windowsAcl(filePath)
   assert.equal(acl.Protected, true, "credential ACL must disable inherited access")
-  assert.equal(acl.OnlyCurrentUser, true, "credential ACL must grant only the current user")
+  assert.equal(acl.OtherPrincipals + acl.Inherited, 0, "credential ACL must grant only the current user")
   assert.ok(acl.RuleCount > 0, "credential ACL must retain owner access")
 }
 
@@ -162,7 +167,7 @@ test("Windows credential protection removes unexpected explicit grants before pu
   let seeded = 0
   const interceptedOpen = t.mock.method(fsPromises, "open", async (file, ...options) => {
     const handle = await originalOpen(file, ...options)
-    if (typeof file === "string" && dirname(file) === dir && file.endsWith(".tmp")) {
+    if (typeof file === "string" && file.startsWith(dir) && file.endsWith(".tmp")) {
       try {
         assert.equal((await handle.stat()).size, 0)
         await execFileAsync(icacls, [file, "/grant:r", "*S-1-1-0:(R)"], { windowsHide: true })
@@ -186,6 +191,47 @@ test("Windows credential protection removes unexpected explicit grants before pu
     interceptedOpen.mock.restore()
     syncBuiltinESMExports()
   }
+})
+
+test("Windows credential temp files never inherit access from a folder other users can read", {
+  skip: process.platform !== "win32",
+}, async (t) => {
+  const { savePrivateJson, getProxyKey } = await credentials()
+  const { dir, filePath } = await fixture(t)
+  const keyPath = join(dir, "key.json")
+  const icacls = join(process.env.SystemRoot || "C:\\Windows", "System32", "icacls.exe")
+  await execFileAsync(icacls, [dir, "/grant", "*S-1-1-0:(OI)(CI)(R)"], { windowsHide: true })
+  const control = join(dir, "control.txt")
+  await writeFile(control, "not secret")
+  assert.ok((await windowsAcl(control)).OtherPrincipals > 0, "new files in the fixture folder must inherit Everyone")
+  await rm(control)
+  const originalOpen = fsPromises.open
+  const atCreation = []
+  const interceptedOpen = t.mock.method(fsPromises, "open", async (file, ...options) => {
+    const handle = await originalOpen(file, ...options)
+    if (typeof file === "string" && file.startsWith(dir) && file.endsWith(".tmp")) {
+      try {
+        // Another user's handle opened now would keep its access after the ACL changes.
+        atCreation.push((await windowsAcl(file)).OtherPrincipals)
+      } catch (error) {
+        await handle.close()
+        throw error
+      }
+    }
+    return handle
+  })
+  syncBuiltinESMExports()
+  try {
+    await savePrivateJson(filePath, { access_token: TOKEN })
+    await getProxyKey({ filePath: keyPath })
+  } finally {
+    interceptedOpen.mock.restore()
+    syncBuiltinESMExports()
+  }
+  assert.deepEqual(atCreation, [0, 0])
+  await assertPrivate(filePath)
+  await assertPrivate(keyPath)
+  assert.deepEqual((await readdir(dir)).sort(), ["auth fixture & private.json", "key.json"])
 })
 
 test("readers never observe partial JSON during replacements", async (t) => {
