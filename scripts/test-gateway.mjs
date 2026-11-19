@@ -1616,6 +1616,25 @@ test("unknown search tool fields and an unused user_location are reported once, 
   ])
 })
 
+test("once-only warnings are remembered up to 256; later ones are still logged, every time", async (t) => {
+  const warnings = []
+  // On the Chat transport, a search hosted search cannot answer gets 501 before any Copilot call.
+  const f = await fixture(t, () => assert.fail("no inference"), {
+    config: { transport: "chat", webSearchMode: "providers" },
+    logger: { log() {}, error() {}, warn: (line) => warnings.push(line) },
+  })
+  const search = async (field) => {
+    const response = await f.request(nestedWebSearch({}, { [field]: true }))
+    await response.arrayBuffer()
+    assert.equal(response.status, 501)
+  }
+  for (let index = 0; index < 256; index++) await search(`field_${index}`)
+  for (const field of ["field_0", "field_256", "field_256"]) await search(field)
+  const logged = (field) => warnings.filter((line) => line.includes(`"${field}"`)).length
+  assert.equal(logged("field_0"), 1)
+  assert.equal(logged("field_256"), 2)
+})
+
 test("provider search forwards only a plain custom web_search tool to Claude", async (t) => {
   const rounds = []
   const f = await fixture(t, (call) => emulationRound(JSON.parse(call.body), rounds), {
