@@ -255,6 +255,7 @@ test("native forwarding preserves semantic body fields and Anthropic headers", a
   assert.equal(new Headers(seen.headers).get("anthropic-beta"), "fixture-beta-1,fixture-beta-2")
   assert.equal(new Headers(seen.headers).get("anthropic-version"), "2023-06-01")
   assert.equal(new Headers(seen.headers).get("authorization"), `Bearer ${token}`)
+  assert.equal(new Headers(seen.headers).get("copilot-vision-request"), "true")
   assert.equal(new Headers(seen.headers).has("x-api-key"), false)
 })
 
@@ -371,6 +372,18 @@ test("an inference 404 is never replayed against a second transport", async (t) 
   assert.equal((await f.request()).status, 404)
   assert.deepEqual(dispatched, ["/v1/messages"])
 })
+
+for (const status of [400, 404]) {
+  test(`a ${status} is sent once even when retries are enabled`, async (t) => {
+    let attempts = 0
+    const f = await fixture(t, () => {
+      attempts++
+      return Response.json({ type: "error", error: { type: "invalid_request_error", message: "refused" } }, { status })
+    }, { config: { maxRetries: 3 } })
+    assert.equal((await f.request()).status, status)
+    assert.equal(attempts, 1)
+  })
+}
 
 for (const [name, dispatch, status] of [
   ["a network failure", () => { throw new TypeError("fetch failed") }, 502],
@@ -586,23 +599,46 @@ test("same-buffer chat usage and DONE tails are processed before finalization", 
   assert.equal(cancelled, true)
 })
 
-test("a Retry-After beyond the retry budget is returned without clipping or replay", async (t) => {
-  let attempts = 0
-  const f = await fixture(t, () => {
-    attempts++
-    return Response.json({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }, {
-      status: 429, headers: { "retry-after": "90" },
-    })
-  }, { config: { maxRetries: 3, retryBudgetMs: 50 } })
-  const response = await f.request()
-  assert.equal(response.status, 429)
-  assert.equal(response.headers.get("retry-after"), "90")
-  assert.equal(attempts, 1)
-  const next = await f.request()
-  assert.equal(next.status, 429)
-  assert.equal(next.headers.get("retry-after"), "90")
-  assert.equal(attempts, 1)
-})
+for (const status of [429, 503]) {
+  test(`a ${status} Retry-After beyond the retry budget is returned without clipping or replay`, async (t) => {
+    let attempts = 0
+    const f = await fixture(t, () => {
+      attempts++
+      return Response.json({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }, {
+        status, headers: { "retry-after": "90" },
+      })
+    }, { config: { maxRetries: 3, retryBudgetMs: 50 } })
+    const response = await f.request()
+    assert.equal(response.status, status)
+    assert.equal(response.headers.get("retry-after"), "90")
+    assert.equal(attempts, 1)
+    // The hint also holds back the next request instead of sending it.
+    const next = await f.request()
+    assert.equal(next.status, 429)
+    assert.equal(next.headers.get("retry-after"), "90")
+    assert.equal(attempts, 1)
+  })
+}
+
+// The first backoff without Retry-After is 500 to 1000 ms.
+for (const [name, status, headers, minimumMs] of [
+  ["a 429 is retried after its Retry-After", 429, { "retry-after": "0.2" }, 200],
+  ["a 500 is retried after its Retry-After", 500, { "retry-after": "0.2" }, 200],
+  ["a 500 without Retry-After is retried after a backoff", 500, {}, 500],
+]) {
+  test(name, async (t) => {
+    const sent = []
+    const f = await fixture(t, () => {
+      sent.push(performance.now())
+      return sent.length > 1 ? Response.json(message())
+        : Response.json({ type: "error", error: { type: "api_error", message: "busy" } }, { status, headers })
+    }, { config: { maxRetries: 3 } })
+    assert.equal((await f.request()).status, 200)
+    assert.equal(sent.length, 2)
+    const waited = sent[1] - sent[0]
+    assert.ok(waited >= minimumMs - 10, `retried after ${Math.round(waited)} ms`)
+  })
+}
 
 test("inference permits are held until response consumption rather than just headers", { timeout: 2500 }, async (t) => {
   const bodies = []
@@ -822,6 +858,21 @@ test("retry admission cannot dispatch after its budget or retain an abandoned qu
   assert.equal(next.status, 200)
   await next.text()
   assert.deepEqual(dispatched, ["first", "next"])
+})
+
+test("a retry that cannot start within the budget keeps the last response's headers, without its cookies", async (t) => {
+  let attempts = 0
+  const f = await fixture(t, () => {
+    attempts++
+    return Response.json({ type: "error", error: { type: "overloaded_error", message: "busy" } }, {
+      status: 503, headers: { "retry-after": "0", "request-id": "req_budget", "set-cookie": "session=fixture" },
+    })
+  }, { config: { maxRetries: 1, retryBudgetMs: 500, minRequestIntervalMs: 60000 } })
+  const response = await f.request()
+  assert.equal(response.status, 504)
+  assert.equal(response.headers.get("request-id"), "req_budget")
+  assert.equal(response.headers.has("set-cookie"), false)
+  assert.equal(attempts, 1)
 })
 
 for (const streaming of [false, true]) {
