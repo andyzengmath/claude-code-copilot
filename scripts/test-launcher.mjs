@@ -20,7 +20,7 @@ const bash = process.env.COPILOT_TEST_BASH || (process.platform === "win32"
     join(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)", "Git", "bin", "bash.exe"),
   ].find(existsSync)
   : spawnSync("bash", ["--version"], { stdio: "ignore" }).status === 0 ? "bash" : undefined)
-const options = { skip: !bash && "Bash (Git Bash on Windows) is needed for launcher fixtures", timeout: 45000 }
+const options = { skip: !bash && "Bash (Git Bash on Windows) is needed for launcher fixtures", timeout: 120000 }
 
 async function availablePort() {
   const reservation = createServer()
@@ -121,7 +121,8 @@ async function launch(t, env, args = [], trace = false) {
     await shutdownProxy(env)
     await closed
   })
-  const timer = setTimeout(() => child.kill(), 35000)
+  // A launch takes 1-2 s in CI, but over 35 s through the Docker fallback on a loaded Windows machine.
+  const timer = setTimeout(() => child.kill(), 90000)
   try {
     const code = await new Promise((resolve, reject) => {
       child.once("error", reject)
@@ -170,6 +171,45 @@ test("launcher shell tracing cannot print the local API key", options, async (t)
   assert.equal(result.code, 0)
   assert.equal(result.stdout.includes(f.key), false)
   assert.equal(result.stderr.includes(f.key), false)
+})
+
+test("launcher passes the local API key in no command line, which other local users can list", options, async (t) => {
+  const port = await availablePort()
+  const key = `argv-fixture-key-${randomUUID()}`
+  const { env, directory } = await setup(t, port, key)
+  env.TEST_ARGV_LOG = join(directory, "argv.log")
+  env.TEST_REAL_ENV = spawnSync(bash, ["-c", "command -v env"], { encoding: "utf8" }).stdout.trim()
+  const logged = (name, body) => `#!/bin/bash
+{ printf '<<${name}>>'; printf ' %q' "$@"; printf '\\n'; } >> "$TEST_ARGV_LOG"
+${body}
+`
+  // Docker is available but fails to start, so the probes, Docker, the Node fallback and Claude all run.
+  const wrappers = {
+    node: `if [[ "$#" -eq 1 && "$1" == */proxy.mjs ]]; then
+  exec "$TEST_REAL_NODE" --import "$TEST_PROXY_HOOK" "$@"
+fi
+exec "$TEST_REAL_NODE" "$@"`,
+    docker: `if [[ "$1" == info || ( "$1" == compose && "$2" == version ) ]]; then exit 0; fi
+exit 1`,
+    curl: "exit 1",
+    env: 'exec "$TEST_REAL_ENV" "$@"',
+    claude: 'exec "$TEST_REAL_NODE" "$TEST_CLAUDE_APP" "$@"',
+  }
+  for (const [name, body] of Object.entries(wrappers)) {
+    await writeFile(join(directory, name), logged(name, body), { mode: 0o755 })
+  }
+  // Git Bash puts its own directories, which have env and curl, ahead of the inherited PATH.
+  env.TEST_WRAPPERS = process.platform === "win32"
+    ? spawnSync(bash, ["-c", 'cygpath -u "$0"', directory], { encoding: "utf8" }).stdout.trim() : directory
+  await writeFile(join(directory, "path.sh"), 'PATH="$TEST_WRAPPERS:$PATH"\n')
+  env.BASH_ENV = `${env.TEST_WRAPPERS}/path.sh`
+  const result = await launch(t, env)
+  assert.equal(result.code, 0, result.stderr)
+  assert.equal(JSON.parse(await readFile(env.TEST_CLIENT_RESULT, "utf8")).keyAccepted, true)
+  const calls = (await readFile(env.TEST_ARGV_LOG, "utf8")).trim().split("\n")
+  const names = new Set(calls.map((line) => line.match(/^<<(\w+)>>/)?.[1]))
+  for (const name of ["node", "docker", "env", "claude"]) assert.ok(names.has(name), `${name} was not run`)
+  for (const line of calls) assert.equal(line.includes(key), false, `key in argv: ${line.slice(0, 120)}`)
 })
 
 for (const status of [404, 500, 200]) {
