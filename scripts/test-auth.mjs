@@ -55,10 +55,11 @@ function scenario({ deviceData = device(), polls = [{ access_token: TOKEN }],
   const options = {
     now: () => time,
     sleep: async (ms) => { sleeps.push(ms); time += ms },
-    // A real timer, unlike the fake clock above. Tests with a hanging request
-    // wait for it to fire. Others must finish real file I/O before it does:
-    // 100ms failed intermittently under load (a credential read took 374ms).
-    timeoutMs: 1000,
+    // A real timer, unlike the fake clock above. A test with a hanging request
+    // waits for it to fire, so it is short there. Other tests must finish real
+    // file I/O before it fires: a credential read inside a request took over a
+    // second on a loaded Windows machine, which 1000ms did not always allow.
+    timeoutMs: [deviceReply, userReply, modelsReply, ...polls].includes(hangingRequest) ? 1000 : 10000,
     fetchImpl: async (url, init) => {
       const path = new URL(url).pathname
       assert.ok(init.signal instanceof AbortSignal, "every request must have an abort signal")
