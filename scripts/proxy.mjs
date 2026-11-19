@@ -2,6 +2,7 @@
 import { timingSafeEqual, createHmac } from "node:crypto"
 import { once } from "node:events"
 import { createServer } from "node:http"
+import { createServer as createTcpServer } from "node:net"
 import { resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { getProxyKey, readAuthToken } from "./credentials.mjs"
@@ -461,6 +462,26 @@ export function createProxyServer({
   return server
 }
 
+// Clients can resolve localhost to ::1. Holding [::1] on the same port keeps
+// another process from taking it and receiving their key and prompts.
+async function holdIPv6Loopback(server, port) {
+  // The socket options http.Server gives its own connections.
+  const loopback = createTcpServer({ allowHalfOpen: true, noDelay: true }, (socket) => server.emit("connection", socket))
+  try {
+    loopback.listen(port, "::1")
+    await once(loopback, "listening")
+  } catch (error) {
+    if (!["EADDRNOTAVAIL", "EAFNOSUPPORT"].includes(error.code)) {
+      const problem = error.code === "EADDRINUSE" ? `another process is listening on [::1]:${port}`
+        : `cannot listen on [::1]:${port} (${error.code ?? error.name})`
+      console.warn(`Warning: ${problem}. Clients using http://localhost:${port} may reach another process; use http://127.0.0.1:${port} instead.`)
+    }
+    return null
+  }
+  server.once("close", () => loopback.close())
+  return loopback
+}
+
 export async function startServer() {
   const args = process.argv.slice(2)
   if (args.length) {
@@ -482,11 +503,14 @@ export async function startServer() {
     if (error.code === "EADDRINUSE") throw new Error(`Port ${config.port} is already in use; stop the old proxy or choose COPILOT_PROXY_PORT`)
     throw error
   }
-  console.log(`Claude Code / GitHub Copilot proxy listening on ${config.host}:${server.address().port}`)
+  const port = server.address().port
+  const loopback = config.host === "127.0.0.1" ? await holdIPv6Loopback(server, port) : null
+  console.log(`Claude Code / GitHub Copilot proxy listening on ${config.host}:${port}`)
   console.log(`Transport: ${config.transport}; local API key required (retrieve with --print-api-key)`)
   const stop = () => {
     shutdown.abort(abortError("Proxy is shutting down"))
     server.close()
+    loopback?.close()
     const timer = setTimeout(() => server.closeAllConnections(), 5000)
     timer.unref()
     server.once("close", () => clearTimeout(timer))
