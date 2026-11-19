@@ -1201,6 +1201,28 @@ test("hosted search shares the configured spacing between Copilot requests", asy
   assert.ok(sent[1].at - sent[0].at >= 350, `hosted search waited ${Math.round(sent[1].at - sent[0].at)} ms`)
 })
 
+test("hosted search, provider search and a plain request each release the only admission slot", { timeout: 5000 }, async (t) => {
+  const paths = []
+  const rounds = []
+  const f = await fixture(t, (call) => {
+    paths.push(call.url.pathname)
+    if (call.url.pathname === "/responses") return Response.json(hostedReply())
+    const body = JSON.parse(call.body)
+    return body.tools ? emulationRound(body, rounds) : Response.json(message())
+  }, { ...withLuna, config: { maxConcurrentRequests: 1, queueTimeoutMs: 200 }, searchProvider: async () => [providerResult] })
+  const hosted = await f.request(nestedWebSearch({ stream: false }))
+  assert.equal(hosted.status, 200)
+  assert.equal((await hosted.json()).content.at(-1).text, "Node 26 is LTS.")
+  // blocked_domains require provider search.
+  const provider = await f.request(nestedWebSearch({ stream: false }, { blocked_domains: ["example.org"] }))
+  assert.equal(provider.status, 200)
+  assert.equal((await provider.json()).content.at(-1).text, "Emulated answer")
+  const plain = await f.request()
+  assert.equal(plain.status, 200)
+  assert.equal((await plain.json()).content[0].text, "hello")
+  assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages", "/v1/messages"])
+})
+
 test("a rejected hosted answer falls back, and its tokens and searches are still reported", async (t) => {
   // Without a completed search, with a search but no answer, and cut off at
   // max_output_tokens before any search completed.
