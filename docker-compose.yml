@@ -2,6 +2,12 @@ services:
   proxy:
     build: .
     restart: always
+    # The proxy writes no files and needs no privileges. Root keeps only
+    # DAC_OVERRIDE, to read the credential files, which the host user owns (0600).
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
     ports:
       - "127.0.0.1:${COPILOT_PROXY_PORT:-18080}:18080"
     volumes:
