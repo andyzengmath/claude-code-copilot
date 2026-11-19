@@ -1043,6 +1043,7 @@ for (const [name, status, headers, paused] of [
   ["a 429 without Retry-After", 429, {}, true],
   ["a 429 with a short Retry-After", 429, { "retry-after": "5" }, true],
   ["a 500", 500, {}, false],
+  ["a 504", 504, {}, false],
 ]) {
   test(`after ${name}, the next search ${paused ? "skips hosted search at once" : "tries hosted search again"}`, async (t) => {
     const paths = []
@@ -1062,6 +1063,106 @@ for (const [name, status, headers, paused] of [
     assert.deepEqual(paths, paused ? ["/v1/messages", "/v1/messages"] : ["/responses", "/v1/messages", "/v1/messages"])
   })
 }
+
+test("hosted search pauses for the Retry-After period, at most an hour", async (t) => {
+  let now = Date.now()
+  t.mock.method(Date, "now", () => now)
+  for (const [status, retryAfter, pauseMs, logged] of [
+    [429, "0.05", 50, "1s"],
+    [503, "2", 2000, "2s"],
+    [429, "999999", 3600000, "3600s"],
+  ]) {
+    const name = `${status} with Retry-After ${retryAfter}`
+    const paths = []
+    const rounds = []
+    const warnings = []
+    const f = await fixture(t, (call) => {
+      paths.push(call.url.pathname)
+      if (call.url.pathname === "/responses") return Response.json({ error: { message: "busy" } }, { status, headers: { "retry-after": retryAfter } })
+      return emulationRound(JSON.parse(call.body), rounds)
+    }, { ...withLuna, searchProvider: async () => [providerResult], logger: warningsTo(warnings) })
+    const triesHosted = async (elapsed) => {
+      now += elapsed
+      paths.length = 0
+      rounds.length = 0
+      assert.equal(parsedEvents(await (await f.request(nestedWebSearch())).text()).at(-1).type, "message_stop", name)
+      return paths[0] === "/responses"
+    }
+    assert.equal(await triesHosted(0), true, name)
+    assert.deepEqual(warnings, [`Hosted web search failed (${status}); using provider search for the next ${logged}`], name)
+    assert.equal(await triesHosted(pauseMs - 1), false, `${name}: paused`)
+    assert.equal(await triesHosted(2), true, `${name}: tried again after the pause`)
+  }
+})
+
+test("a hosted search timeout pauses hosted search for a minute", { timeout: 5000 }, async (t) => {
+  let now = Date.now()
+  t.mock.method(Date, "now", () => now)
+  const never = () => new Promise(() => {})
+  const stalledBody = () => new Response(new ReadableStream(), { headers: { "content-type": "application/json" } })
+  // The search deadline, and the hosted client's own timeout for one wait when the request timeout is shorter.
+  for (const [name, config, respond, logged] of [
+    ["the search deadline", { searchTimeoutMs: 50 }, never, "timed out after 50ms"],
+    ["no response within the request timeout", { requestTimeoutMs: 200, searchTimeoutMs: 5000 }, never, "timed out"],
+    ["a stalled body", { requestTimeoutMs: 200, searchTimeoutMs: 5000 }, stalledBody, "timed out"],
+  ]) {
+    const paths = []
+    const rounds = []
+    const warnings = []
+    const f = await fixture(t, (call) => {
+      paths.push(call.url.pathname)
+      return call.url.pathname === "/responses" ? respond() : emulationRound(JSON.parse(call.body), rounds)
+    }, { ...withLuna, config, searchProvider: async () => [providerResult], logger: warningsTo(warnings) })
+    const triesHosted = async (elapsed) => {
+      now += elapsed
+      paths.length = 0
+      rounds.length = 0
+      assert.equal((await (await f.request(nestedWebSearch({ stream: false }))).json()).content.at(-1).text, "Emulated answer", name)
+      return paths[0] === "/responses"
+    }
+    assert.equal(await triesHosted(0), true, name)
+    assert.deepEqual(warnings, [`Hosted web search ${logged}; using provider search for the next 60s`], name)
+    assert.equal(await triesHosted(59999), false, `${name}: paused`)
+    assert.equal(await triesHosted(2), true, `${name}: tried again after a minute`)
+  }
+})
+
+// The admission gate is shared with Claude requests, so its errors say nothing about /responses.
+test("an error raised before /responses answers neither pauses hosted search nor is logged as its answer", { timeout: 5000 }, async (t) => {
+  let now = Date.now()
+  t.mock.method(Date, "now", () => now)
+  for (const [name, status, config, wait] of [
+    // For Claude's Retry-After of 1.5 s, the gate tells the hosted request "retry-after: 2": 1.501 s later
+    // the gate is open again, while a pause taken from that header would still last.
+    ["the gate's cooldown after a Claude 429", 429, { queueTimeoutMs: 1000 }, 1501],
+    ["a full admission queue", 503, { maxConcurrentRequests: 1, maxQueuedRequests: 0 }, 0],
+  ]) {
+    const paths = []
+    const rounds = []
+    const warnings = []
+    let held
+    const f = await fixture(t, (call) => {
+      paths.push(call.url.pathname)
+      if (call.url.pathname === "/responses") return Response.json(hostedReply())
+      const body = JSON.parse(call.body)
+      if (body.tools) return emulationRound(body, rounds)
+      if (status === 429) return Response.json({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }, { status, headers: { "retry-after": "1.5" } })
+      return new Response(new ReadableStream({ start(controller) { held = controller } }), { headers: { "content-type": "text/event-stream" } })
+    }, { ...withLuna, config, searchProvider: async () => [providerResult], logger: warningsTo(warnings) })
+    const plain = await f.request({ stream: true })
+    const refused = await f.request(nestedWebSearch({ stream: false }))
+    assert.equal(refused.status, status, name)
+    assert.deepEqual(warnings, [`Hosted web search failed before /responses answered (${status}); using provider search`], name)
+    held?.enqueue(new TextEncoder().encode(nativeFrames()))
+    held?.close()
+    await plain.text()
+    now += wait
+    paths.length = 0
+    const response = await f.request(nestedWebSearch({ stream: false }))
+    assert.equal((await response.json()).content.at(-1).text, "Node 26 is LTS.", name)
+    assert.deepEqual(paths, ["/responses"], name)
+  }
+})
 
 test("hosted search shares the configured spacing between Copilot requests", async (t) => {
   const sent = []
@@ -1169,7 +1270,7 @@ test("a hosted answer that trickles in past the search deadline falls back to pr
   assert.equal((await response.json()).content.at(-1).text, "Emulated answer")
   assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages"])
   assert.equal(cancelled, true)
-  assert.deepEqual(warnings, ["Hosted web search timed out after 100ms; using provider search"])
+  assert.deepEqual(warnings, ["Hosted web search timed out after 100ms; using provider search for the next 60s"])
 })
 
 test("a hosted search without a response falls back at the search deadline, not the request timeout", { timeout: 10000 }, async (t) => {
@@ -1206,7 +1307,7 @@ test("a hosted search still waiting for admission at the search deadline falls b
   const plain = await f.request({ stream: true })
   const search = f.request(nestedWebSearch({ stream: false }))
   await until(() => warnings.length > 0)
-  assert.deepEqual(warnings, ["Hosted web search timed out after 100ms; using provider search"])
+  assert.deepEqual(warnings, ["Hosted web search timed out after 100ms; using provider search for the next 60s"])
   held.enqueue(new TextEncoder().encode(nativeFrames()))
   held.close()
   assert.equal(parsedEvents(await plain.text()).at(-1).type, "message_stop")

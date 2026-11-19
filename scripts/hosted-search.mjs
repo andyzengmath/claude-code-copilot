@@ -305,17 +305,25 @@ export async function emitHostedMessage(message, emit) {
   await emit("message_stop", { type: "message_stop" })
 }
 
+// How long hosted search pauses after /responses answered with this error:
+// its Retry-After after 429 (a minute without one) and 503, and five minutes
+// after 401, 403 and 404.
+function refusalPause(response) {
+  const hint = parseRetryAfterMs(response.headers.get("retry-after"))
+  if (response.status === 429) return hint ?? 60000
+  if (response.status === 503) return hint ?? 0
+  return [401, 403, 404].includes(response.status) ? 300000 : 0
+}
+
 // Hosted search for one proxy. `client` is the upstream client for
-// /responses. After a refusal or rate limit, hosted search pauses instead of
-// paying for a failing call before every provider search.
+// /responses. After /responses refuses, rate-limits or times out, hosted
+// search pauses instead of paying for a failing call before every provider search.
 export function createHostedSearch({ catalog, client, config, logger, warnOnce }) {
   let pausedUntil = 0
-  function pause(error) {
-    const hint = parseRetryAfterMs(error?.headers?.["retry-after"] ?? null)
-    const duration = error?.status === 429 ? hint ?? 60000
-      : error?.status === 503 ? hint ?? 0
-      : [401, 403, 404].includes(error?.status) ? 300000 : 0
-    if (duration > 0) pausedUntil = Math.max(pausedUntil, Date.now() + Math.min(duration, 3600000))
+  // Returns the pause, capped at one hour.
+  function pause(ms) {
+    const duration = Math.min(ms, 3600000)
+    if (duration > 0) pausedUntil = Math.max(pausedUntil, Date.now() + duration)
     return duration
   }
 
@@ -347,7 +355,9 @@ export function createHostedSearch({ catalog, client, config, logger, warnOnce }
         token, headers: {}, signal: AbortSignal.any([signal, deadline]),
       })
       if (!upstream.response.ok) throw await upstreamError(upstream)
-      try { data = JSON.parse(await upstream.text()) } catch { throw new ProxyError(502, "Copilot hosted search returned invalid JSON") }
+      // Parse errors only: a failed or timed-out read keeps its own error.
+      const text = await upstream.text()
+      try { data = JSON.parse(text) } catch { throw new ProxyError(502, "Copilot hosted search returned invalid JSON") }
       let message
       try {
         message = hostedSearchMessage(data, { id: `msg_${randomUUID()}`, model, settings })
@@ -360,15 +370,24 @@ export function createHostedSearch({ catalog, client, config, logger, warnOnce }
       return { message, searchModel: info.id }
     } catch (error) {
       signal.throwIfAborted()
-      // The deadline expiring is a hosted failure, not a cancellation.
-      if (deadline?.aborted) {
-        logger.warn(`Hosted web search timed out after ${config.searchTimeoutMs}ms; using provider search`)
-        return { message: null, usage: rejectedHostedUsage(data) }
+      // A timeout is the deadline expiring, which is a hosted failure rather
+      // than a cancellation, or the client's own 504 for one wait; a 504 that
+      // /responses returned is an answer like any other status.
+      const response = upstream?.response
+      const timedOut = deadline !== undefined && (deadline.aborted || (error.status === 504 && response?.ok !== false))
+      // Only /responses' answers and timeouts pause hosted search. An error
+      // raised before /responses answered, such as the shared admission
+      // gate's cooldown or a full queue, says nothing about hosted search.
+      const duration = pause(Math.max(timedOut ? 60000 : 0, response?.ok === false ? refusalPause(response) : 0))
+      const pauseNote = duration > 0 ? ` for the next ${Math.ceil(duration / 1000)}s` : ""
+      if (timedOut) {
+        logger.warn(`Hosted web search timed out${deadline.aborted ? ` after ${config.searchTimeoutMs}ms` : ""}; using provider search${pauseNote}`)
+      } else if (!response) {
+        logger.warn(`Hosted web search failed before /responses answered (${error.status ?? error.name}); using provider search`)
+      } else {
+        // Upstream messages are never logged; hostedReason is written locally.
+        logger.warn(`Hosted web search failed (${error.hostedReason ?? error.status ?? error.name}); using provider search${pauseNote}`)
       }
-      const duration = pause(error)
-      // Upstream messages are never logged; hostedReason is written locally.
-      logger.warn(`Hosted web search failed (${error.hostedReason ?? error.status ?? error.name}); using provider search` +
-        (duration > 0 ? ` for the next ${Math.ceil(duration / 1000)}s` : ""))
       return { message: null, usage: rejectedHostedUsage(data) }
     } finally {
       upstream?.dispose()
