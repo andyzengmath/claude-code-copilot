@@ -346,6 +346,22 @@ test("native errors retain upstream status, body and diagnostic headers", async 
   assert.equal(response.headers.has("content-encoding"), false)
 })
 
+test("a native upstream error that is not an Anthropic envelope gets a JSON envelope", async (t) => {
+  for (const [status, contentType, body, type] of [
+    [502, "text/html", "<html><body><h1>502 Bad Gateway</h1></body></html>", "api_error"],
+    [404, "application/json", JSON.stringify({ error: { message: "model unavailable" } }), "not_found_error"],
+  ]) {
+    const f = await fixture(t, () => new Response(body, { status, headers: { "content-type": contentType, "request-id": "req_gateway" } }))
+    const response = await f.request()
+    assert.equal(response.status, status)
+    assert.equal(response.headers.get("content-type"), "application/json")
+    assert.equal(response.headers.get("request-id"), "req_gateway")
+    const envelope = await response.json()
+    assert.equal(envelope.type, "error")
+    assert.equal(envelope.error.type, type)
+  }
+})
+
 test("an inference 404 is never replayed against a second transport", async (t) => {
   const dispatched = []
   const f = await fixture(t, (call) => {

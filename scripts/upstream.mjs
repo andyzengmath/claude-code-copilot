@@ -36,13 +36,16 @@ export async function upstreamError(upstream) {
   const rawBody = await upstream.text()
   let source
   try { source = JSON.parse(rawBody) } catch { source = null }
-  const type = source?.error?.type ?? errorType(response.status)
+  const anthropic = source?.type === "error" && typeof source.error?.type === "string"
+  const type = typeof source?.error?.type === "string" ? source.error.type : errorType(response.status)
   const message = typeof source?.error?.message === "string" ? source.error.message
     : typeof source?.message === "string" ? source.message
     : rawBody.trim() || `Copilot returned HTTP ${response.status}`
   const error = new ProxyError(response.status, message, type, responseHeaders(response.headers))
-  error.rawBody = rawBody
-  error.envelope = source?.type === "error" && source?.error?.type
+  // The native transport relays an Anthropic error envelope as sent; any
+  // other body, such as a gateway's HTML page, gets a JSON envelope.
+  if (anthropic) error.rawBody = rawBody
+  error.envelope = anthropic
     ? source
     : { type: "error", error: { ...(source?.error && typeof source.error === "object" ? source.error : {}), type, message } }
   if (source?.request_id) error.envelope.request_id = source.request_id
