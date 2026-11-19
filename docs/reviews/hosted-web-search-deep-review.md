@@ -9,6 +9,8 @@ Reviewed on 2026-11-18. PR #11 contains three layers on top of `main` (`ed0e1b4`
   - `d9058c7` credentials and SSE
   - `0b464f4` re-review findings
   - `bcbd634` confirmation-round finding
+- **Merged:** with a merge commit, `43ea788`, so the commits stay bisectable (DR-32).
+- **Follow-up:** PR #12 resolves the deferred findings; see [Follow-up](#follow-up-pr-12).
 
 ## Method
 
@@ -57,7 +59,7 @@ All five are fixed in `0b464f4`.
 - The correctness reviewer confirmed the R-6 fix and voted APPROVE, so five reviewers approve.
 - The security reviewer approves with comments; its only open item is the accepted DR-28 deferral.
 - No critical, high or medium finding remains open.
-- What remains are the deferrals listed below: one low finding (DR-28), two partial refactors (DR-26, DR-30), and two informational items (DR-31, DR-32).
+- What remained were deferrals: one low finding (DR-28), two partial refactors (DR-26, DR-30), and two informational items (DR-31, DR-32). PR #12 resolves them; see [Follow-up](#follow-up-pr-12).
 
 ## Findings
 
@@ -87,16 +89,16 @@ Severity is the highest any source reviewer gave that the evidence supports. "Fi
 | DR-20 | Low | The start and stop events of parallel results interleaved | CODE-REVIEWER-8 | Fixed `902548c` |
 | DR-21 | Low | An unterminated final SSE frame corrupted the error event | CODE-REVIEWER-9 | Fixed `d9058c7` |
 | DR-22 | Low | The `site:` restriction and the `/v1/models` filter were untested | TEST-ENGINEER-10 | Tests added `902548c` |
-| DR-23 | Low | A hosted answer that was received but rejected discarded its usage | CODE-REVIEWER-3 | Fixed `902548c` |
+| DR-23 | Low | A hosted answer that was received but rejected discarded its usage | CODE-REVIEWER-3 | Fixed `902548c`; searches counted `20a3fce` |
 | DR-24 | Low | The launcher sent the key to anything that mimicked `/health` | SECURITY-2 | Fixed `a169a44` |
 | DR-25 | Low | Token files written by `main` (often mode 0644) were not re-permissioned | SECURITY-4 | Fixed `d9058c7` (POSIX) |
-| DR-26 | Low | The `hostedSearch` closure forced a `started` handshake | ARCHITECT-5 | Partly fixed `902548c` |
+| DR-26 | Low | The `hostedSearch` closure forced a `started` handshake | ARCHITECT-5 | Fixed `902548c`, `ff9f96a`, `05858f7` |
 | DR-27 | Low | `allowed_domains` was not enforced on page reads and citations | SECURITY-5 | Fixed `902548c` |
-| DR-28 | Low | Windows credential temp files briefly have inherited ACLs | SECURITY-6 | Deferred; README caution added |
+| DR-28 | Low | Windows credential temp files briefly have inherited ACLs | SECURITY-6 | Fixed `ae8c1ea` |
 | DR-29 | Low | A Docker upgrade left the keyless container running | CRITIC-6 | Fixed `a169a44`, refined `0b464f4` |
-| DR-30 | Info | Provider names and defaults were declared in three places | ARCHITECT-8 | Partly fixed `902548c` |
-| DR-31 | Info | 401/403 denials fell through to third-party providers silently | SECURITY-8 | Logged once; fallback kept |
-| DR-32 | Info | Bundling the PR #8 rewrite hampers bisecting | CRITIC-8 | Merge with a merge commit |
+| DR-30 | Info | Provider names and defaults were declared in three places | ARCHITECT-8 | Fixed `902548c`, `8e1d8ae` |
+| DR-31 | Info | 401/403 denials fell through to third-party providers silently | SECURITY-8 | Logged once; `WEB_SEARCH_THIRD_PARTY=0` opt-out `0ecc4dc` |
+| DR-32 | Info | Bundling the PR #8 rewrite hampers bisecting | CRITIC-8 | Merged with a merge commit `43ea788` |
 | DR-33 | Info | Hosted instructions lacked untrusted-content framing | SECURITY-7 | Fixed `902548c` |
 | DR-34 | Info | `user_location` was still rejected with 400 | CRITIC-7 | Fixed `902548c` |
 
@@ -191,17 +193,28 @@ Hosted search does not call the requested model, so it now runs before any outpu
 - The README example passes the key to curl on stdin.
 - The Docker smoke test checks the container's proof.
 
-## Deferred
+## Follow-up (PR #12)
 
-- **DR-28 (Windows temp ACL window).**
-  - The window exists only when the credential path is in a folder other users can read; the default paths under the user profile are not.
-  - Closing it needs a private staging directory with its own ACL, a larger change to credential publication.
-  - It predates hosted search. The security reviewer accepted the deferral, and the README now advises keeping custom Windows credential paths in a private folder.
-- **DR-26 remainder.** `hostedSearch` still lives inside `createProxyServer`, and `handle()` is still long. The coupling the architect identified, the `started` handshake, is removed. The architect accepted the deferral; extraction will matter when a third search backend is added.
-- **DR-30 remainder.** `createSearchProvider` keeps its own defaults so that unit tests can pass partial configuration.
-- **DR-31.** Third-party providers remain the fallback after a GitHub refusal, as the approved plan requires. The proxy now logs the refusal once.
-- **DR-32.** Merge PR #11 with a merge commit, not a squash, so that the atomic commits stay bisectable.
-- **DR-23 residual.** Searches run by a rejected hosted answer are not counted in `web_search_requests`; only its tokens are reported. This is cosmetic.
+PR #12 resolves the deferred findings, one commit each, and each commit passes the suite on its own.
+
+**Confirmation:** the security reviewer, the architect and the correctness reviewer re-checked their own findings at `91e6a8d`. All are resolved, none of them found a new defect, and all three approve. The correctness reviewer compared 20 request scenarios before and after the handler split: status, headers, bodies and logs were identical.
+
+- **DR-28 (`ae8c1ea`).**
+  - On Windows, the temporary credential file is now created inside a staging folder whose ACL already grants only the current user, so the file never has the folder's inherited access.
+  - The file is still protected on its own, so it stays private after it is renamed or linked into place.
+  - A new test grants Everyone read access to the fixture folder and checks each temporary file's ACL at creation. It fails on the old code.
+  - POSIX is unchanged: mode 0600 at creation has no such window.
+- **DR-26 (`ff9f96a`, `05858f7`).** `createHostedSearch` in `hosted-search.mjs` owns hosted search and its pause. `handle()` keeps the request lifecycle, routing, error handling and cleanup, and delegates to route helpers that share a per-request context.
+- **DR-30 (`8e1d8ae`).** `createSearchProvider` completes partial configuration with `readConfig`, so the defaults live in one place and an invalid setting fails as it does in the proxy.
+- **DR-31 (`0ecc4dc`).**
+  - `WEB_SEARCH_THIRD_PARTY=0` limits provider search to GitHub's search, so a policy refusal never sends the query to a third-party provider.
+  - The default keeps the fallback the approved plan requires; its refusal warning now names the setting.
+  - `WEBSEARCH_PROVIDER=exa` or `parallel` contradicts the setting and is rejected at startup.
+- **DR-23 residual (`20a3fce`).** The searches of a rejected hosted answer are now counted in `web_search_requests`, like its tokens. They do not count against the fallback's `max_uses`, because the client never sees them.
+
+**Accepted residuals:**
+- **SECURITY-2.** The health proof is not bound to the proxy's address, so a process holding the port could relay the nonce to a genuine proxy on another address or port. The default setup runs no such second proxy, and binding the proof to the port would break Docker's port mapping.
+- **Installed-client tests in CI.** CI does not install Claude Code, so the three tests that run the installed client run only locally. An optional CI job with a pinned Claude Code version would cover them.
 
 ## Verification
 
@@ -228,6 +241,12 @@ Hosted search does not call the requested model, so it now runs before any outpu
 - **Provider search with `allowed_domains`:** results only from nodejs.org.
 
 **Real Claude Code 2.1.303, end to end on the default Opus 5.5:** a plain prompt returns OK, and WebSearch is answered by one hosted GPT-6 Luna search that cites nodejs.org/en/download.
+
+**Follow-up (PR #12):**
+- **Test suite:** on Node 26.13 with Claude Code 2.1.303, 295 tests, 294 pass, 1 skipped; on Node 22.23 and 24.22, 291 pass, 4 skipped. Each commit passes the suite on its own.
+- **Tests that detect the fixes:** the new tests for DR-28, DR-30, DR-31 and the DR-23 residual fail without their fixes.
+- **Live against Copilot:** the six scenarios above pass again. So do provider search with `WEB_SEARCH_THIRD_PARTY=0`, which returned GitHub's results without trying a third-party provider, and plain JSON, streaming and token-count requests through the split handler.
+- **Real Claude Code 2.1.303, end to end:** a plain prompt returns OK, and WebSearch cites nodejs.org/en/download.
 
 ## Strengths noted by reviewers
 

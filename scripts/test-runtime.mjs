@@ -46,6 +46,16 @@ test("hosted web search configuration defaults to GPT-6 Luna and validates its s
   assert.throws(() => readConfig({ WEBSEARCH_PROVIDER: "bing" }), /WEBSEARCH_PROVIDER/)
 })
 
+test("WEB_SEARCH_THIRD_PARTY defaults to on, and turning it off rules out a third-party preferred provider", () => {
+  const readConfig = exported("readConfig")
+  assert.equal(readConfig({}).webSearchThirdParty, true)
+  assert.equal(readConfig({ WEB_SEARCH_THIRD_PARTY: "0" }).webSearchThirdParty, false)
+  assert.equal(readConfig({ WEB_SEARCH_THIRD_PARTY: "0", WEBSEARCH_PROVIDER: "github" }).websearchProvider, "github")
+  for (const provider of ["exa", "parallel"]) {
+    assert.throws(() => readConfig({ WEB_SEARCH_THIRD_PARTY: "0", WEBSEARCH_PROVIDER: provider }), /WEB_SEARCH_THIRD_PARTY=0/)
+  }
+})
+
 test("admission transfers a permit to the FIFO waiter before a new arrival", async () => {
   const gate = exported("createAdmissionGate")({ limit: 1, maxQueued: 5, maxQueueBytes: 100, queueTimeoutMs: 1000 })
   const releaseA = await gate.acquire()

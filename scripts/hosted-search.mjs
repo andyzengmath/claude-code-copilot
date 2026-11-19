@@ -1,5 +1,8 @@
+import { randomUUID } from "node:crypto"
 import { domainToASCII } from "node:url"
-import { ProxyError } from "./runtime.mjs"
+import { isRoutable } from "./models.mjs"
+import { parseRetryAfterMs, ProxyError } from "./runtime.mjs"
+import { upstreamError } from "./upstream.mjs"
 
 // Hosted web search: answer a search-only Messages request with one Copilot
 // /responses call that runs OpenAI's server-side web_search tool (as Codex
@@ -122,8 +125,15 @@ function count(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null
 }
 
+// The query of a hosted search call's action; undefined for page reads and empty searches.
+function searchQuery(action) {
+  if (!plainObject(action) || action.type !== "search") return undefined
+  return [action.query, ...(Array.isArray(action.queries) ? action.queries : [])]
+    .find((value) => typeof value === "string" && value.trim())
+}
+
 // Token usage of a Responses payload in Anthropic's shape; throws for invalid usage.
-export function hostedSearchUsage(usage) {
+function hostedSearchUsage(usage) {
   const input = count(usage?.input_tokens)
   const output = count(usage?.output_tokens)
   const detail = (value) => value === undefined || value === null ? 0 : count(value)
@@ -136,6 +146,16 @@ export function hostedSearchUsage(usage) {
     input_tokens: input - cached - written, output_tokens: output,
     cache_read_input_tokens: cached, cache_creation_input_tokens: written,
   }
+}
+
+// Tokens and searches of a hosted answer that was received but not used;
+// undefined when its usage is invalid.
+export function rejectedHostedUsage(response) {
+  let usage
+  try { usage = hostedSearchUsage(response?.usage) } catch { return undefined }
+  const output = Array.isArray(response.output) ? response.output : []
+  const searches = output.filter((item) => item?.type === "web_search_call" && searchQuery(item.action)).length
+  return { ...usage, server_tool_use: { web_search_requests: searches } }
 }
 
 // Map a Responses API result onto an Anthropic web search message. Throws a
@@ -191,8 +211,7 @@ export function hostedSearchMessage(response, { id, model, settings }) {
         if (url) pageReads.push(permitted(url))
         continue
       }
-      const query = [action.query, ...(Array.isArray(action.queries) ? action.queries : [])]
-        .find((value) => typeof value === "string" && value.trim())
+      const query = searchQuery(action)
       if (!query) continue
       searches++
       const toolId = `srvtoolu_${typeof item.id === "string" && /^[A-Za-z0-9_-]{1,100}$/.test(item.id) ? item.id : `hosted_${searches}`}`
@@ -272,4 +291,64 @@ export async function emitHostedMessage(message, emit) {
   }
   await emit("message_delta", { type: "message_delta", delta: { stop_reason: message.stop_reason, stop_sequence: null }, usage: message.usage })
   await emit("message_stop", { type: "message_stop" })
+}
+
+// Hosted search for one proxy. `client` is the upstream client for
+// /responses. After a refusal or rate limit, hosted search pauses instead of
+// paying for a failing call before every provider search.
+export function createHostedSearch({ catalog, client, config, logger, warnOnce }) {
+  let pausedUntil = 0
+  function pause(error) {
+    const hint = parseRetryAfterMs(error?.headers?.["retry-after"] ?? null)
+    const duration = error?.status === 429 ? hint ?? 60000
+      : error?.status === 503 ? hint ?? 0
+      : [401, 403, 404].includes(error?.status) ? 300000 : 0
+    if (duration > 0) pausedUntil = Math.max(pausedUntil, Date.now() + Math.min(duration, 3600000))
+    return duration
+  }
+
+  // Answer a search-only request with one Copilot /responses call using the
+  // hosted web_search tool. Returns { message, searchModel } on success.
+  // Otherwise returns { message: null, usage } so the caller uses provider
+  // search; `usage` holds the tokens and searches of a hosted answer that was
+  // received but rejected.
+  return async function hostedSearch({ body, settings, model, token, signal }) {
+    const paused = pausedUntil - Date.now()
+    if (paused > 0) {
+      logger.log(`  search: providers (hosted search paused for ${Math.ceil(paused / 1000)}s)`)
+      return { message: null }
+    }
+    let upstream
+    let data
+    try {
+      const info = (await catalog.get(token, signal)).find((entry) => entry.id === config.webSearchModel)
+      if (!info || !isRoutable(info) || !info.supported_endpoints?.includes("/responses")) {
+        warnOnce(`Hosted web search model ${config.webSearchModel} is unavailable for /responses; using provider search`)
+        return { message: null }
+      }
+      // No incoming headers: anthropic-* headers do not apply to /responses.
+      upstream = await client.request("/responses", buildHostedSearchRequest(body, settings, config, info), { token, headers: {}, signal })
+      if (!upstream.response.ok) throw await upstreamError(upstream)
+      try { data = JSON.parse(await upstream.text()) } catch { throw new ProxyError(502, "Copilot hosted search returned invalid JSON") }
+      let message
+      try {
+        message = hostedSearchMessage(data, { id: `msg_${randomUUID()}`, model, settings })
+      } catch (error) {
+        error.hostedReason = error.message
+        throw error
+      }
+      const searches = message.usage.server_tool_use.web_search_requests
+      logger.log(`  search: hosted ${info.id} (${searches} ${searches === 1 ? "search" : "searches"})`)
+      return { message, searchModel: info.id }
+    } catch (error) {
+      signal.throwIfAborted()
+      const duration = pause(error)
+      // Upstream messages are never logged; hostedReason is written locally.
+      logger.warn(`Hosted web search failed (${error.hostedReason ?? error.status ?? error.name}); using provider search` +
+        (duration > 0 ? ` for the next ${Math.ceil(duration / 1000)}s` : ""))
+      return { message: null, usage: rejectedHostedUsage(data) }
+    } finally {
+      upstream?.dispose()
+    }
+  }
 }

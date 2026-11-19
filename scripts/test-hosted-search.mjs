@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { readConfig } from "./config.mjs"
-import { buildHostedSearchRequest, emitHostedMessage, hostedSearchIneligibility, hostedSearchMessage } from "./hosted-search.mjs"
+import { buildHostedSearchRequest, emitHostedMessage, hostedSearchIneligibility, hostedSearchMessage, rejectedHostedUsage } from "./hosted-search.mjs"
 import { extractWebSearchConfig } from "./search.mjs"
 
 const config = readConfig({})
@@ -230,6 +230,20 @@ test("a hosted answer without a completed search, or a declined one, falls back 
   const mixed = map({ ...lunaResponse(), output: [search("ws_1", "q", ["https://nodejs.org/a"]), search("ws_2", "second", [], "failed"), answer("A")] })
   assert.deepEqual(results(mixed)[1], { type: "web_search_tool_result_error", error_code: "unavailable" })
   assert.equal(mixed.usage.server_tool_use.web_search_requests, 2)
+})
+
+test("a rejected hosted answer's usage counts its searches but not its page reads", () => {
+  const output = [
+    search("ws_1", "q", ["https://nodejs.org/a"]), search("ws_2", "second", [], "failed"),
+    { id: "ws_3", type: "web_search_call", status: "completed", action: { type: "open_page", url: "https://nodejs.org/a" } },
+    search("ws_4", "  "),
+  ]
+  assert.deepEqual(rejectedHostedUsage(lunaResponse({ output })), {
+    input_tokens: 3427, output_tokens: 153, cache_read_input_tokens: 1000, cache_creation_input_tokens: 4354,
+    server_tool_use: { web_search_requests: 2 },
+  })
+  assert.equal(rejectedHostedUsage(lunaResponse({ usage: undefined })), undefined)
+  assert.equal(rejectedHostedUsage(undefined), undefined)
 })
 
 test("hosted search ids, queries, source caps and usage are normalized or rejected", () => {

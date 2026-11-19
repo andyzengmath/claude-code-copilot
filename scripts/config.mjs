@@ -63,6 +63,7 @@ export function readConfig(env = process.env, overrides = {}) {
   for (const [property, name, fallback] of [
     ["forwardReasoning", "COPILOT_FORWARD_REASONING", true],
     ["logSearchQueries", "COPILOT_LOG_SEARCH_QUERIES", false],
+    ["webSearchThirdParty", "WEB_SEARCH_THIRD_PARTY", true],
   ]) {
     const value = overrides[property] ?? env[name] ?? fallback
     if (![true, false, "0", "1"].includes(value)) throw new Error(`${name} must be 0 or 1`)
@@ -74,6 +75,9 @@ export function readConfig(env = process.env, overrides = {}) {
   }
   if (!["", ...PREFERRED_SEARCH_PROVIDERS].includes(config.websearchProvider)) {
     throw new Error("WEBSEARCH_PROVIDER must be github, exa, parallel, or empty")
+  }
+  if (!config.webSearchThirdParty && !["", "github"].includes(config.websearchProvider)) {
+    throw new Error("WEBSEARCH_PROVIDER must be github or empty when WEB_SEARCH_THIRD_PARTY=0")
   }
   if (!["hosted", "providers"].includes(config.webSearchMode)) {
     throw new Error("WEB_SEARCH_MODE must be hosted or providers")

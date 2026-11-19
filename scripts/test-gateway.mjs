@@ -1068,21 +1068,25 @@ test("hosted search shares the configured spacing between Copilot requests", asy
   assert.ok(sent[1].at - sent[0].at >= 350, `hosted search waited ${Math.round(sent[1].at - sent[0].at)} ms`)
 })
 
-test("a hosted answer without a completed search falls back, and its tokens are still reported", async (t) => {
-  const paths = []
-  const rounds = []
-  const f = await fixture(t, (call) => {
-    paths.push(call.url.pathname)
-    if (call.url.pathname === "/responses") return Response.json({ ...hostedReply(), output: [hostedReply().output[1]] })
-    return emulationRound(JSON.parse(call.body), rounds)
-  }, { ...withLuna, searchProvider: async () => [providerResult] })
-  const response = await f.request(nestedWebSearch({ stream: false }))
-  assert.equal(response.status, 200)
-  const body = await response.json()
-  assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages"])
-  assert.equal(body.content.at(-1).text, "Emulated answer")
-  assert.equal(body.usage.input_tokens, 900 + 2 * 9)
-  assert.equal(body.usage.output_tokens, 40 + 2 * 3)
+test("a rejected hosted answer falls back, and its tokens and searches are still reported", async (t) => {
+  // Without a completed search, and with a search but no answer.
+  for (const [output, hostedSearches] of [[[hostedReply().output[1]], 0], [[hostedReply().output[0]], 1]]) {
+    const paths = []
+    const rounds = []
+    const f = await fixture(t, (call) => {
+      paths.push(call.url.pathname)
+      if (call.url.pathname === "/responses") return Response.json({ ...hostedReply(), output })
+      return emulationRound(JSON.parse(call.body), rounds)
+    }, { ...withLuna, searchProvider: async () => [providerResult] })
+    const response = await f.request(nestedWebSearch({ stream: false }))
+    assert.equal(response.status, 200)
+    const body = await response.json()
+    assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages"])
+    assert.equal(body.content.at(-1).text, "Emulated answer")
+    assert.equal(body.usage.input_tokens, 900 + 2 * 9)
+    assert.equal(body.usage.output_tokens, 40 + 2 * 3)
+    assert.deepEqual(body.usage.server_tool_use, { web_search_requests: hostedSearches + 1 })
+  }
 })
 
 test("Claude Code's 5.5 WebSearch request with automatic choice still makes the hosted model search", async (t) => {
