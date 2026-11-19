@@ -80,7 +80,9 @@ printf 'Authorization: Bearer %s\n' "$ANTHROPIC_AUTH_TOKEN" |
 
 Use a returned supported identifier with Claude Code's `/model`. The account/integrator catalog is authoritative; an absent model does not establish your plan's entitlements. Aliases only normalize spelling within the **same version**: the proxy never silently upgrades a tier or model version.
 
-The catalog lists Claude models by their Claude API IDs, such as `claude-opus-4-7`, rather than Copilot's dotted IDs, such as `claude-opus-4.7`. Both spellings route to the same model, but use the dashed one. Claude Code recognizes only that form: for a dotted ID it assumes a 200K context window instead of 1M and sends requests in an older shape.
+The catalog lists Claude models by their Claude API IDs, such as `claude-opus-4-7`, rather than Copilot's dotted IDs, such as `claude-opus-4.7`. Both spellings route to the same model, but use the dashed one: older Claude Code versions, such as 2.1.286, recognize only that form, and for a dotted ID they assume a 200K context window instead of 1M and send requests in an older shape. Claude Code 2.1.328 handles both spellings alike.
+
+To choose among the proxy's models inside Claude Code, start it with `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` (export it before running the launcher). Claude Code then reads the proxy's `/v1/models` at startup, caches the list in its configuration directory, and offers those models, with their dashed IDs, in `/model`.
 
 Claude Code v2.1.280 and later start on **Claude Opus 5.5** by default. Its Claude API ID, `claude-opus-5-5`, normalizes to Copilot's `claude-opus-5.5` when your catalog offers it. Earlier Claude Code versions don't support Opus 5.5; run `claude update` to upgrade.
 
@@ -179,6 +181,8 @@ There is **no inference replay between transports**, including after upstream er
 
 Claude Code's auto mode can ask the API to run its permission classifier server-side. Copilot doesn't support that, so Claude Code shows a notice that the session isn't eligible and runs the classifier itself, sending those requests through the proxy as before. `scripts/launch.sh` sets `CLAUDE_CODE_AUTO_MODE_SERVER=0` to skip the notice; set it yourself when you start `claude` another way.
 
+This depends on a fallback that Claude Code plans to remove. The notice in Claude Code 2.1.328 says: "An upcoming release removes this fallback. In sessions like this one, each checked action will then be asked about or denied." Expect auto mode through the proxy to work that way after such a release. Set `CLAUDE_CODE_AUTO_MODE_SERVER=0` only for sessions that use the proxy, as the launcher does for the Claude Code it starts. Don't set it in `~/.claude/settings.json`: there it also turns off the server-side check in sessions that use Anthropic directly.
+
 ## Web Search
 
 Ordinary Claude Code WebSearch makes nested requests containing the server tool `web_search_20250305`, which Copilot's native Messages endpoint rejects ("The use of the web search tool is not supported"). The proxy answers these requests in one of two ways.
@@ -220,7 +224,7 @@ Every non-health route requires the persistent local key in `x-api-key` or `Auth
 {"status":"ok","provider":"github-copilot","api_key_required":true}
 ```
 
-With `?nonce=` followed by 32 to 128 lowercase hex characters, the response also includes `key_proof`: an HMAC-SHA256 of the nonce under the local key. The launcher checks it before it sends the key, so a process that occupies the port cannot collect the key or Claude Code's prompts.
+With `?nonce=` followed by 32 to 128 lowercase hex characters, the response also includes `key_proof`: an HMAC-SHA256 of the nonce under the local key. The launcher checks it before it sends the key, so a process that occupies the port cannot collect the key or Claude Code's prompts. The proof is not bound to the address, though: a program listening on the probed port could relay the nonce to another proxy that holds the same key. Run one proxy per key, and use the same `COPILOT_PROXY_PORT` for that proxy and every launch.
 
 OAuth credentials and the local API key are persisted privately on disk. On POSIX, a credential file that other users can read, such as one written by an older version, is restricted to its owner when read; with Docker, where the files are mounted read-only, the launcher restricts the auth file before it starts the container. On Windows, credential files, including their temporary copies, grant access only to you from the moment they are created. Still keep custom credential paths in a folder only you can write to, not one created directly under `C:\`: there every signed-in user can create files, so another user could place a key file before the proxy creates its own. Model metadata and query results are cached in memory; query logging is disabled by default, but operational/error logs can still be emitted. Prompts go to GitHub Copilot. Hosted search sends the search request, including Claude Code's search prompt, to Copilot's `/responses` endpoint, where the search model runs OpenAI's web search. Provider search sends queries to GitHub's search first and then to configured or fallback providers, unless `WEB_SEARCH_THIRD_PARTY=0` limits it to GitHub's search. Their data handling policies apply. Do not put secrets in queries, publish credential files, or assume that a local proxy means data stays on your machine.
 
@@ -307,8 +311,8 @@ Export variables before starting Node or the launcher. Compose explicitly maps t
 
 ## Migration and troubleshooting
 
-- **Upgrading from the old proxy:** the literal `copilot-proxy` API key no longer works, and the old proxy accepts requests without any key, so stop it before starting this version. The launcher detects it and prints these steps.
-  - Docker: `docker rm -f claude-copilot-proxy`, then run `./scripts/launch.sh`, or export `COPILOT_AUTH_FILE` and `COPILOT_PROXY_KEY_FILE` as shown under [Docker](#docker) and run `docker compose up -d --build --force-recreate --no-deps proxy`.
+- **Upgrading from the old proxy:** the literal `copilot-proxy` API key no longer works, and the old proxy accepts requests without any key, so remove it before starting this version. The launcher detects it and prints these steps.
+  - Docker: `docker rm -f claude-copilot-proxy`, then run `./scripts/launch.sh`, or follow [Docker](#docker), whose steps create the key file before the first `docker compose` command (Compose does not create missing credential files).
   - Node: stop the old `node scripts/proxy.mjs` process, then start the new one.
   - Then update your client settings, as the next entry describes.
 - **Client settings from earlier instructions:** earlier versions of this README and of the `/setup-copilot` command used `ANTHROPIC_API_KEY` (set to `copilot-proxy`, or later to the local key) and `http://localhost:18080`. Use `ANTHROPIC_AUTH_TOKEN` and `http://127.0.0.1:18080` instead, and leave `ANTHROPIC_API_KEY` unset, as under [Start Claude Code](#2-start-claude-code). `localhost` can connect to the IPv6 address `[::1]` first, and Compose publishes the Docker proxy only on `127.0.0.1`, so another local program could listen on `[::1]` and receive the key.
@@ -319,7 +323,7 @@ Export variables before starting Node or the launcher. Compose explicitly maps t
 - **Login screen, or "Unable to connect to Anthropic services", when Claude Code starts for the first time:** with `ANTHROPIC_API_KEY`, first-run setup checks the connection to Anthropic, asks about the key and, if you decline it, shows the login screen. With `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` set and `ANTHROPIC_API_KEY` unset, setup skips all three. Never overwrite `~/.claude.json` to get past setup: it also holds your folder trust, login and API-key answers.
 - **401 from the proxy:** the request did not carry the proxy's local key; the error says "A valid local proxy API key is required". Use the key from the key file of the running proxy (`COPILOT_PROXY_KEY_FILE`), passed as `ANTHROPIC_AUTH_TOKEN`. Health is intentionally public and does not validate your key.
 - **502 "Copilot rejected the saved GitHub sign-in":** the proxy accepted your key, but GitHub rejected the OAuth token in the auth file, for example because it expired or was revoked. Rerun `node scripts/auth.mjs` with the intended `COPILOT_AUTH_FILE`, then restart your proxy; for Docker, recreate it with `docker compose up -d --force-recreate --no-deps proxy`. Do not delete unrelated credentials.
-- **Port occupied / incompatible service:** identify the owning process/container and stop or restart only that resource, or choose a different `COPILOT_PROXY_PORT`. The launcher never kills a shared proxy or restarts unrelated Docker services.
+- **Port occupied / incompatible service:** if the launcher reports an older claude-code-copilot proxy that accepts requests without an API key, remove it as described above. Don't avoid it with another `COPILOT_PROXY_PORT`: it keeps answering anyone who can reach it, and the old Compose file published it on all network interfaces. For any other service, identify the owning process/container and stop or restart only that resource, or choose a different `COPILOT_PROXY_PORT`. The launcher never kills a shared proxy or restarts unrelated Docker services.
 - **Unknown model / unsupported feature:** inspect authenticated `/v1/models`, select an available identifier, and check the transport restrictions above. No automatic tier/version substitution is performed.
 - **429, queue overload, or timeout:** inspect the returned error and `Retry-After`, reduce parallelism, or adjust documented bounds. Raising retries cannot safely repair ambiguous network failures.
 
