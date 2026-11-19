@@ -5,6 +5,7 @@ import { createServer } from "node:http"
 import { gzipSync } from "node:zlib"
 import test from "node:test"
 import * as proxy from "./proxy.mjs"
+import { NativeMessageState } from "./sse.mjs"
 import { fixture, event, message, nativeFrames, streamResponse, key, token, models } from "./test-helpers/gateway.mjs"
 
 const parsedEvents = (text) => [...text.matchAll(/^data: (.+)$/gm)].map((match) => JSON.parse(match[1]))
@@ -895,6 +896,27 @@ async function until(ready, ms = 2000) {
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
 }
+// A streamed message as a native Messages client reassembles it: streamed
+// parts start empty and every delta has its block's type. NativeMessageState
+// rejects delta types it does not know.
+function reassembled(events) {
+  const state = new NativeMessageState({ collect: true })
+  const blocks = new Map()
+  for (const data of events) {
+    if (data.type === "content_block_start") {
+      const block = data.content_block
+      blocks.set(data.index, block.type)
+      if (block.type === "text") assert.equal(block.text, "")
+      if (block.type === "server_tool_use") assert.deepEqual(block.input, {})
+    } else if (data.type === "content_block_delta") {
+      const type = blocks.get(data.index)
+      assert.equal(data.delta.type, { text: "text_delta", server_tool_use: "input_json_delta" }[type], `delta of a ${type} block`)
+    }
+    state.accept(data, data.type)
+  }
+  assert.equal(state.completed, true)
+  return state.message
+}
 
 for (const streaming of [true, false]) {
   test(`Claude Code's nested WebSearch is answered by one hosted GPT-6 Luna search (${streaming ? "streaming" : "JSON"})`, async (t) => {
@@ -930,14 +952,16 @@ for (const streaming of [true, false]) {
         "content_block_start", "content_block_stop", "content_block_start", "content_block_delta", "content_block_stop",
         "message_delta", "message_stop",
       ])
-      assert.equal(events.at(-2).delta.stop_reason, "end_turn")
-      assert.deepEqual(events.at(-2).usage.server_tool_use, { web_search_requests: 1 })
-      assert.equal(events.at(-2).usage.output_tokens, 40)
+      // Reassembled as a client would, the stream is exactly the JSON answer.
+      const json = await (await f.request(nestedWebSearch({ stream: false }))).json()
+      assert.deepEqual(reassembled(events), { ...json, id: events[0].message.id })
     } else {
       const body = await response.json()
-      assert.deepEqual(body.content, expectedContent)
-      assert.equal(body.stop_reason, "end_turn")
-      assert.equal(body.usage.input_tokens, 900)
+      assert.deepEqual(body, {
+        id: body.id, type: "message", role: "assistant", model: "claude-sonnet-5", content: expectedContent,
+        stop_reason: "end_turn", stop_sequence: null,
+        usage: { input_tokens: 900, output_tokens: 40, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, server_tool_use: { web_search_requests: 1 } },
+      })
     }
   })
 }

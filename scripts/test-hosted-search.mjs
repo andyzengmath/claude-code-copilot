@@ -3,6 +3,7 @@ import test from "node:test"
 import { readConfig } from "./config.mjs"
 import { buildHostedSearchRequest, emitHostedMessage, hostedSearchIneligibility, hostedSearchMessage, rejectedHostedUsage } from "./hosted-search.mjs"
 import { extractWebSearchConfig } from "./search.mjs"
+import { NativeMessageState } from "./sse.mjs"
 
 const config = readConfig({})
 const luna = { id: "gpt-6-luna", supported_endpoints: ["/responses", "ws:/responses"], capabilities: { limits: { max_output_tokens: 128000 } } }
@@ -64,6 +65,27 @@ const answer = (text, citations = []) => ({
 })
 const map = (response, settings = settingsFor(nestedSearch())) => hostedSearchMessage(response, { id: "msg_t", model: "m", settings })
 const results = (message) => message.content.filter((block) => block.type === "web_search_tool_result").map((block) => block.content)
+// A streamed message as a native Messages client reassembles it: streamed
+// parts start empty and every delta has its block's type. NativeMessageState
+// rejects delta types it does not know.
+function reassembled(events) {
+  const state = new NativeMessageState({ collect: true })
+  const blocks = new Map()
+  for (const data of events) {
+    if (data.type === "content_block_start") {
+      const block = data.content_block
+      blocks.set(data.index, block.type)
+      if (block.type === "text") assert.equal(block.text, "")
+      if (block.type === "server_tool_use") assert.deepEqual(block.input, {})
+    } else if (data.type === "content_block_delta") {
+      const type = blocks.get(data.index)
+      assert.equal(data.delta.type, { text: "text_delta", server_tool_use: "input_json_delta" }[type], `delta of a ${type} block`)
+    }
+    state.accept(data, data.type)
+  }
+  assert.equal(state.completed, true)
+  return state.message
+}
 
 test("Claude Code's nested WebSearch request becomes one hosted Responses search", () => {
   const location = { type: "approximate", city: "Seattle", region: "Washington", country: "US", timezone: "America/Los_Angeles" }
@@ -328,4 +350,6 @@ test("hosted messages stream as standard Anthropic events without splitting char
   for (const delta of deltas) assert.equal(delta, Buffer.from(delta).toString(), "no delta ends or starts inside a surrogate pair")
   assert.deepEqual(events.at(-2), { type: "message_delta", data: { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: message.usage } })
   assert.deepEqual(events.at(-1), { type: "message_stop", data: { type: "message_stop" } })
+  // Reassembled as a client would, the stream is exactly the JSON message.
+  assert.deepEqual(reassembled(events.map((event) => event.data)), message)
 })
