@@ -141,6 +141,32 @@ test("search progress and result blocks are emitted before the following generat
   assert.deepEqual(events.filter((entry) => entry.type === "content_block_start").map((entry) => entry.data.index), [0, 1, 2])
 })
 
+test("text beside a search call is kept in the message and in the stream, at matching indices", async () => {
+  const events = []
+  let calls = 0
+  const output = await exported("runWebSearch")({
+    request: request(), config: searchConfig(), signal: new AbortController().signal,
+    search: async () => [result()],
+    emit: async (type, data) => { events.push(data) },
+    generate: async (body, onEvent) => {
+      calls++
+      const response = calls === 1
+        ? answer([{ type: "text", text: "Let me search." }, tool("search_after_text")])
+        : answer([{ type: "text", text: "Found it." }], "end_turn")
+      for (const [index, block] of response.content.entries()) {
+        await onEvent({ type: "content_block_start", index, content_block: block })
+        await onEvent({ type: "content_block_stop", index })
+      }
+      return response
+    },
+  })
+  assert.deepEqual(output.content.map((block) => block.type), ["text", "server_tool_use", "web_search_tool_result", "text"])
+  assert.equal(output.content[0].text, "Let me search.")
+  const starts = events.filter((data) => data.type === "content_block_start")
+  assert.deepEqual(starts.map((data) => data.index), [0, 1, 2, 3])
+  for (const data of starts) assert.deepEqual(data.content_block, output.content[data.index])
+})
+
 test("unsupported search versions, user location and contradictory domain lists reject explicitly", () => {
   const extract = exported("extractWebSearchConfig")
   const config = searchConfig()
@@ -498,7 +524,7 @@ test("results of one search round are appended whole and in call order", async (
   ])
 })
 
-test("a fatal search failure cancels the other searches of its round and adds no later output", async () => {
+test("a fatal search failure cancels the other searches of its round and adds no later output", { timeout: 2000 }, async () => {
   const failure = new Error("unexpected search failure")
   const events = []
   let sibling
