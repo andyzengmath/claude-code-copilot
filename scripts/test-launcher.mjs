@@ -62,6 +62,8 @@ async function setup(t, port, key = "launcher-fixture-key") {
     TEST_PROXY_HOOK: pathToFileURL(join(directory, "proxy-hook.mjs")).href,
     TEST_CONTROL_PIPE: process.platform === "win32" ? `\\\\.\\pipe\\copilot-launch-${randomUUID()}` : join(directory, "control.sock"),
     TEST_CONTROL_TOKEN: randomUUID(),
+    // Stale client settings from older instructions must not reach Claude Code.
+    ANTHROPIC_API_KEY: "copilot-proxy",
     ANTHROPIC_AUTH_TOKEN: "stale-fixture-auth-token",
   })
   await savePrivateJson(env.COPILOT_AUTH_FILE, { access_token: "launcher-fixture-upstream-token" })
@@ -77,13 +79,14 @@ exec "$TEST_REAL_NODE" "$@"
   await writeFile(env.TEST_CLAUDE_APP, `
 import { writeFile } from "node:fs/promises";
 const response = await fetch(process.env.ANTHROPIC_BASE_URL + "/v1/messages", {
-  method: "POST", headers: {"x-api-key": process.env.ANTHROPIC_API_KEY, "content-type":"application/json"}, body:"null",
+  method: "POST", headers: {authorization: "Bearer " + process.env.ANTHROPIC_AUTH_TOKEN, "content-type":"application/json"}, body:"null",
   signal: AbortSignal.timeout(3000)
 });
 await response.arrayBuffer();
 await writeFile(process.env.TEST_CLIENT_RESULT, JSON.stringify({
   base: process.env.ANTHROPIC_BASE_URL, keyAccepted: response.status === 400,
-  authTokenCleared: !process.env.ANTHROPIC_AUTH_TOKEN, args: process.argv.slice(2)
+  apiKeyUnset: !("ANTHROPIC_API_KEY" in process.env), autoModeServer: process.env.CLAUDE_CODE_AUTO_MODE_SERVER,
+  args: process.argv.slice(2)
 }));
 console.log("fixture client finished");
 `)
@@ -137,14 +140,16 @@ test("launcher refuses a healthy service whose API key differs from its configur
   assert.equal((await fetch(`${f.base}/health`)).status, 200)
 })
 
-test("launcher hands the configured key to Claude without an inherited competing auth token", options, async (t) => {
+test("launcher hands the configured key to Claude as its auth token and unsets an inherited API key", options, async (t) => {
   const f = await fixture(t, () => assert.fail("no upstream calls expected"))
   const { env } = await setup(t, f.server.address().port, f.key)
   const result = await launch(t, env, ["-p", "fixture with spaces"])
   assert.equal(result.code, 0, result.stderr)
   const client = JSON.parse(await readFile(env.TEST_CLIENT_RESULT, "utf8"))
   assert.equal(client.keyAccepted, true)
-  assert.equal(client.authTokenCleared, true)
+  // Unset, not empty: interactive Claude Code asks before using an API key.
+  assert.equal(client.apiKeyUnset, true)
+  assert.equal(client.autoModeServer, "0")
   assert.equal(client.base, f.base)
   assert.deepEqual(client.args, ["-p", "fixture with spaces"])
 })
