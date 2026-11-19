@@ -1069,13 +1069,19 @@ test("hosted search shares the configured spacing between Copilot requests", asy
 })
 
 test("a rejected hosted answer falls back, and its tokens and searches are still reported", async (t) => {
-  // Without a completed search, and with a search but no answer.
-  for (const [output, hostedSearches] of [[[hostedReply().output[1]], 0], [[hostedReply().output[0]], 1]]) {
+  // Without a completed search, with a search but no answer, and cut off at
+  // max_output_tokens before any search completed.
+  const truncated = { status: "incomplete", incomplete_details: { reason: "max_output_tokens" } }
+  for (const [reply, hostedSearches] of [
+    [{ output: [hostedReply().output[1]] }, 0],
+    [{ output: [hostedReply().output[0]] }, 1],
+    [{ ...truncated, output: [hostedReply().output[1]] }, 0],
+  ]) {
     const paths = []
     const rounds = []
     const f = await fixture(t, (call) => {
       paths.push(call.url.pathname)
-      if (call.url.pathname === "/responses") return Response.json({ ...hostedReply(), output })
+      if (call.url.pathname === "/responses") return Response.json({ ...hostedReply(), ...reply })
       return emulationRound(JSON.parse(call.body), rounds)
     }, { ...withLuna, searchProvider: async () => [providerResult] })
     const response = await f.request(nestedWebSearch({ stream: false }))

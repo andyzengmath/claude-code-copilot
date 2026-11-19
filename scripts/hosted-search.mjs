@@ -241,14 +241,14 @@ export function hostedSearchMessage(response, { id, model, settings }) {
       }
     }
   }
-  if (!lastResults && !truncated) {
-    throw new ProxyError(502, "Copilot hosted search completed no search")
-  }
+  // A truncated answer also needs a completed search: Claude Code would
+  // otherwise receive an unsearched answer, or nothing, as its search results.
+  if (!lastResults) throw new ProxyError(502, "Copilot hosted search completed no search")
   // Pages the model read or cited but no search listed, such as a page opened
   // directly, still reach Claude Code as links.
   let extra = 0
   for (const url of [...pageReads, ...citations]) {
-    if (!lastResults || extra >= MAX_SOURCES_PER_SEARCH || listed.has(urlKey(url))) continue
+    if (extra >= MAX_SOURCES_PER_SEARCH || listed.has(urlKey(url))) continue
     listed.add(urlKey(url))
     lastResults.push(resultFor(url, cleanHref(url)))
     extra++

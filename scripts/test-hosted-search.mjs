@@ -260,15 +260,30 @@ test("hosted search ids, queries, source caps and usage are normalized or reject
   }
 })
 
-test("hosted search truncation is reported and invalid payloads are rejected for fallback", () => {
-  const truncated = map(lunaResponse({
+test("a truncated hosted answer is used only after a completed search, and invalid payloads are rejected for fallback", () => {
+  const cut = {
     status: "incomplete", incomplete_details: { reason: "max_output_tokens" },
-    output: [{ id: "ws_partial", type: "web_search_call", status: "incomplete", action: {} }],
     usage: { input_tokens: 4455, input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, output_tokens: 16 },
-  }))
-  assert.equal(truncated.stop_reason, "max_tokens")
-  assert.deepEqual(truncated.content, [])
-  assert.equal(truncated.usage.output_tokens, 16)
+  }
+  // A completed search keeps its results and any partial answer, reported as max_tokens.
+  const partial = map(lunaResponse({ ...cut, output: [search("ws_1", "q", ["https://nodejs.org/a"]), answer("Node.js 26 is")] }))
+  assert.equal(partial.stop_reason, "max_tokens")
+  assert.deepEqual(partial.content.map((block) => block.type), ["server_tool_use", "web_search_tool_result", "text"])
+  assert.equal(partial.content[2].text, "Node.js 26 is")
+  assert.equal(partial.usage.output_tokens, 16)
+  const resultsOnly = map(lunaResponse({ ...cut, output: [search("ws_1", "q", ["https://nodejs.org/a"])] }))
+  assert.equal(resultsOnly.stop_reason, "max_tokens")
+  assert.deepEqual(results(resultsOnly).map((list) => list.map((result) => result.url)), [["https://nodejs.org/a"]])
+  // Without one, a truncated answer falls back like any other unsearched answer.
+  for (const output of [
+    [],
+    [{ id: "ws_partial", type: "web_search_call", status: "incomplete", action: {} }],
+    [search("ws_1", "q", [], "incomplete")],
+    [search("ws_1", "q", [], "failed"), answer("Search is unavailable")],
+    [answer("From memory")],
+  ]) {
+    assert.throws(() => map(lunaResponse({ ...cut, output })), (error) => error.status === 502 && /no search/.test(error.message))
+  }
   for (const invalid of [
     lunaResponse({ status: "failed" }),
     lunaResponse({ status: "incomplete", incomplete_details: { reason: "content_filter" } }),
