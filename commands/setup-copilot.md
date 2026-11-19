@@ -1,42 +1,27 @@
 ---
-description: Set up and start using Claude through GitHub Copilot
-allowed-tools: Bash
+description: Check the GitHub Copilot proxy setup and show how to start Claude Code through it
+allowed-tools: Bash(node --version), Bash(test -s *)
 ---
 
-Help the user set up the GitHub Copilot provider for Claude Code. Follow these steps:
+Help the user start Claude Code through the claude-code-copilot proxy in `${CLAUDE_PLUGIN_ROOT}`. Never read, print or copy a credential: do not show the contents of `~/.claude-copilot-auth.json`, `~/.claude-copilot-proxy-key.json` or the files that `COPILOT_AUTH_FILE` and `COPILOT_PROXY_KEY_FILE` name, and do not run `scripts/proxy.mjs --print-api-key` yourself.
 
-1. First, check if the plugin exists:
-   ```
-   ls ${CLAUDE_PLUGIN_ROOT}/../github-copilot-provider/scripts/
-   ```
+1. Run `node --version`. If Node.js is missing or older than 22, tell the user to install Node.js 22 or newer, and stop.
 
-2. Check if the user is already authenticated:
+2. Check for a saved GitHub sign-in without reading it. Claude Code may ask before it runs this command, because the command contains a variable; it only tests that the file exists and is not empty:
    ```
-   cat ~/.claude-copilot-auth.json 2>/dev/null
+   test -s "${COPILOT_AUTH_FILE:-$HOME/.claude-copilot-auth.json}"
    ```
-
-3. If not authenticated, tell the user to run in a separate terminal:
+   Exit status 0 means the user is signed in. Otherwise, ask the user to run this in their own terminal, complete GitHub's device sign-in, and tell you when it is done; then check again:
    ```
-   node ${CLAUDE_PLUGIN_ROOT}/../github-copilot-provider/scripts/auth.mjs
-   ```
-   Wait for them to confirm they've completed authentication.
-
-4. Once authenticated, tell the user how to start the proxy and use it:
-
-   **Terminal 1** — Start the proxy:
-   ```
-   node ${CLAUDE_PLUGIN_ROOT}/../github-copilot-provider/scripts/proxy.mjs
+   node "${CLAUDE_PLUGIN_ROOT}/scripts/auth.mjs"
    ```
 
-   **Terminal 2** — Run Claude Code:
+3. Tell the user to exit this session and start Claude Code from a terminal with the launcher. It reuses or starts the proxy (Docker if available, otherwise Node.js) and gives Claude Code the local key:
    ```
-   ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY=copilot-proxy claude
+   "${CLAUDE_PLUGIN_ROOT}/scripts/launch.sh"
    ```
+   For an alias, they can add `alias claude-copilot='"${CLAUDE_PLUGIN_ROOT}/scripts/launch.sh"'` to `~/.bashrc` or `~/.zshrc`, replacing any older `claude-copilot` alias.
 
-5. For convenience, suggest they add a shell alias:
-   ```bash
-   # Add to ~/.zshrc or ~/.bashrc
-   alias claude-copilot='ANTHROPIC_BASE_URL=http://localhost:18080 ANTHROPIC_API_KEY=copilot-proxy claude'
-   ```
+4. Without Bash, for example in PowerShell, point the user to the manual steps in `${CLAUDE_PLUGIN_ROOT}/README.md`. In short, from `${CLAUDE_PLUGIN_ROOT}`: run `node scripts/proxy.mjs` in one terminal; in another, set `ANTHROPIC_BASE_URL` to `http://127.0.0.1:18080`, set `ANTHROPIC_AUTH_TOKEN` to the output of `node scripts/proxy.mjs --print-api-key`, remove `ANTHROPIC_API_KEY`, and run `claude`.
 
-Be concise and guide them through each step, verifying success before moving on.
+Be concise. Never suggest `ANTHROPIC_API_KEY=copilot-proxy` or `http://localhost:18080` from older instructions: the proxy rejects that key, and it listens on `127.0.0.1`.
