@@ -1,5 +1,8 @@
 # Claude Code via GitHub Copilot
 
+> [!IMPORTANT]
+> **This fork is archived.** Development continues at [andyzengmath/claude-code-on-copilot](https://github.com/andyzengmath/claude-code-on-copilot), with the full commit history. To move an existing checkout, run `git remote set-url origin https://github.com/andyzengmath/claude-code-on-copilot.git` and then `git pull`. The pull requests and reviews in this fork remain readable here.
+
 <p align="center">
 <img alt="pipeline" src="https://github.com/user-attachments/assets/bdc80db2-97b2-4515-ae13-ef220ba3b21c" width="full"/>
 </p>
