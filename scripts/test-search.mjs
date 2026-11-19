@@ -152,6 +152,22 @@ test("unsupported search versions, user location and contradictory domain lists 
   assert.throws(() => extract([{ name: "web_search", type: "web_search_20250305", max_uses: -1 }], config), /max_uses/i)
 })
 
+// Claude Code 2.1.328 forwards both lists to its nested WebSearch request,
+// one of them possibly empty, and rejects only two nonempty lists itself.
+test("an empty companion domain list is not a contradiction", () => {
+  const extract = exported("extractWebSearchConfig")
+  const config = searchConfig()
+  const domains = (fields) => {
+    const { allowedDomains, blockedDomains } = extract([{ name: "web_search", type: "web_search_20250305", ...fields }], config)
+    return { allowedDomains, blockedDomains }
+  }
+  assert.deepEqual(domains({ allowed_domains: ["NodeJS.org"], blocked_domains: [] }), { allowedDomains: ["nodejs.org"], blockedDomains: [] })
+  assert.deepEqual(domains({ allowed_domains: [], blocked_domains: ["example.com"] }), { allowedDomains: [], blockedDomains: ["example.com"] })
+  assert.deepEqual(domains({ allowed_domains: [], blocked_domains: [] }), { allowedDomains: [], blockedDomains: [] })
+  assert.throws(() => domains({ allowed_domains: ["nodejs.org"], blocked_domains: ["example.com"] }),
+    (error) => error.status === 400 && /both allowed_domains and blocked_domains/.test(error.message))
+})
+
 test("domain constraints match normalized hostname boundaries, never string suffix tricks", async () => {
   const createService = exported("createWebSearchService")
   const service = createService({

@@ -1267,6 +1267,19 @@ test("Claude Code's 5.5 WebSearch request with automatic choice still makes the 
   assert.equal(payload.tool_choice, "required")
 })
 
+test("an empty companion domain list from Claude Code does not reject its WebSearch", async (t) => {
+  let payload
+  const f = await fixture(t, (call) => {
+    payload = JSON.parse(call.body)
+    return Response.json(hostedReply())
+  }, withLuna)
+  const response = await f.request(nestedWebSearch({ stream: false }, { allowed_domains: ["nodejs.org"], blocked_domains: [] }))
+  assert.equal(response.status, 200)
+  assert.deepEqual(payload.tools[0].filters, { allowed_domains: ["nodejs.org"] })
+  const both = await f.request(nestedWebSearch({ stream: false }, { allowed_domains: ["nodejs.org"], blocked_domains: ["example.org"] }))
+  assert.equal(both.status, 400)
+})
+
 test("a client abort during hosted search cancels it without falling back", { timeout: 2500 }, async (t) => {
   const paths = []
   let hostedSignal
