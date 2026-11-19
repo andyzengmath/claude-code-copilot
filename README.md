@@ -48,7 +48,7 @@ The auth script guides you through GitHub's device-code flow. The OAuth token is
 ./scripts/launch.sh
 ```
 
-The launcher reads/creates a persistent local API key, verifies a compatible running proxy that proves it holds the same key, or tries Docker before Node. The proof is an HMAC of a fresh nonce, so the launcher never sends its key to a listener that does not already hold it. It waits up to 30 seconds for readiness and cleans up its Node child if startup fails. A ready Node proxy remains available when Claude Code exits so other sessions are not interrupted; use the printed Bash `kill` command to stop it explicitly. Existing proxies and Docker containers are never stopped by the launcher. Export configuration variables before launching; the launcher does not source `.env`.
+The launcher reads/creates a persistent local API key, verifies a compatible running proxy that proves it holds the same key, or tries Docker before Node. The proof is an HMAC of a fresh nonce, so the launcher never sends its key to a listener that does not already hold it. It waits up to 30 seconds for readiness and cleans up its Node child if startup fails. A ready Node proxy remains available when Claude Code exits so other sessions are not interrupted; use the printed Bash `kill` command to stop it explicitly. Existing proxies and Docker containers are never stopped by the launcher. Export configuration variables before launching; the launcher does not source `.env`. It starts Claude Code with the key in `ANTHROPIC_AUTH_TOKEN` and with `ANTHROPIC_API_KEY` removed from its environment.
 
 **Manual Node startup:**
 
@@ -60,19 +60,21 @@ In another terminal, from the same checkout and using the same credential-path e
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:${COPILOT_PROXY_PORT:-18080}"
-export ANTHROPIC_API_KEY="$(node scripts/proxy.mjs --print-api-key)"
-unset ANTHROPIC_AUTH_TOKEN
+export ANTHROPIC_AUTH_TOKEN="$(node scripts/proxy.mjs --print-api-key)"
+unset ANTHROPIC_API_KEY
 claude
 ```
 
 `--print-api-key` explicitly writes only the key to stdout; capture it rather than displaying it. It works without a GitHub auth file and never contacts GitHub. Normal startup does not print the key. Keep both credentials files private and out of version control.
+
+Give Claude Code the key as `ANTHROPIC_AUTH_TOKEN`, as the launcher does, and leave `ANTHROPIC_API_KEY` unset. Interactive Claude Code uses `ANTHROPIC_API_KEY` only after asking "Do you want to use this API key?", where the default answer is No, and it remembers the answer. `ANTHROPIC_AUTH_TOKEN` needs no confirmation, takes precedence over a claude.ai login, and is sent as `Authorization: Bearer`, which the proxy accepts. With both variables set, Claude Code can still ask about the API key. Set the token only together with `ANTHROPIC_BASE_URL`: without the base URL, Claude Code sends it to Anthropic.
 
 ### 3. Select your model
 
 Discover model identifiers through the authenticated catalog. `printf` is a shell builtin, so the key reaches curl through stdin rather than a command line other local users can list:
 
 ```bash
-printf 'x-api-key: %s\n' "$ANTHROPIC_API_KEY" |
+printf 'Authorization: Bearer %s\n' "$ANTHROPIC_AUTH_TOKEN" |
   curl --fail --silent --show-error -H @- "$ANTHROPIC_BASE_URL/v1/models"
 ```
 
@@ -90,11 +92,12 @@ Create both host credential files **before** starting the container. The followi
 export COPILOT_AUTH_FILE="${COPILOT_AUTH_FILE:-$HOME/.claude-copilot-auth.json}"
 export COPILOT_PROXY_KEY_FILE="${COPILOT_PROXY_KEY_FILE:-$HOME/.claude-copilot-proxy-key.json}"
 # Run node scripts/auth.mjs first if the auth file does not exist.
-export ANTHROPIC_API_KEY="$(node scripts/proxy.mjs --print-api-key)"
+key="$(node scripts/proxy.mjs --print-api-key)"  # also creates the key file
 chmod 600 "$COPILOT_AUTH_FILE" "$COPILOT_PROXY_KEY_FILE"
 docker compose up -d --build proxy
 export ANTHROPIC_BASE_URL="http://127.0.0.1:${COPILOT_PROXY_PORT:-18080}"
-unset ANTHROPIC_AUTH_TOKEN
+export ANTHROPIC_AUTH_TOKEN="$key"
+unset ANTHROPIC_API_KEY key
 claude
 ```
 
@@ -121,17 +124,23 @@ node scripts\proxy.mjs
 $key = node scripts\proxy.mjs --print-api-key
 if ($LASTEXITCODE -ne 0) { throw "Unable to read the local API key" }
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:18080"
-$env:ANTHROPIC_API_KEY = $key
-$env:ANTHROPIC_AUTH_TOKEN = ""
+$env:ANTHROPIC_AUTH_TOKEN = $key
+Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction Ignore
 $env:CLAUDE_CODE_AUTO_MODE_SERVER = "0"
 claude
 ```
 
-If you previously set `ANTHROPIC_API_KEY` to `copilot-proxy` as a user environment variable, the proxy now rejects it with a 401. Store the local key there instead, so new terminals pick it up:
+To have new terminals use the proxy, store the key in your user environment, only together with the base URL, and remove any stored `ANTHROPIC_API_KEY`:
 
 ```powershell
-[Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", (node scripts\proxy.mjs --print-api-key), "User")
+$key = node scripts\proxy.mjs --print-api-key
+if ($LASTEXITCODE -ne 0) { throw "Unable to read the local API key" }
+[Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", "http://127.0.0.1:18080", "User")
+[Environment]::SetEnvironmentVariable("ANTHROPIC_AUTH_TOKEN", $key, "User")
+[Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", $null, "User")
 ```
+
+Every new Claude Code session then goes through the proxy. To undo this, remove `ANTHROPIC_AUTH_TOKEN` before `ANTHROPIC_BASE_URL`, so the key is never stored without the URL.
 
 For Docker Desktop, authenticate first, then replace direct proxy startup with:
 
@@ -144,11 +153,11 @@ if (!$env:COPILOT_PROXY_KEY_FILE) {
 }
 $key = node scripts\proxy.mjs --print-api-key
 if ($LASTEXITCODE -ne 0) { throw "Unable to create/read the local API key" }
-$env:ANTHROPIC_API_KEY = $key
-$env:ANTHROPIC_AUTH_TOKEN = ""
 docker compose up -d --build proxy
 $port = if ($env:COPILOT_PROXY_PORT) { $env:COPILOT_PROXY_PORT } else { "18080" }
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:$port"
+$env:ANTHROPIC_AUTH_TOKEN = $key
+Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction Ignore
 claude
 ```
 
@@ -301,9 +310,15 @@ Export variables before starting Node or the launcher. Compose explicitly maps t
 - **Upgrading from the old proxy:** the literal `copilot-proxy` API key no longer works, and the old proxy accepts requests without any key, so stop it before starting this version. The launcher detects it and prints these steps.
   - Docker: `docker rm -f claude-copilot-proxy`, then run `./scripts/launch.sh`, or export `COPILOT_AUTH_FILE` and `COPILOT_PROXY_KEY_FILE` as shown under [Docker](#docker) and run `docker compose up -d --build --force-recreate --no-deps proxy`.
   - Node: stop the old `node scripts/proxy.mjs` process, then start the new one.
-  - Then capture the generated key with `--print-api-key` and update `ANTHROPIC_API_KEY`.
-- **401 from the local proxy:** use the same key file as the running service and send `x-api-key` or Bearer auth. Health is intentionally public and does not validate your key.
-- **401 from Copilot:** rerun `node scripts/auth.mjs` with the intended `COPILOT_AUTH_FILE`, then restart your proxy. Do not delete unrelated credentials.
+  - Then update your client settings, as the next entry describes.
+- **Client settings from earlier instructions:** earlier versions of this README and of the `/setup-copilot` command used `ANTHROPIC_API_KEY` (set to `copilot-proxy`, or later to the local key) and `http://localhost:18080`. Use `ANTHROPIC_AUTH_TOKEN` and `http://127.0.0.1:18080` instead, and leave `ANTHROPIC_API_KEY` unset, as under [Start Claude Code](#2-start-claude-code). `localhost` can connect to the IPv6 address `[::1]` first, and Compose publishes the Docker proxy only on `127.0.0.1`, so another local program could listen on `[::1]` and receive the key.
+  - Bash or zsh: find the old lines with `grep -nE 'ANTHROPIC_API_KEY|localhost:18080' ~/.bashrc ~/.zshrc ~/.profile 2>/dev/null` and delete them, including an old `claude-copilot` alias (`alias claude-copilot='/path/to/claude-code-copilot/scripts/launch.sh'` replaces it). Run `unset ANTHROPIC_API_KEY` in terminals that are already open.
+  - PowerShell: remove the stored key with `[Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", $null, "User")`, and replace a stored `http://localhost:18080` with `[Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", "http://127.0.0.1:18080", "User")` (or remove it with `$null`). Store the token only as shown under [Windows (PowerShell)](#windows-powershell). Terminals that are already open keep the old values; `Remove-Item Env:ANTHROPIC_API_KEY` clears the key there.
+  - Claude Code settings: remove `ANTHROPIC_API_KEY` from the `env` block of `~/.claude/settings.json`, and change an `ANTHROPIC_BASE_URL` there to `http://127.0.0.1:18080`.
+- **Interactive Claude Code gets 401 "A valid local proxy API key is required" while `claude -p` works:** Claude Code asked "Do you want to use this API key?" about `ANTHROPIC_API_KEY`, and the answer was No, the default. It remembers that answer for the key and sends your claude.ai login to the proxy instead, so `/login` does not help. Pass the key as `ANTHROPIC_AUTH_TOKEN` with `ANTHROPIC_API_KEY` unset, as the launcher and the steps above do, or turn on "Use custom API key" in `/config`. Without a claude.ai login, Claude Code reports "ANTHROPIC_API_KEY not used here" instead.
+- **Login screen, or "Unable to connect to Anthropic services", when Claude Code starts for the first time:** with `ANTHROPIC_API_KEY`, first-run setup checks the connection to Anthropic, asks about the key and, if you decline it, shows the login screen. With `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` set and `ANTHROPIC_API_KEY` unset, setup skips all three. Never overwrite `~/.claude.json` to get past setup: it also holds your folder trust, login and API-key answers.
+- **401 from the proxy:** the request did not carry the proxy's local key; the error says "A valid local proxy API key is required". Use the key from the key file of the running proxy (`COPILOT_PROXY_KEY_FILE`), passed as `ANTHROPIC_AUTH_TOKEN`. Health is intentionally public and does not validate your key.
+- **502 "Copilot rejected the saved GitHub sign-in":** the proxy accepted your key, but GitHub rejected the OAuth token in the auth file, for example because it expired or was revoked. Rerun `node scripts/auth.mjs` with the intended `COPILOT_AUTH_FILE`, then restart your proxy; for Docker, recreate it with `docker compose up -d --force-recreate --no-deps proxy`. Do not delete unrelated credentials.
 - **Port occupied / incompatible service:** identify the owning process/container and stop or restart only that resource, or choose a different `COPILOT_PROXY_PORT`. The launcher never kills a shared proxy or restarts unrelated Docker services.
 - **Unknown model / unsupported feature:** inspect authenticated `/v1/models`, select an available identifier, and check the transport restrictions above. No automatic tier/version substitution is performed.
 - **429, queue overload, or timeout:** inspect the returned error and `Retry-After`, reduce parallelism, or adjust documented bounds. Raising retries cannot safely repair ambiguous network failures.
