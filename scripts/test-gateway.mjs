@@ -373,14 +373,20 @@ test("an inference 404 is never replayed against a second transport", async (t) 
   assert.deepEqual(dispatched, ["/v1/messages"])
 })
 
-for (const status of [400, 404]) {
-  test(`a ${status} is sent once even when retries are enabled`, async (t) => {
+for (const [name, status, headers] of [
+  ["a 400", 400, {}],
+  ["a 404", 404, {}],
+  ["a 500 with x-should-retry: false", 500, { "x-should-retry": "false" }],
+]) {
+  test(`${name} is sent once even when retries are enabled`, async (t) => {
     let attempts = 0
     const f = await fixture(t, () => {
       attempts++
-      return Response.json({ type: "error", error: { type: "invalid_request_error", message: "refused" } }, { status })
+      return Response.json({ type: "error", error: { type: "api_error", message: "refused" } }, { status, headers })
     }, { config: { maxRetries: 3 } })
-    assert.equal((await f.request()).status, status)
+    const response = await f.request()
+    assert.equal(response.status, status)
+    assert.equal(response.headers.get("x-should-retry"), headers["x-should-retry"] ?? null)
     assert.equal(attempts, 1)
   })
 }

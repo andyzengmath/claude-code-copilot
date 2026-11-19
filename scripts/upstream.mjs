@@ -119,7 +119,9 @@ export function createUpstreamClient({ fetchImpl, baseUrl, config, logger, gate:
         const hint = parseRetryAfterMs(response.headers.get("retry-after"))
         if (cooldown && (response.status === 429 || response.status === 503) && hint !== null) gate.cooldown(hint)
         const delay = hint ?? Math.floor(Math.min(1000 * 2 ** attempt, 8000) * (0.5 + Math.random() * 0.5))
-        if (!retryable.has(response.status) || attempt === config.maxRetries || performance.now() + delay > deadline) {
+        // Like Claude Code, honor an upstream x-should-retry: false.
+        if (!retryable.has(response.status) || response.headers.get("x-should-retry") === "false" ||
+          attempt === config.maxRetries || performance.now() + delay > deadline) {
           return { ...upstream, dispose }
         }
         retryHeaders = responseHeaders(response.headers)
