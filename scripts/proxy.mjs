@@ -100,7 +100,8 @@ function validateRequest(body, countTokens) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw new ProxyError(400, "Messages request must be a JSON object", "invalid_request_error")
   }
-  if (typeof body.model !== "string" || !body.model.trim() || body.model.length > 200 || /[\r\n\0]/.test(body.model)) {
+  // The model name is logged, so no control characters (terminal escapes).
+  if (typeof body.model !== "string" || !body.model.trim() || body.model.length > 200 || /[\x00-\x1f\x7f-\x9f]/.test(body.model)) {
     throw new ProxyError(400, "A valid model identifier is required", "invalid_request_error")
   }
   if (!Array.isArray(body.messages) || body.messages.some((message) => !message || typeof message !== "object" || !["user", "assistant", "system"].includes(message.role))) {
@@ -249,7 +250,7 @@ export function createProxyServer({
     let request = { ...upstreamBody(body), model }
     if (ctx.nativeTransport && !searchSettings) request = prepareSearchRequest(request, config, null)
     ctx.inference = true
-    logger.log(`[${new Date().toISOString()}] ${req.method} ${url.pathname} | model: ${model} | transport: ${transport}${searchSettings ? " + search" : ""}`)
+    logger.log(`[${new Date().toISOString()}] ${req.method} ${url.pathname} | model: ${JSON.stringify(model)} | transport: ${transport}${searchSettings ? " + search" : ""}`)
     if (countOnly) {
       if (!ctx.nativeTransport) {
         throw new ProxyError(501, "Authoritative token counting requires native Messages transport", "api_error")

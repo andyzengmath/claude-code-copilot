@@ -320,6 +320,22 @@ test("routing is exact and malformed bodies are rejected before upstream dispatc
   assert.equal(f.calls.length, 0)
 })
 
+test("model names with control characters are rejected, and logged model names are escaped", async (t) => {
+  const lines = []
+  const record = (line) => lines.push(line)
+  // An explicit transport logs the model name the client sent.
+  const f = await fixture(t, () => Response.json(message()), {
+    config: { transport: "messages" }, logger: { log: record, warn: record, error: record },
+  })
+  for (const model of ["claude-sonnet-5\x1b]0;title\x07", "\x1b[2Jclaude-sonnet-5", "claude-sonnet-5\x9b2J", "claude\x7fsonnet", "claude\tsonnet"]) {
+    assert.equal((await f.request({ model })).status, 400, JSON.stringify(model))
+  }
+  assert.equal(f.calls.length, 0)
+  assert.equal((await f.request({ model: "claude-sonnet-5" })).status, 200)
+  assert.ok(lines.some((line) => line.includes('| model: "claude-sonnet-5" |')))
+  assert.equal(lines.some((line) => /[\x00-\x1f\x7f-\x9f]/.test(line)), false)
+})
+
 test("declared and chunked request bodies obey the byte limit", async (t) => {
   const f = await fixture(t, () => assert.fail("oversized request dispatched"), { config: { maxBodyBytes: 256 } })
   assert.equal((await f.request({ messages: [{ role: "user", content: "x".repeat(500) }] })).status, 413)
