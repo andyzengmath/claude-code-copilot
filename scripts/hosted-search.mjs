@@ -332,14 +332,20 @@ export function createHostedSearch({ catalog, client, config, logger, warnOnce }
     }
     let upstream
     let data
+    let deadline
     try {
       const info = (await catalog.get(token, signal)).find((entry) => entry.id === config.webSearchModel)
       if (!info || !isRoutable(info) || !info.supported_endpoints?.includes("/responses")) {
         warnOnce(`Hosted web search model ${config.webSearchModel} is unavailable for /responses; using provider search`)
         return { message: null }
       }
+      // One wall-clock deadline covers admission, the response and its whole
+      // body, which a response that trickles in would otherwise keep extending.
+      deadline = AbortSignal.timeout(config.searchTimeoutMs)
       // No incoming headers: anthropic-* headers do not apply to /responses.
-      upstream = await client.request("/responses", buildHostedSearchRequest(body, settings, config, info), { token, headers: {}, signal })
+      upstream = await client.request("/responses", buildHostedSearchRequest(body, settings, config, info), {
+        token, headers: {}, signal: AbortSignal.any([signal, deadline]),
+      })
       if (!upstream.response.ok) throw await upstreamError(upstream)
       try { data = JSON.parse(await upstream.text()) } catch { throw new ProxyError(502, "Copilot hosted search returned invalid JSON") }
       let message
@@ -354,6 +360,11 @@ export function createHostedSearch({ catalog, client, config, logger, warnOnce }
       return { message, searchModel: info.id }
     } catch (error) {
       signal.throwIfAborted()
+      // The deadline expiring is a hosted failure, not a cancellation.
+      if (deadline?.aborted) {
+        logger.warn(`Hosted web search timed out after ${config.searchTimeoutMs}ms; using provider search`)
+        return { message: null, usage: rejectedHostedUsage(data) }
+      }
       const duration = pause(error)
       // Upstream messages are never logged; hostedReason is written locally.
       logger.warn(`Hosted web search failed (${error.hostedReason ?? error.status ?? error.name}); using provider search` +

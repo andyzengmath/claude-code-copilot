@@ -888,6 +888,13 @@ const emulationRound = (body, rounds) => {
     ? message([{ type: "tool_use", id: "toolu_s", name: "web_search", input: { query: "node lts" } }], "tool_use")
     : message([{ type: "text", text: "Emulated answer" }])))
 }
+const warningsTo = (warnings) => ({ log() {}, error() {}, warn: (line) => warnings.push(line) })
+async function until(ready, ms = 2000) {
+  for (const end = performance.now() + ms; !ready();) {
+    if (performance.now() > end) throw new Error("condition not reached")
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
 
 for (const streaming of [true, false]) {
   test(`Claude Code's nested WebSearch is answered by one hosted GPT-6 Luna search (${streaming ? "streaming" : "JSON"})`, async (t) => {
@@ -1131,6 +1138,82 @@ test("a client abort during hosted search cancels it without falling back", { ti
   await assert.rejects(pending)
   while (!hostedSignal.aborted) await new Promise((resolve) => setTimeout(resolve, 5))
   assert.deepEqual(paths, ["/responses"])
+})
+
+// Hosted search has one wall-clock deadline, WEB_SEARCH_TIMEOUT_MS, for
+// admission, the response and its whole body; provider search answers after it.
+test("a hosted answer that trickles in past the search deadline falls back to provider search", { timeout: 5000 }, async (t) => {
+  const paths = []
+  const rounds = []
+  const warnings = []
+  let cancelled = false
+  const f = await fixture(t, (call) => {
+    paths.push(call.url.pathname)
+    if (call.url.pathname !== "/responses") return emulationRound(JSON.parse(call.body), rounds)
+    // A valid answer in 16-byte chunks 30 ms apart: no read waits long, but the body takes over a second.
+    const bytes = new TextEncoder().encode(JSON.stringify(hostedReply()))
+    let timer
+    return new Response(new ReadableStream({
+      start(controller) {
+        let offset = 0
+        timer = setInterval(() => {
+          controller.enqueue(bytes.subarray(offset, offset += 16))
+          if (offset >= bytes.length) { clearInterval(timer); controller.close() }
+        }, 30)
+      },
+      cancel() { cancelled = true; clearInterval(timer) },
+    }), { headers: { "content-type": "application/json" } })
+  }, { ...withLuna, config: { searchTimeoutMs: 100, requestTimeoutMs: 5000 }, searchProvider: async () => [providerResult], logger: warningsTo(warnings) })
+  const response = await f.request(nestedWebSearch({ stream: false }))
+  assert.equal(response.status, 200)
+  assert.equal((await response.json()).content.at(-1).text, "Emulated answer")
+  assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages"])
+  assert.equal(cancelled, true)
+  assert.deepEqual(warnings, ["Hosted web search timed out after 100ms; using provider search"])
+})
+
+test("a hosted search without a response falls back at the search deadline, not the request timeout", { timeout: 10000 }, async (t) => {
+  const paths = []
+  const rounds = []
+  const f = await fixture(t, (call) => {
+    paths.push(call.url.pathname)
+    return call.url.pathname === "/responses" ? new Promise(() => {}) : emulationRound(JSON.parse(call.body), rounds)
+  }, { ...withLuna, config: { searchTimeoutMs: 50, requestTimeoutMs: 5000 }, searchProvider: async () => [providerResult] })
+  const started = performance.now()
+  const response = await f.request(nestedWebSearch({ stream: false }))
+  assert.equal(response.status, 200)
+  assert.equal((await response.json()).content.at(-1).text, "Emulated answer")
+  assert.ok(performance.now() - started < 1000, `fell back after ${Math.round(performance.now() - started)} ms`)
+  assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages"])
+})
+
+test("a hosted search still waiting for admission at the search deadline falls back", { timeout: 5000 }, async (t) => {
+  const paths = []
+  const rounds = []
+  const warnings = []
+  let held
+  const f = await fixture(t, (call) => {
+    paths.push(call.url.pathname)
+    if (call.url.pathname === "/responses") return Response.json(hostedReply())
+    const body = JSON.parse(call.body)
+    if (body.tools) return emulationRound(body, rounds)
+    // A plain streaming answer that holds the only admission slot until the test ends it.
+    return new Response(new ReadableStream({ start(controller) { held = controller } }), { headers: { "content-type": "text/event-stream" } })
+  }, {
+    ...withLuna, config: { maxConcurrentRequests: 1, queueTimeoutMs: 5000, searchTimeoutMs: 100 },
+    searchProvider: async () => [providerResult], logger: warningsTo(warnings),
+  })
+  const plain = await f.request({ stream: true })
+  const search = f.request(nestedWebSearch({ stream: false }))
+  await until(() => warnings.length > 0)
+  assert.deepEqual(warnings, ["Hosted web search timed out after 100ms; using provider search"])
+  held.enqueue(new TextEncoder().encode(nativeFrames()))
+  held.close()
+  assert.equal(parsedEvents(await plain.text()).at(-1).type, "message_stop")
+  const response = await search
+  assert.equal(response.status, 200)
+  assert.equal((await response.json()).content.at(-1).text, "Emulated answer")
+  assert.deepEqual(paths, ["/v1/messages", "/v1/messages", "/v1/messages"])
 })
 
 test("hosted search serves Chat-transport models, and other searches there get 501 before any output", async (t) => {
