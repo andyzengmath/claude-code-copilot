@@ -556,6 +556,36 @@ test("an idle upstream is cancelled and receives a structured streaming error", 
   assert.equal(cancelled, true)
 })
 
+test("a slow native stream gets heartbeat pings, and their timer stops when the response ends", { timeout: 5000 }, async (t) => {
+  const intervals = t.mock.method(globalThis, "setInterval")
+  const cleared = t.mock.method(globalThis, "clearInterval")
+  const frames = nativeFrames()
+  const split = frames.indexOf("event: content_block_start")
+  let upstream
+  const f = await fixture(t, () => new Response(new ReadableStream({
+    start(controller) {
+      upstream = controller
+      controller.enqueue(new TextEncoder().encode(frames.slice(0, split)))
+    },
+  }), { headers: { "content-type": "text/event-stream" } }), { config: { heartbeatMs: 20 } })
+  const response = await f.request({ stream: true })
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
+  let text = ""
+  // The upstream stays silent until the client has seen a ping.
+  while (!text.includes("event: ping")) {
+    const { done, value } = await reader.read()
+    assert.equal(done, false, "the stream ended before a heartbeat")
+    text += value
+  }
+  upstream.enqueue(new TextEncoder().encode(frames.slice(split)))
+  upstream.close()
+  for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) text += chunk.value
+  assert.equal(parsedEvents(text).at(-1).type, "message_stop")
+  const pings = intervals.mock.calls.filter((call) => call.arguments[1] === 20)
+  assert.equal(pings.length, 1)
+  assert.ok(cleared.mock.calls.some((call) => call.arguments[0] === pings[0].result), "the heartbeat timer is cleared")
+})
+
 test("downstream disconnect aborts and cancels the upstream body", { timeout: 2500 }, async (t) => {
   let upstreamSignal
   let resolveCancelled
@@ -889,6 +919,29 @@ test("native nonstreaming rejects malformed tool input shapes instead of forward
   const response = await f.request()
   assert.equal(response.status, 502)
   assert.equal((await response.json()).type, "error")
+})
+
+test("a native non-streaming reply that is not a complete message is an error", async (t) => {
+  for (const reply of [{ ...message(), stop_reason: null }, { ...message(), content: "hello" }, { ...message(), type: "completion" }]) {
+    const f = await fixture(t, () => Response.json(reply))
+    const response = await f.request()
+    assert.equal(response.status, 502)
+    assert.match((await response.json()).error.message, /incomplete native message/)
+  }
+})
+
+test("an upstream reply over the response byte limit is an error, never a cut-off message", async (t) => {
+  const reply = message([{ type: "text", text: "x".repeat(8192) }])
+  const f = await fixture(t, (call) => JSON.parse(call.body).stream ? streamResponse(nativeFrames(reply)) : Response.json(reply), {
+    config: { maxResponseBytes: 4096 },
+  })
+  const plain = await f.request()
+  assert.equal(plain.status, 502)
+  assert.match((await plain.json()).error.message, /byte limit/)
+  const events = parsedEvents(await (await f.request({ stream: true })).text())
+  assert.equal(events.at(-1).type, "error")
+  assert.match(events.at(-1).error.message, /byte limit/)
+  assert.equal(events.some((event) => event.type === "message_stop"), false)
 })
 
 test("retry admission cannot dispatch after its budget or retain an abandoned queue reservation", async (t) => {
