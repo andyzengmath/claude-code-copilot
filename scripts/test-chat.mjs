@@ -484,3 +484,12 @@ test("a split turn with text between its tool calls keeps every part in order", 
   // with no tool call anywhere cannot be a split turn.
   upstreamError(() => translateResponseToAnthropic(split([{ content: "one" }], [{ content: "two" }]), "model"))
 })
+
+test("consecutive text choices of a split turn stay separate blocks", () => {
+  const out = translateResponseToAnthropic(split(
+    [{ content: "First part." }],
+    [{ content: "Second part." }],
+    [{ tool_calls: [fn("toolu_h", "get_time", { city: "Lima" })] }],
+  ), "model")
+  assert.deepEqual(out.content.map((block) => block.text ?? block.id), ["First part.", "Second part.", "toolu_h"])
+})

@@ -49,7 +49,11 @@ export function extractWebSearchConfig(tools, config) {
   if (tool.name !== "web_search" || tools.some((other) => other !== tool && other.name === "web_search")) {
     throw new ProxyError(400, "The server search tool must have the unique name web_search", "invalid_request_error")
   }
-  if (tool.allowed_domains != null && tool.blocked_domains != null) {
+  // Claude Code can send an empty list beside the other one; only two
+  // nonempty lists contradict each other.
+  const allowedDomains = domainList(tool.allowed_domains)
+  const blockedDomains = domainList(tool.blocked_domains)
+  if (allowedDomains.length && blockedDomains.length) {
     throw new ProxyError(400, "Search cannot specify both allowed_domains and blocked_domains", "invalid_request_error")
   }
   // search_profile is an optional hint from Claude Code 2.1.303+ that only
@@ -64,8 +68,7 @@ export function extractWebSearchConfig(tools, config) {
   }
   return {
     requested, maxUses: Math.min(requested, config.searchMaxUses),
-    allowedDomains: domainList(tool.allowed_domains),
-    blockedDomains: domainList(tool.blocked_domains),
+    allowedDomains, blockedDomains,
     userLocation: userLocation(tool.user_location),
     ignoredFields,
   }

@@ -242,8 +242,9 @@ export async function writeResponse(res, data, { signal, timeoutMs = 120000 } = 
   })
 }
 
+// `timeoutMs` bounds each body read; `headersTimeoutMs` the wait for headers.
 export async function openResponse(fetchImpl, url, init, {
-  signal: parentSignal, timeoutMs = 120000, maxBytes = 64 * 1024 * 1024, logger = console,
+  signal: parentSignal, timeoutMs = 120000, headersTimeoutMs = timeoutMs, maxBytes = 64 * 1024 * 1024, logger = console,
 } = {}) {
   parentSignal?.throwIfAborted()
   const controller = new AbortController()
@@ -254,8 +255,8 @@ export async function openResponse(fetchImpl, url, init, {
       if (error.name !== "AbortError") logger.warn("Upstream body cancellation failed")
     })
   }
-  async function wait(promise, phase) {
-    const timer = setTimeout(() => controller.abort(new ProxyError(504, `Copilot ${phase} timed out after ${timeoutMs}ms`)), timeoutMs)
+  async function wait(promise, phase, ms) {
+    const timer = setTimeout(() => controller.abort(new ProxyError(504, `Copilot ${phase} timed out after ${ms}ms`)), ms)
     try {
       return await abortable(promise, signal)
     } finally {
@@ -269,7 +270,7 @@ export async function openResponse(fetchImpl, url, init, {
   pending.then((response) => { if (signal.aborted) cancel(response.body) }, () => {})
   let response
   try {
-    response = await wait(pending, "request")
+    response = await wait(pending, "request", headersTimeoutMs)
   } catch (error) {
     controller.abort(error)
     if (error.status || error.name === "AbortError") throw error
@@ -296,7 +297,7 @@ export async function openResponse(fetchImpl, url, init, {
     let bytes = 0
     try {
       for (;;) {
-        const { done, value } = await wait(reader.read(), "body read")
+        const { done, value } = await wait(reader.read(), "body read", timeoutMs)
         if (done) { exhausted = true; break }
         bytes += value.byteLength
         if (bytes > maxBytes) throw new ProxyError(502, "Copilot response exceeds the configured byte limit")

@@ -11,6 +11,7 @@ Reviewed on 2026-11-18. PR #11 contains three layers on top of `main` (`ed0e1b4`
   - `bcbd634` confirmation-round finding
 - **Merged:** with a merge commit, `43ea788`, so the commits stay bisectable (DR-32).
 - **Follow-up:** PR #12 resolves the deferred findings; see [Follow-up](#follow-up-pr-12).
+- **Re-review:** a [re-review](hosted-web-search-re-review.md) found DR-4, DR-10, DR-11, DR-19, DR-25 and R-5 only partly fixed; PR #13 completes them.
 
 ## Method
 

@@ -9,6 +9,8 @@ permissions:
 
 jobs:
   test:
+    # A hung test must not hold a runner for GitHub's default of six hours.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -89,7 +91,7 @@ jobs:
           '
       - name: Start the egress-blocked proxy
         run: docker compose start proxy
-      - name: Verify actual loopback publishing, read-only credentials, and blocked egress
+      - name: Verify loopback publishing, read-only credentials, container hardening, and blocked egress
         shell: bash
         run: |
           node --input-type=module -e '
@@ -112,6 +114,11 @@ jobs:
               assert.equal(mounts[0].Source, source);
               assert.equal(mounts[0].RW, false, "Credential mount must be read-only");
             }
+            // The health checks below prove that the proxy still reads both 0600 credential files.
+            assert.equal(container.HostConfig.ReadonlyRootfs, true, "Root filesystem must be read-only");
+            const status = execFileSync("docker", ["exec", id, "cat", "/proc/1/status"], { encoding: "utf8" });
+            assert.equal(status.match(/^CapEff:\s*(\w+)$/m)?.[1], "0000000000000002", "Only CAP_DAC_OVERRIDE may be effective");
+            assert.match(status, /^NoNewPrivs:\s*1$/m);
             const networks = Object.values(container.NetworkSettings.Networks);
             assert.equal(networks.length, 1);
             const [network] = JSON.parse(execFileSync("docker", ["network", "inspect", networks[0].NetworkID], { encoding: "utf8" }));

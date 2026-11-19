@@ -47,7 +47,8 @@ function device(overrides = {}) {
 }
 
 function scenario({ deviceData = device(), polls = [{ access_token: TOKEN }],
-  userStatus = 200, modelsStatus = 200, userReply, modelsReply, deviceReply } = {}) {
+  userStatus = 200, modelsStatus = 200, userReply, modelsReply, deviceReply,
+  stalls = [deviceReply, userReply, modelsReply, ...polls].includes(hangingRequest) } = {}) {
   let time = 0
   const sleeps = []
   const requests = []
@@ -55,10 +56,11 @@ function scenario({ deviceData = device(), polls = [{ access_token: TOKEN }],
   const options = {
     now: () => time,
     sleep: async (ms) => { sleeps.push(ms); time += ms },
-    // A real timer, unlike the fake clock above. Tests with a hanging request
-    // wait for it to fire. Others must finish real file I/O before it does:
-    // 100ms failed intermittently under load (a credential read took 374ms).
-    timeoutMs: 1000,
+    // A real timer, unlike the fake clock above. A test whose request never
+    // finishes (`stalls`) waits for it to fire, so it is short there. Other
+    // tests must finish real file I/O before it fires: a credential read inside
+    // a request took over a second on a loaded Windows machine.
+    timeoutMs: stalls ? 1000 : 10000,
     fetchImpl: async (url, init) => {
       const path = new URL(url).pathname
       assert.ok(init.signal instanceof AbortSignal, "every request must have an abort signal")
@@ -416,7 +418,7 @@ test("polling timeouts back off all later polls and still respect local expiry",
 test("timeout covers response body consumption, not only response headers", async (t) => {
   const { authenticate } = await authentication()
   const { filePath } = await fixture(t)
-  const run = scenario({ deviceReply: () => new Response(new ReadableStream({ start() {} })) })
+  const run = scenario({ deviceReply: () => new Response(new ReadableStream({ start() {} })), stalls: true })
   await assert.rejects(authenticate({ filePath, ...run.options }), /timed out|timeout/i)
 })
 

@@ -3,6 +3,7 @@ import test from "node:test"
 import { readConfig } from "./config.mjs"
 import { buildHostedSearchRequest, emitHostedMessage, hostedSearchIneligibility, hostedSearchMessage, rejectedHostedUsage } from "./hosted-search.mjs"
 import { extractWebSearchConfig } from "./search.mjs"
+import { NativeMessageState } from "./sse.mjs"
 
 const config = readConfig({})
 const luna = { id: "gpt-6-luna", supported_endpoints: ["/responses", "ws:/responses"], capabilities: { limits: { max_output_tokens: 128000 } } }
@@ -64,6 +65,27 @@ const answer = (text, citations = []) => ({
 })
 const map = (response, settings = settingsFor(nestedSearch())) => hostedSearchMessage(response, { id: "msg_t", model: "m", settings })
 const results = (message) => message.content.filter((block) => block.type === "web_search_tool_result").map((block) => block.content)
+// A streamed message as a native Messages client reassembles it: streamed
+// parts start empty and every delta has its block's type. NativeMessageState
+// rejects delta types it does not know.
+function reassembled(events) {
+  const state = new NativeMessageState({ collect: true })
+  const blocks = new Map()
+  for (const data of events) {
+    if (data.type === "content_block_start") {
+      const block = data.content_block
+      blocks.set(data.index, block.type)
+      if (block.type === "text") assert.equal(block.text, "")
+      if (block.type === "server_tool_use") assert.deepEqual(block.input, {})
+    } else if (data.type === "content_block_delta") {
+      const type = blocks.get(data.index)
+      assert.equal(data.delta.type, { text: "text_delta", server_tool_use: "input_json_delta" }[type], `delta of a ${type} block`)
+    }
+    state.accept(data, data.type)
+  }
+  assert.equal(state.completed, true)
+  return state.message
+}
 
 test("Claude Code's nested WebSearch request becomes one hosted Responses search", () => {
   const location = { type: "approximate", city: "Seattle", region: "Washington", country: "US", timezone: "America/Los_Angeles" }
@@ -147,6 +169,18 @@ test("hosted search accepts only request fields it can honor; everything else us
     ] }), /non-text/],
     [nestedSearch({ system: [{ type: "image", source: {} }] }), /non-text/],
   ]) assert.match(reason(body), expected)
+})
+
+test("hosted search takes only the tool choices it honors; a forced undeclared tool uses provider search", () => {
+  const reason = (body) => hostedSearchIneligibility(body, settingsFor(body), config)
+  for (const tool_choice of [
+    undefined, { type: "auto" }, { type: "any" }, { type: "tool", name: "web_search" },
+    { type: "auto", disable_parallel_tool_use: false }, { type: "tool", name: "web_search", disable_parallel_tool_use: true },
+  ]) assert.equal(reason(nestedSearch({ tool_choice })), null, JSON.stringify(tool_choice))
+  for (const tool_choice of [
+    { type: "tool", name: "undeclared_tool" }, { type: "tool" }, { type: "auto", name: "web_search" },
+    { type: "any", disable_parallel_tool_use: "yes" }, { type: "auto", strict: true }, { type: "required" }, "auto", null,
+  ]) assert.match(reason(nestedSearch({ tool_choice })), /tool_choice requires provider search/, JSON.stringify(tool_choice))
 })
 
 test("hosted results map to server_tool_use, web_search_tool_result and text blocks", () => {
@@ -260,15 +294,30 @@ test("hosted search ids, queries, source caps and usage are normalized or reject
   }
 })
 
-test("hosted search truncation is reported and invalid payloads are rejected for fallback", () => {
-  const truncated = map(lunaResponse({
+test("a truncated hosted answer is used only after a completed search, and invalid payloads are rejected for fallback", () => {
+  const cut = {
     status: "incomplete", incomplete_details: { reason: "max_output_tokens" },
-    output: [{ id: "ws_partial", type: "web_search_call", status: "incomplete", action: {} }],
     usage: { input_tokens: 4455, input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 }, output_tokens: 16 },
-  }))
-  assert.equal(truncated.stop_reason, "max_tokens")
-  assert.deepEqual(truncated.content, [])
-  assert.equal(truncated.usage.output_tokens, 16)
+  }
+  // A completed search keeps its results and any partial answer, reported as max_tokens.
+  const partial = map(lunaResponse({ ...cut, output: [search("ws_1", "q", ["https://nodejs.org/a"]), answer("Node.js 26 is")] }))
+  assert.equal(partial.stop_reason, "max_tokens")
+  assert.deepEqual(partial.content.map((block) => block.type), ["server_tool_use", "web_search_tool_result", "text"])
+  assert.equal(partial.content[2].text, "Node.js 26 is")
+  assert.equal(partial.usage.output_tokens, 16)
+  const resultsOnly = map(lunaResponse({ ...cut, output: [search("ws_1", "q", ["https://nodejs.org/a"])] }))
+  assert.equal(resultsOnly.stop_reason, "max_tokens")
+  assert.deepEqual(results(resultsOnly).map((list) => list.map((result) => result.url)), [["https://nodejs.org/a"]])
+  // Without one, a truncated answer falls back like any other unsearched answer.
+  for (const output of [
+    [],
+    [{ id: "ws_partial", type: "web_search_call", status: "incomplete", action: {} }],
+    [search("ws_1", "q", [], "incomplete")],
+    [search("ws_1", "q", [], "failed"), answer("Search is unavailable")],
+    [answer("From memory")],
+  ]) {
+    assert.throws(() => map(lunaResponse({ ...cut, output })), (error) => error.status === 502 && /no search/.test(error.message))
+  }
   for (const invalid of [
     lunaResponse({ status: "failed" }),
     lunaResponse({ status: "incomplete", incomplete_details: { reason: "content_filter" } }),
@@ -301,4 +350,6 @@ test("hosted messages stream as standard Anthropic events without splitting char
   for (const delta of deltas) assert.equal(delta, Buffer.from(delta).toString(), "no delta ends or starts inside a surrogate pair")
   assert.deepEqual(events.at(-2), { type: "message_delta", data: { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: message.usage } })
   assert.deepEqual(events.at(-1), { type: "message_stop", data: { type: "message_stop" } })
+  // Reassembled as a client would, the stream is exactly the JSON message.
+  assert.deepEqual(reassembled(events.map((event) => event.data)), message)
 })

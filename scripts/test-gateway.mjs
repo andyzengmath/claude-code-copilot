@@ -1,10 +1,15 @@
 import assert from "node:assert/strict"
 import { createHmac } from "node:crypto"
 import { once } from "node:events"
+import { mkdtemp, rm } from "node:fs/promises"
 import { createServer } from "node:http"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { gzipSync } from "node:zlib"
 import test from "node:test"
+import { readAuthToken } from "./credentials.mjs"
 import * as proxy from "./proxy.mjs"
+import { NativeMessageState } from "./sse.mjs"
 import { fixture, event, message, nativeFrames, streamResponse, key, token, models } from "./test-helpers/gateway.mjs"
 
 const parsedEvents = (text) => [...text.matchAll(/^data: (.+)$/gm)].map((match) => JSON.parse(match[1]))
@@ -254,6 +259,7 @@ test("native forwarding preserves semantic body fields and Anthropic headers", a
   assert.equal(new Headers(seen.headers).get("anthropic-beta"), "fixture-beta-1,fixture-beta-2")
   assert.equal(new Headers(seen.headers).get("anthropic-version"), "2023-06-01")
   assert.equal(new Headers(seen.headers).get("authorization"), `Bearer ${token}`)
+  assert.equal(new Headers(seen.headers).get("copilot-vision-request"), "true")
   assert.equal(new Headers(seen.headers).has("x-api-key"), false)
 })
 
@@ -264,9 +270,43 @@ test("health is public but inference and model discovery require the local key",
   for (const path of ["/v1/messages", "/v1/models", "/v1/messages/count_tokens"]) {
     const response = await fetch(`${f.base}${path}`, { headers: { "x-api-key": "wrong" } })
     assert.equal(response.status, 401)
+    assert.equal(response.headers.get("x-should-retry"), "false")
     assert.equal(response.headers.has("access-control-allow-origin"), false)
   }
   assert.equal(f.calls.length, 0)
+})
+
+test("Copilot rejecting the GitHub sign-in is a final 502 naming the fix, so only the local key gets a 401", async (t) => {
+  const rejected = () => Response.json({ type: "error", error: { type: "authentication_error", message: "Bad credentials" } }, { status: 401 })
+  for (const [name, path, options] of [
+    ["model listing", "/v1/models", { catalog: rejected }],
+    ["model discovery", "/v1/messages", { catalog: rejected }],
+    ["native generation", "/v1/messages", {}],
+    ["Chat generation", "/v1/messages", { config: { transport: "chat" } }],
+    ["token counting", "/v1/messages/count_tokens", {}],
+  ]) {
+    const errors = []
+    const f = await fixture(t, rejected, { ...options, logger: { log() {}, warn() {}, error: (line) => errors.push(line) } })
+    const response = path === "/v1/models" ? await fetch(`${f.base}${path}`, { headers: { "x-api-key": f.key } }) : await f.request({}, path)
+    assert.equal(response.status, 502, name)
+    assert.equal(response.headers.get("x-should-retry"), "false", name)
+    assert.deepEqual(await response.json(), { type: "error", error: {
+      type: "api_error", message: "Copilot rejected the saved GitHub sign-in (HTTP 401). Run node scripts/auth.mjs to sign in again.",
+    } }, name)
+    // The operator is told too, including before inference starts.
+    assert.deepEqual(errors, ["Copilot rejected the saved GitHub sign-in (HTTP 401); run node scripts/auth.mjs"], name)
+  }
+})
+
+test("failures before inference are logged, but the client's own mistakes are not", async (t) => {
+  const errors = []
+  const f = await fixture(t, () => assert.fail("no generation without a catalog"), {
+    catalog: () => Response.json({ message: "private upstream detail" }, { status: 503 }),
+    logger: { log() {}, warn() {}, error: (line) => errors.push(line) },
+  })
+  assert.equal((await f.request()).status, 503)
+  assert.equal((await f.request({ max_tokens: -1 })).status, 400)
+  assert.deepEqual(errors, ["Proxy request failed: 503 ProxyError"])
 })
 
 test("health proves possession of the local key only for a well-formed nonce", async (t) => {
@@ -292,6 +332,22 @@ test("routing is exact and malformed bodies are rejected before upstream dispatc
     assert.equal(response.status, 400)
   }
   assert.equal(f.calls.length, 0)
+})
+
+test("model names with control characters are rejected, and logged model names are escaped", async (t) => {
+  const lines = []
+  const record = (line) => lines.push(line)
+  // An explicit transport logs the model name the client sent.
+  const f = await fixture(t, () => Response.json(message()), {
+    config: { transport: "messages" }, logger: { log: record, warn: record, error: record },
+  })
+  for (const model of ["claude-sonnet-5\x1b]0;title\x07", "\x1b[2Jclaude-sonnet-5", "claude-sonnet-5\x9b2J", "claude\x7fsonnet", "claude\tsonnet"]) {
+    assert.equal((await f.request({ model })).status, 400, JSON.stringify(model))
+  }
+  assert.equal(f.calls.length, 0)
+  assert.equal((await f.request({ model: "claude-sonnet-5" })).status, 200)
+  assert.ok(lines.some((line) => line.includes('| model: "claude-sonnet-5" |')))
+  assert.equal(lines.some((line) => /[\x00-\x1f\x7f-\x9f]/.test(line)), false)
 })
 
 test("declared and chunked request bodies obey the byte limit", async (t) => {
@@ -325,6 +381,22 @@ test("native errors retain upstream status, body and diagnostic headers", async 
   assert.equal(response.headers.has("content-encoding"), false)
 })
 
+test("a native upstream error that is not an Anthropic envelope gets a JSON envelope", async (t) => {
+  for (const [status, contentType, body, type] of [
+    [502, "text/html", "<html><body><h1>502 Bad Gateway</h1></body></html>", "api_error"],
+    [404, "application/json", JSON.stringify({ error: { message: "model unavailable" } }), "not_found_error"],
+  ]) {
+    const f = await fixture(t, () => new Response(body, { status, headers: { "content-type": contentType, "request-id": "req_gateway" } }))
+    const response = await f.request()
+    assert.equal(response.status, status)
+    assert.equal(response.headers.get("content-type"), "application/json")
+    assert.equal(response.headers.get("request-id"), "req_gateway")
+    const envelope = await response.json()
+    assert.equal(envelope.type, "error")
+    assert.equal(envelope.error.type, type)
+  }
+})
+
 test("an inference 404 is never replayed against a second transport", async (t) => {
   const dispatched = []
   const f = await fixture(t, (call) => {
@@ -335,14 +407,49 @@ test("an inference 404 is never replayed against a second transport", async (t) 
   assert.deepEqual(dispatched, ["/v1/messages"])
 })
 
-test("a network failure does not replay an ambiguously submitted completion", async (t) => {
-  let dispatched = 0
-  const f = await fixture(t, () => {
-    dispatched++
-    throw new TypeError("fetch failed")
-  }, { config: { maxRetries: 3 } })
-  assert.equal((await f.request()).status, 502)
-  assert.equal(dispatched, 1)
+for (const [name, status, headers] of [
+  ["a 400", 400, {}],
+  ["a 404", 404, {}],
+  ["a 500 with x-should-retry: false", 500, { "x-should-retry": "false" }],
+]) {
+  test(`${name} is sent once even when retries are enabled`, async (t) => {
+    let attempts = 0
+    const f = await fixture(t, () => {
+      attempts++
+      return Response.json({ type: "error", error: { type: "api_error", message: "refused" } }, { status, headers })
+    }, { config: { maxRetries: 3 } })
+    const response = await f.request()
+    assert.equal(response.status, status)
+    assert.equal(response.headers.get("x-should-retry"), headers["x-should-retry"] ?? null)
+    assert.equal(attempts, 1)
+  })
+}
+
+for (const [name, dispatch, status] of [
+  ["a network failure", () => { throw new TypeError("fetch failed") }, 502],
+  ["a header timeout", () => new Promise(() => {}), 504],
+]) {
+  test(`${name} does not replay an ambiguously submitted completion`, async (t) => {
+    let dispatched = 0
+    const f = await fixture(t, () => {
+      dispatched++
+      return dispatch()
+    }, { config: { maxRetries: 3, requestTimeoutMs: 50, nonStreamingTimeoutMs: 50 } })
+    assert.equal((await f.request()).status, status)
+    assert.equal(dispatched, 1)
+  })
+}
+
+// Copilot sends a non-streaming reply's headers only once the reply is finished.
+test("a non-streaming reply may take longer than the request timeout to start", async (t) => {
+  const f = await fixture(t, async (call) => {
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    return call.url.pathname.endsWith("/count_tokens") ? Response.json({ input_tokens: 5 }) : Response.json(message())
+  }, { config: { requestTimeoutMs: 50, nonStreamingTimeoutMs: 10000 } })
+  assert.equal((await f.request()).status, 200)
+  // Streaming replies and token counts start at once, so they keep the request timeout.
+  assert.equal((await f.request({ stream: true })).status, 504)
+  assert.equal((await f.request({}, "/v1/messages/count_tokens")).status, 504)
 })
 
 test("native token counting uses the same normalized payload without an estimate fallback", async (t) => {
@@ -463,6 +570,36 @@ test("an idle upstream is cancelled and receives a structured streaming error", 
   assert.equal(cancelled, true)
 })
 
+test("a slow native stream gets heartbeat pings, and their timer stops when the response ends", { timeout: 5000 }, async (t) => {
+  const intervals = t.mock.method(globalThis, "setInterval")
+  const cleared = t.mock.method(globalThis, "clearInterval")
+  const frames = nativeFrames()
+  const split = frames.indexOf("event: content_block_start")
+  let upstream
+  const f = await fixture(t, () => new Response(new ReadableStream({
+    start(controller) {
+      upstream = controller
+      controller.enqueue(new TextEncoder().encode(frames.slice(0, split)))
+    },
+  }), { headers: { "content-type": "text/event-stream" } }), { config: { heartbeatMs: 20 } })
+  const response = await f.request({ stream: true })
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
+  let text = ""
+  // The upstream stays silent until the client has seen a ping.
+  while (!text.includes("event: ping")) {
+    const { done, value } = await reader.read()
+    assert.equal(done, false, "the stream ended before a heartbeat")
+    text += value
+  }
+  upstream.enqueue(new TextEncoder().encode(frames.slice(split)))
+  upstream.close()
+  for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) text += chunk.value
+  assert.equal(parsedEvents(text).at(-1).type, "message_stop")
+  const pings = intervals.mock.calls.filter((call) => call.arguments[1] === 20)
+  assert.equal(pings.length, 1)
+  assert.ok(cleared.mock.calls.some((call) => call.arguments[0] === pings[0].result), "the heartbeat timer is cleared")
+})
+
 test("downstream disconnect aborts and cancels the upstream body", { timeout: 2500 }, async (t) => {
   let upstreamSignal
   let resolveCancelled
@@ -532,23 +669,46 @@ test("same-buffer chat usage and DONE tails are processed before finalization", 
   assert.equal(cancelled, true)
 })
 
-test("a Retry-After beyond the retry budget is returned without clipping or replay", async (t) => {
-  let attempts = 0
-  const f = await fixture(t, () => {
-    attempts++
-    return Response.json({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }, {
-      status: 429, headers: { "retry-after": "90" },
-    })
-  }, { config: { maxRetries: 3, retryBudgetMs: 50 } })
-  const response = await f.request()
-  assert.equal(response.status, 429)
-  assert.equal(response.headers.get("retry-after"), "90")
-  assert.equal(attempts, 1)
-  const next = await f.request()
-  assert.equal(next.status, 429)
-  assert.equal(next.headers.get("retry-after"), "90")
-  assert.equal(attempts, 1)
-})
+for (const status of [429, 503]) {
+  test(`a ${status} Retry-After beyond the retry budget is returned without clipping or replay`, async (t) => {
+    let attempts = 0
+    const f = await fixture(t, () => {
+      attempts++
+      return Response.json({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }, {
+        status, headers: { "retry-after": "90" },
+      })
+    }, { config: { maxRetries: 3, retryBudgetMs: 50 } })
+    const response = await f.request()
+    assert.equal(response.status, status)
+    assert.equal(response.headers.get("retry-after"), "90")
+    assert.equal(attempts, 1)
+    // The hint also holds back the next request instead of sending it.
+    const next = await f.request()
+    assert.equal(next.status, 429)
+    assert.equal(next.headers.get("retry-after"), "90")
+    assert.equal(attempts, 1)
+  })
+}
+
+// The first backoff without Retry-After is 500 to 1000 ms.
+for (const [name, status, headers, minimumMs] of [
+  ["a 429 is retried after its Retry-After", 429, { "retry-after": "0.2" }, 200],
+  ["a 500 is retried after its Retry-After", 500, { "retry-after": "0.2" }, 200],
+  ["a 500 without Retry-After is retried after a backoff", 500, {}, 500],
+]) {
+  test(name, async (t) => {
+    const sent = []
+    const f = await fixture(t, () => {
+      sent.push(performance.now())
+      return sent.length > 1 ? Response.json(message())
+        : Response.json({ type: "error", error: { type: "api_error", message: "busy" } }, { status, headers })
+    }, { config: { maxRetries: 3 } })
+    assert.equal((await f.request()).status, 200)
+    assert.equal(sent.length, 2)
+    const waited = sent[1] - sent[0]
+    assert.ok(waited >= minimumMs - 10, `retried after ${Math.round(waited)} ms`)
+  })
+}
 
 test("inference permits are held until response consumption rather than just headers", { timeout: 2500 }, async (t) => {
   const bodies = []
@@ -596,6 +756,29 @@ test("model discovery caches are isolated when the credential provider changes",
   currentToken = "first-fixture-token"
   assert.deepEqual(await discover(), ["claude-sonnet-5"])
   assert.equal(discoveries, 2)
+})
+
+test("a sign-in that cannot be read at request time is a final 503 naming the fix, logged by its code only", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "copilot-gateway-auth-"))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const errors = []
+  let read = () => readAuthToken(join(directory, "missing.json"))
+  const f = await fixture(t, () => assert.fail("no Copilot request without a sign-in"), {
+    tokenProvider: () => read(),
+    logger: { log() {}, warn() {}, error: (line) => errors.push(line) },
+  })
+  const failures = [await f.request(), await fetch(`${f.base}/v1/models`, { headers: { "x-api-key": f.key } })]
+  // A read error can quote the file, as a JSON parser's does.
+  read = async () => { throw new SyntaxError('Unexpected token in {"access_token":"gho_fixture_secret"}') }
+  failures.push(await f.request())
+  for (const response of failures) {
+    assert.equal(response.status, 503)
+    assert.equal(response.headers.get("x-should-retry"), "false")
+    assert.match((await response.json()).error.message, /Run node scripts\/auth\.mjs/)
+  }
+  assert.deepEqual(errors.map((line) => /\((\w+)\)/.exec(line)?.[1]), ["ENOENT", "ENOENT", "SyntaxError"])
+  assert.equal(errors.some((line) => line.includes("gho_fixture_secret") || line.includes(directory)), false)
+  assert.equal(f.calls.length, 0)
 })
 
 test("a temporary catalog outage permits bounded stale data but never indefinite stale routing", async (t) => {
@@ -752,6 +935,29 @@ test("native nonstreaming rejects malformed tool input shapes instead of forward
   assert.equal((await response.json()).type, "error")
 })
 
+test("a native non-streaming reply that is not a complete message is an error", async (t) => {
+  for (const reply of [{ ...message(), stop_reason: null }, { ...message(), content: "hello" }, { ...message(), type: "completion" }]) {
+    const f = await fixture(t, () => Response.json(reply))
+    const response = await f.request()
+    assert.equal(response.status, 502)
+    assert.match((await response.json()).error.message, /incomplete native message/)
+  }
+})
+
+test("an upstream reply over the response byte limit is an error, never a cut-off message", async (t) => {
+  const reply = message([{ type: "text", text: "x".repeat(8192) }])
+  const f = await fixture(t, (call) => JSON.parse(call.body).stream ? streamResponse(nativeFrames(reply)) : Response.json(reply), {
+    config: { maxResponseBytes: 4096 },
+  })
+  const plain = await f.request()
+  assert.equal(plain.status, 502)
+  assert.match((await plain.json()).error.message, /byte limit/)
+  const events = parsedEvents(await (await f.request({ stream: true })).text())
+  assert.equal(events.at(-1).type, "error")
+  assert.match(events.at(-1).error.message, /byte limit/)
+  assert.equal(events.some((event) => event.type === "message_stop"), false)
+})
+
 test("retry admission cannot dispatch after its budget or retain an abandoned queue reservation", async (t) => {
   const dispatched = []
   const f = await fixture(t, (call) => {
@@ -768,6 +974,21 @@ test("retry admission cannot dispatch after its budget or retain an abandoned qu
   assert.equal(next.status, 200)
   await next.text()
   assert.deepEqual(dispatched, ["first", "next"])
+})
+
+test("a retry that cannot start within the budget keeps the last response's headers, without its cookies", async (t) => {
+  let attempts = 0
+  const f = await fixture(t, () => {
+    attempts++
+    return Response.json({ type: "error", error: { type: "overloaded_error", message: "busy" } }, {
+      status: 503, headers: { "retry-after": "0", "request-id": "req_budget", "set-cookie": "session=fixture" },
+    })
+  }, { config: { maxRetries: 1, retryBudgetMs: 500, minRequestIntervalMs: 60000 } })
+  const response = await f.request()
+  assert.equal(response.status, 504)
+  assert.equal(response.headers.get("request-id"), "req_budget")
+  assert.equal(response.headers.has("set-cookie"), false)
+  assert.equal(attempts, 1)
 })
 
 for (const streaming of [false, true]) {
@@ -888,6 +1109,34 @@ const emulationRound = (body, rounds) => {
     ? message([{ type: "tool_use", id: "toolu_s", name: "web_search", input: { query: "node lts" } }], "tool_use")
     : message([{ type: "text", text: "Emulated answer" }])))
 }
+const warningsTo = (warnings) => ({ log() {}, error() {}, warn: (line) => warnings.push(line) })
+async function until(ready, ms = 2000) {
+  for (const end = performance.now() + ms; !ready();) {
+    if (performance.now() > end) throw new Error("condition not reached")
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
+// A streamed message as a native Messages client reassembles it: streamed
+// parts start empty and every delta has its block's type. NativeMessageState
+// rejects delta types it does not know.
+function reassembled(events) {
+  const state = new NativeMessageState({ collect: true })
+  const blocks = new Map()
+  for (const data of events) {
+    if (data.type === "content_block_start") {
+      const block = data.content_block
+      blocks.set(data.index, block.type)
+      if (block.type === "text") assert.equal(block.text, "")
+      if (block.type === "server_tool_use") assert.deepEqual(block.input, {})
+    } else if (data.type === "content_block_delta") {
+      const type = blocks.get(data.index)
+      assert.equal(data.delta.type, { text: "text_delta", server_tool_use: "input_json_delta" }[type], `delta of a ${type} block`)
+    }
+    state.accept(data, data.type)
+  }
+  assert.equal(state.completed, true)
+  return state.message
+}
 
 for (const streaming of [true, false]) {
   test(`Claude Code's nested WebSearch is answered by one hosted GPT-6 Luna search (${streaming ? "streaming" : "JSON"})`, async (t) => {
@@ -923,14 +1172,16 @@ for (const streaming of [true, false]) {
         "content_block_start", "content_block_stop", "content_block_start", "content_block_delta", "content_block_stop",
         "message_delta", "message_stop",
       ])
-      assert.equal(events.at(-2).delta.stop_reason, "end_turn")
-      assert.deepEqual(events.at(-2).usage.server_tool_use, { web_search_requests: 1 })
-      assert.equal(events.at(-2).usage.output_tokens, 40)
+      // Reassembled as a client would, the stream is exactly the JSON answer.
+      const json = await (await f.request(nestedWebSearch({ stream: false }))).json()
+      assert.deepEqual(reassembled(events), { ...json, id: events[0].message.id })
     } else {
       const body = await response.json()
-      assert.deepEqual(body.content, expectedContent)
-      assert.equal(body.stop_reason, "end_turn")
-      assert.equal(body.usage.input_tokens, 900)
+      assert.deepEqual(body, {
+        id: body.id, type: "message", role: "assistant", model: "claude-sonnet-5", content: expectedContent,
+        stop_reason: "end_turn", stop_sequence: null,
+        usage: { input_tokens: 900, output_tokens: 40, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, server_tool_use: { web_search_requests: 1 } },
+      })
     }
   })
 }
@@ -963,6 +1214,7 @@ test("provider search is used when the hosted search model, mode or request does
     ["blocked_domains", withLuna, nestedWebSearch({}, { blocked_domains: ["example.org"] })],
     ["stop_sequences", withLuna, nestedWebSearch({ stop_sequences: ["<END>"] })],
     ["temperature", withLuna, nestedWebSearch({ temperature: 0 })],
+    ["a forced undeclared tool", withLuna, nestedWebSearch({ tool_choice: { type: "tool", name: "undeclared_tool" } })],
   ]) {
     const paths = []
     const rounds = []
@@ -1035,6 +1287,7 @@ for (const [name, status, headers, paused] of [
   ["a 429 without Retry-After", 429, {}, true],
   ["a 429 with a short Retry-After", 429, { "retry-after": "5" }, true],
   ["a 500", 500, {}, false],
+  ["a 504", 504, {}, false],
 ]) {
   test(`after ${name}, the next search ${paused ? "skips hosted search at once" : "tries hosted search again"}`, async (t) => {
     const paths = []
@@ -1055,6 +1308,106 @@ for (const [name, status, headers, paused] of [
   })
 }
 
+test("hosted search pauses for the Retry-After period, at most an hour", async (t) => {
+  let now = Date.now()
+  t.mock.method(Date, "now", () => now)
+  for (const [status, retryAfter, pauseMs, logged] of [
+    [429, "0.05", 50, "1s"],
+    [503, "2", 2000, "2s"],
+    [429, "999999", 3600000, "3600s"],
+  ]) {
+    const name = `${status} with Retry-After ${retryAfter}`
+    const paths = []
+    const rounds = []
+    const warnings = []
+    const f = await fixture(t, (call) => {
+      paths.push(call.url.pathname)
+      if (call.url.pathname === "/responses") return Response.json({ error: { message: "busy" } }, { status, headers: { "retry-after": retryAfter } })
+      return emulationRound(JSON.parse(call.body), rounds)
+    }, { ...withLuna, searchProvider: async () => [providerResult], logger: warningsTo(warnings) })
+    const triesHosted = async (elapsed) => {
+      now += elapsed
+      paths.length = 0
+      rounds.length = 0
+      assert.equal(parsedEvents(await (await f.request(nestedWebSearch())).text()).at(-1).type, "message_stop", name)
+      return paths[0] === "/responses"
+    }
+    assert.equal(await triesHosted(0), true, name)
+    assert.deepEqual(warnings, [`Hosted web search failed (${status}); using provider search for the next ${logged}`], name)
+    assert.equal(await triesHosted(pauseMs - 1), false, `${name}: paused`)
+    assert.equal(await triesHosted(2), true, `${name}: tried again after the pause`)
+  }
+})
+
+test("a hosted search timeout pauses hosted search for a minute", { timeout: 5000 }, async (t) => {
+  let now = Date.now()
+  t.mock.method(Date, "now", () => now)
+  const never = () => new Promise(() => {})
+  const stalledBody = () => new Response(new ReadableStream(), { headers: { "content-type": "application/json" } })
+  // The search deadline, and the hosted client's own timeout for one wait when the request timeout is shorter.
+  for (const [name, config, respond, logged] of [
+    ["the search deadline", { searchTimeoutMs: 50 }, never, "timed out after 50ms"],
+    ["no response within the request timeout", { requestTimeoutMs: 200, searchTimeoutMs: 5000 }, never, "timed out"],
+    ["a stalled body", { requestTimeoutMs: 200, searchTimeoutMs: 5000 }, stalledBody, "timed out"],
+  ]) {
+    const paths = []
+    const rounds = []
+    const warnings = []
+    const f = await fixture(t, (call) => {
+      paths.push(call.url.pathname)
+      return call.url.pathname === "/responses" ? respond() : emulationRound(JSON.parse(call.body), rounds)
+    }, { ...withLuna, config, searchProvider: async () => [providerResult], logger: warningsTo(warnings) })
+    const triesHosted = async (elapsed) => {
+      now += elapsed
+      paths.length = 0
+      rounds.length = 0
+      assert.equal((await (await f.request(nestedWebSearch({ stream: false }))).json()).content.at(-1).text, "Emulated answer", name)
+      return paths[0] === "/responses"
+    }
+    assert.equal(await triesHosted(0), true, name)
+    assert.deepEqual(warnings, [`Hosted web search ${logged}; using provider search for the next 60s`], name)
+    assert.equal(await triesHosted(59999), false, `${name}: paused`)
+    assert.equal(await triesHosted(2), true, `${name}: tried again after a minute`)
+  }
+})
+
+// The admission gate is shared with Claude requests, so its errors say nothing about /responses.
+test("an error raised before /responses answers neither pauses hosted search nor is logged as its answer", { timeout: 5000 }, async (t) => {
+  let now = Date.now()
+  t.mock.method(Date, "now", () => now)
+  for (const [name, status, config, wait] of [
+    // For Claude's Retry-After of 1.5 s, the gate tells the hosted request "retry-after: 2": 1.501 s later
+    // the gate is open again, while a pause taken from that header would still last.
+    ["the gate's cooldown after a Claude 429", 429, { queueTimeoutMs: 1000 }, 1501],
+    ["a full admission queue", 503, { maxConcurrentRequests: 1, maxQueuedRequests: 0 }, 0],
+  ]) {
+    const paths = []
+    const rounds = []
+    const warnings = []
+    let held
+    const f = await fixture(t, (call) => {
+      paths.push(call.url.pathname)
+      if (call.url.pathname === "/responses") return Response.json(hostedReply())
+      const body = JSON.parse(call.body)
+      if (body.tools) return emulationRound(body, rounds)
+      if (status === 429) return Response.json({ type: "error", error: { type: "rate_limit_error", message: "slow down" } }, { status, headers: { "retry-after": "1.5" } })
+      return new Response(new ReadableStream({ start(controller) { held = controller } }), { headers: { "content-type": "text/event-stream" } })
+    }, { ...withLuna, config, searchProvider: async () => [providerResult], logger: warningsTo(warnings) })
+    const plain = await f.request({ stream: true })
+    const refused = await f.request(nestedWebSearch({ stream: false }))
+    assert.equal(refused.status, status, name)
+    assert.deepEqual(warnings, [`Hosted web search failed before /responses answered (${status}); using provider search`], name)
+    held?.enqueue(new TextEncoder().encode(nativeFrames()))
+    held?.close()
+    await plain.text()
+    now += wait
+    paths.length = 0
+    const response = await f.request(nestedWebSearch({ stream: false }))
+    assert.equal((await response.json()).content.at(-1).text, "Node 26 is LTS.", name)
+    assert.deepEqual(paths, ["/responses"], name)
+  }
+})
+
 test("hosted search shares the configured spacing between Copilot requests", async (t) => {
   const sent = []
   const f = await fixture(t, (call) => {
@@ -1068,14 +1421,42 @@ test("hosted search shares the configured spacing between Copilot requests", asy
   assert.ok(sent[1].at - sent[0].at >= 350, `hosted search waited ${Math.round(sent[1].at - sent[0].at)} ms`)
 })
 
+test("hosted search, provider search and a plain request each release the only admission slot", { timeout: 5000 }, async (t) => {
+  const paths = []
+  const rounds = []
+  const f = await fixture(t, (call) => {
+    paths.push(call.url.pathname)
+    if (call.url.pathname === "/responses") return Response.json(hostedReply())
+    const body = JSON.parse(call.body)
+    return body.tools ? emulationRound(body, rounds) : Response.json(message())
+  }, { ...withLuna, config: { maxConcurrentRequests: 1, queueTimeoutMs: 200 }, searchProvider: async () => [providerResult] })
+  const hosted = await f.request(nestedWebSearch({ stream: false }))
+  assert.equal(hosted.status, 200)
+  assert.equal((await hosted.json()).content.at(-1).text, "Node 26 is LTS.")
+  // blocked_domains require provider search.
+  const provider = await f.request(nestedWebSearch({ stream: false }, { blocked_domains: ["example.org"] }))
+  assert.equal(provider.status, 200)
+  assert.equal((await provider.json()).content.at(-1).text, "Emulated answer")
+  const plain = await f.request()
+  assert.equal(plain.status, 200)
+  assert.equal((await plain.json()).content[0].text, "hello")
+  assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages", "/v1/messages"])
+})
+
 test("a rejected hosted answer falls back, and its tokens and searches are still reported", async (t) => {
-  // Without a completed search, and with a search but no answer.
-  for (const [output, hostedSearches] of [[[hostedReply().output[1]], 0], [[hostedReply().output[0]], 1]]) {
+  // Without a completed search, with a search but no answer, and cut off at
+  // max_output_tokens before any search completed.
+  const truncated = { status: "incomplete", incomplete_details: { reason: "max_output_tokens" } }
+  for (const [reply, hostedSearches] of [
+    [{ output: [hostedReply().output[1]] }, 0],
+    [{ output: [hostedReply().output[0]] }, 1],
+    [{ ...truncated, output: [hostedReply().output[1]] }, 0],
+  ]) {
     const paths = []
     const rounds = []
     const f = await fixture(t, (call) => {
       paths.push(call.url.pathname)
-      if (call.url.pathname === "/responses") return Response.json({ ...hostedReply(), output })
+      if (call.url.pathname === "/responses") return Response.json({ ...hostedReply(), ...reply })
       return emulationRound(JSON.parse(call.body), rounds)
     }, { ...withLuna, searchProvider: async () => [providerResult] })
     const response = await f.request(nestedWebSearch({ stream: false }))
@@ -1106,6 +1487,19 @@ test("Claude Code's 5.5 WebSearch request with automatic choice still makes the 
   assert.equal(payload.tool_choice, "required")
 })
 
+test("an empty companion domain list from Claude Code does not reject its WebSearch", async (t) => {
+  let payload
+  const f = await fixture(t, (call) => {
+    payload = JSON.parse(call.body)
+    return Response.json(hostedReply())
+  }, withLuna)
+  const response = await f.request(nestedWebSearch({ stream: false }, { allowed_domains: ["nodejs.org"], blocked_domains: [] }))
+  assert.equal(response.status, 200)
+  assert.deepEqual(payload.tools[0].filters, { allowed_domains: ["nodejs.org"] })
+  const both = await f.request(nestedWebSearch({ stream: false }, { allowed_domains: ["nodejs.org"], blocked_domains: ["example.org"] }))
+  assert.equal(both.status, 400)
+})
+
 test("a client abort during hosted search cancels it without falling back", { timeout: 2500 }, async (t) => {
   const paths = []
   let hostedSignal
@@ -1124,6 +1518,85 @@ test("a client abort during hosted search cancels it without falling back", { ti
   await assert.rejects(pending)
   while (!hostedSignal.aborted) await new Promise((resolve) => setTimeout(resolve, 5))
   assert.deepEqual(paths, ["/responses"])
+})
+
+// Hosted search has one wall-clock deadline, WEB_SEARCH_TIMEOUT_MS, for
+// admission, the response and its whole body; provider search answers after it.
+test("a hosted answer that trickles in past the search deadline falls back to provider search", { timeout: 5000 }, async (t) => {
+  const paths = []
+  const rounds = []
+  const warnings = []
+  let cancelled = false
+  const f = await fixture(t, (call) => {
+    paths.push(call.url.pathname)
+    if (call.url.pathname !== "/responses") return emulationRound(JSON.parse(call.body), rounds)
+    // A valid answer in 16-byte chunks 30 ms apart: no read waits long, but the body takes over a second.
+    const bytes = new TextEncoder().encode(JSON.stringify(hostedReply()))
+    let timer
+    return new Response(new ReadableStream({
+      start(controller) {
+        let offset = 0
+        timer = setInterval(() => {
+          controller.enqueue(bytes.subarray(offset, offset += 16))
+          if (offset >= bytes.length) { clearInterval(timer); controller.close() }
+        }, 30)
+      },
+      cancel() { cancelled = true; clearInterval(timer) },
+    }), { headers: { "content-type": "application/json" } })
+  }, { ...withLuna, config: { searchTimeoutMs: 100, requestTimeoutMs: 5000 }, searchProvider: async () => [providerResult], logger: warningsTo(warnings) })
+  const response = await f.request(nestedWebSearch({ stream: false }))
+  assert.equal(response.status, 200)
+  assert.equal((await response.json()).content.at(-1).text, "Emulated answer")
+  assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages"])
+  assert.equal(cancelled, true)
+  assert.deepEqual(warnings, ["Hosted web search timed out after 100ms; using provider search for the next 60s"])
+})
+
+test("a hosted search without a response falls back at the search deadline, not the request timeout", { timeout: 10000 }, async (t) => {
+  const paths = []
+  const rounds = []
+  const f = await fixture(t, (call) => {
+    paths.push(call.url.pathname)
+    return call.url.pathname === "/responses" ? new Promise(() => {}) : emulationRound(JSON.parse(call.body), rounds)
+  }, { ...withLuna, config: { searchTimeoutMs: 50, requestTimeoutMs: 5000 }, searchProvider: async () => [providerResult] })
+  const started = performance.now()
+  const response = await f.request(nestedWebSearch({ stream: false }))
+  assert.equal(response.status, 200)
+  assert.equal((await response.json()).content.at(-1).text, "Emulated answer")
+  assert.ok(performance.now() - started < 1000, `fell back after ${Math.round(performance.now() - started)} ms`)
+  assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages"])
+})
+
+test("a hosted search still waiting for admission at the search deadline falls back without pausing hosted search", { timeout: 5000 }, async (t) => {
+  const paths = []
+  const rounds = []
+  const warnings = []
+  let held
+  const f = await fixture(t, (call) => {
+    paths.push(call.url.pathname)
+    if (call.url.pathname === "/responses") return Response.json(hostedReply())
+    const body = JSON.parse(call.body)
+    if (body.tools) return emulationRound(body, rounds)
+    // A plain streaming answer that holds the only admission slot until the test ends it.
+    return new Response(new ReadableStream({ start(controller) { held = controller } }), { headers: { "content-type": "text/event-stream" } })
+  }, {
+    ...withLuna, config: { maxConcurrentRequests: 1, queueTimeoutMs: 5000, searchTimeoutMs: 100 },
+    searchProvider: async () => [providerResult], logger: warningsTo(warnings),
+  })
+  const plain = await f.request({ stream: true })
+  const search = f.request(nestedWebSearch({ stream: false }))
+  await until(() => warnings.length > 0)
+  assert.deepEqual(warnings, ["Hosted web search failed before /responses answered (still waiting for admission after 100ms); using provider search"])
+  held.enqueue(new TextEncoder().encode(nativeFrames()))
+  held.close()
+  assert.equal(parsedEvents(await plain.text()).at(-1).type, "message_stop")
+  const response = await search
+  assert.equal(response.status, 200)
+  assert.equal((await response.json()).content.at(-1).text, "Emulated answer")
+  assert.deepEqual(paths, ["/v1/messages", "/v1/messages", "/v1/messages"])
+  // /responses was never sent, so the next search tries hosted search again.
+  assert.equal((await f.request(nestedWebSearch({ stream: false }))).status, 200)
+  assert.equal(paths.at(-1), "/responses")
 })
 
 test("hosted search serves Chat-transport models, and other searches there get 501 before any output", async (t) => {
@@ -1158,6 +1631,25 @@ test("unknown search tool fields and an unused user_location are reported once, 
     'Ignored unsupported web_search tool field(s): "a\\n[2026-11-18] POST /v1/messages", "b", "c", "d", "e" and 2 more',
     "Provider web search ignored the web_search user_location",
   ])
+})
+
+test("once-only warnings are remembered up to 256; later ones are still logged, every time", async (t) => {
+  const warnings = []
+  // On the Chat transport, a search hosted search cannot answer gets 501 before any Copilot call.
+  const f = await fixture(t, () => assert.fail("no inference"), {
+    config: { transport: "chat", webSearchMode: "providers" },
+    logger: { log() {}, error() {}, warn: (line) => warnings.push(line) },
+  })
+  const search = async (field) => {
+    const response = await f.request(nestedWebSearch({}, { [field]: true }))
+    await response.arrayBuffer()
+    assert.equal(response.status, 501)
+  }
+  for (let index = 0; index < 256; index++) await search(`field_${index}`)
+  for (const field of ["field_0", "field_256", "field_256"]) await search(field)
+  const logged = (field) => warnings.filter((line) => line.includes(`"${field}"`)).length
+  assert.equal(logged("field_0"), 1)
+  assert.equal(logged("field_256"), 2)
 })
 
 test("provider search forwards only a plain custom web_search tool to Claude", async (t) => {

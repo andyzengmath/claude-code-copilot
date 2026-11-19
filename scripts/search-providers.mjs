@@ -48,12 +48,14 @@ function result(url, title, snippet, age = null) {
   }
 }
 
-function validResults(items, convert, maxResults) {
+// The result cap applies after the search chain's domain filter, so that
+// excluded results never crowd out permitted ones.
+function validResults(items, convert) {
   if (!Array.isArray(items)) throw malformed()
   const results = items.map((item) => isObject(item) ? convert(item) : null).filter(Boolean)
   // Filtering unsafe/missing URLs is not evidence of a successful empty search.
   if (items.length && !results.length) throw malformed()
-  return results.slice(0, maxResults)
+  return results
 }
 
 function selectProvider(query, config) {
@@ -180,7 +182,7 @@ function mcpReply(text) {
   throw malformed()
 }
 
-function mcpResults(text, maxResults) {
+function mcpResults(text) {
   const content = mcpReply(text)
   const candidates = []
   for (const item of content) {
@@ -214,10 +216,10 @@ function mcpResults(text, maxResults) {
       .find((value) => typeof value === "string" && value) ??
       (Array.isArray(item.excerpts) ? item.excerpts.filter((value) => typeof value === "string").join("\n") : "")
     return result(item.url, item.title, snippet, item.publishedDate || item.publish_date || item.age)
-  }, maxResults)
+  })
 }
 
-function githubResults(text, maxResults) {
+function githubResults(text) {
   const content = mcpReply(text)
   if (!content.length) throw malformed()
   const items = content.flatMap((item) => {
@@ -233,7 +235,7 @@ function githubResults(text, maxResults) {
       ? item.snippets.filter((value) => typeof value === "string" && value.trim()) : []
     const snippet = snippets.length ? snippets.join("\n\n") : item.semantic_document
     return result(item.url, item.title, typeof snippet === "string" ? snippet.slice(0, 4000) : "", item.last_updated_date)
-  }, maxResults)
+  })
 }
 
 function decodeHtml(text) {
@@ -266,7 +268,7 @@ function ddgUrl(value) {
   return decoded
 }
 
-function liteResults(html, maxResults) {
+function liteResults(html) {
   // Detect challenge markup, not words in an ordinary search result/query.
   if (/<(?:form|input|div)[^>]*(?:id|class|action)\s*=\s*["'][^"']*(?:captcha|anomaly|challenge)/i.test(html)) {
     throw new ProviderFailure("CAPTCHA challenge")
@@ -282,10 +284,10 @@ function liteResults(html, maxResults) {
   }
   return validResults(links.map((match, index) => ({
     url: ddgUrl(attribute(match[1], "href")), title: plainHtml(match[2]), snippet: snippets[index] ?? "",
-  })), (item) => result(item.url, item.title, item.snippet), maxResults)
+  })), (item) => result(item.url, item.title, item.snippet))
 }
 
-function instantResults(text, maxResults) {
+function instantResults(text) {
   const data = parseJson(text)
   if (!isObject(data) || data.error || !Array.isArray(data.RelatedTopics)) throw malformed()
   if ((data.AbstractURL !== undefined && typeof data.AbstractURL !== "string") ||
@@ -308,7 +310,7 @@ function instantResults(text, maxResults) {
       })
     }
   }
-  return validResults(candidates, (item) => result(item.url, item.title, item.snippet), maxResults)
+  return validResults(candidates, (item) => result(item.url, item.title, item.snippet))
 }
 
 export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}, logger = console, githubMcpUrl } = {}) {
@@ -321,7 +323,7 @@ export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream", ...headers },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
-  }, signal), maxResults)
+  }, signal))
   const providers = {
     github: {
       label: "GitHub",
@@ -353,7 +355,7 @@ export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}
           signal,
         ))
         if (!isObject(data) || data.error || !isObject(data.web)) throw malformed()
-        return validResults(data.web.results, (item) => result(item.url, item.title, item.description, item.age), maxResults)
+        return validResults(data.web.results, (item) => result(item.url, item.title, item.description, item.age))
       },
     },
     serper: {
@@ -365,7 +367,7 @@ export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}
           body: JSON.stringify({ q: query, num: maxResults }),
         }, signal))
         if (!isObject(data) || data.error) throw malformed()
-        return validResults(data.organic, (item) => result(item.link, item.title, item.snippet), maxResults)
+        return validResults(data.organic, (item) => result(item.link, item.title, item.snippet))
       },
     },
     lite: {
@@ -379,7 +381,7 @@ export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}
             Accept: "text/html", "Accept-Language": "en-US,en;q=0.9",
           },
           body: `q=${encodeURIComponent(query)}&kl=us-en`,
-        }, signal), maxResults)
+        }, signal))
       },
     },
     instant: {
@@ -388,7 +390,7 @@ export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}
         return instantResults(await request(
           `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`,
           { headers: { "User-Agent": USER_AGENT } }, signal,
-        ), maxResults)
+        ))
       },
     },
   }
@@ -415,8 +417,9 @@ export function createSearchProvider({ fetchImpl = globalThis.fetch, config = {}
         // Only GitHub's own search receives the Copilot sign-in.
         const found = await provider.search(query, chain, name === "github" ? token : undefined)
         signal?.throwIfAborted()
-        // Results the domain lists exclude do not end the fallback chain.
-        const results = typeof accepts === "function" ? found.filter(accepts) : found
+        // Results the domain lists exclude do not end the fallback chain, and
+        // the cap applies to the permitted ones.
+        const results = (typeof accepts === "function" ? found.filter(accepts) : found).slice(0, maxResults)
         if (results.length) return results
         succeeded = true
       } catch (error) {

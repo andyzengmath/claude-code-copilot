@@ -2,6 +2,7 @@
 import { timingSafeEqual, createHmac } from "node:crypto"
 import { once } from "node:events"
 import { createServer } from "node:http"
+import { createServer as createTcpServer } from "node:net"
 import { resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { getProxyKey, readAuthToken } from "./credentials.mjs"
@@ -34,6 +35,14 @@ function authorized(req, key) {
 function jsonResponse(res, status, body, headers = {}) {
   res.writeHead(status, { ...headers, "content-type": "application/json" })
   res.end(JSON.stringify(body))
+}
+
+// Claude Code takes a 401 to mean its API key, and only the local key should
+// get one. Copilot rejecting the saved GitHub sign-in needs a new sign-in, so
+// it is a 502 that says so, and retrying helps neither.
+function signInRejected(error) {
+  return new ProxyError(502, "Copilot rejected the saved GitHub sign-in (HTTP 401). Run node scripts/auth.mjs to sign in again.",
+    "api_error", { ...error.headers, "x-should-retry": "false" })
 }
 
 // Client-chosen names in logs: escaped, truncated and limited in number.
@@ -92,7 +101,8 @@ function validateRequest(body, countTokens) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     throw new ProxyError(400, "Messages request must be a JSON object", "invalid_request_error")
   }
-  if (typeof body.model !== "string" || !body.model.trim() || body.model.length > 200 || /[\r\n\0]/.test(body.model)) {
+  // The model name is logged, so no control characters (terminal escapes).
+  if (typeof body.model !== "string" || !body.model.trim() || body.model.length > 200 || /[\x00-\x1f\x7f-\x9f]/.test(body.model)) {
     throw new ProxyError(400, "A valid model identifier is required", "invalid_request_error")
   }
   if (!Array.isArray(body.messages) || body.messages.some((message) => !message || typeof message !== "object" || !["user", "assistant", "system"].includes(message.role))) {
@@ -149,7 +159,7 @@ export function createProxyServer({
   const key = Buffer.from(proxyKey)
   const config = readConfig({}, overrides)
   const baseUrl = upstreamBaseUrl.replace(/\/$/, "")
-  const getToken = tokenProvider ?? (token ? async () => token : readAuthToken)
+  const readToken = tokenProvider ?? (token ? async () => token : readAuthToken)
   const shutdown = new AbortController()
   const lifecycle = shutdownSignal ? AbortSignal.any([shutdownSignal, shutdown.signal]) : shutdown.signal
   const catalog = createModelCatalog({ fetchImpl, baseUrl, config, logger })
@@ -158,9 +168,10 @@ export function createProxyServer({
   // search is the fallback. It shares the admission gate, so the configured
   // concurrency and spacing limits cover all Copilot requests, but its
   // Retry-After pauses only hosted search, never the gate Claude requests use.
+  const searchDeadline = Math.min(config.requestTimeoutMs, config.searchTimeoutMs)
   const hostedClient = createUpstreamClient({
     fetchImpl, baseUrl, logger, gate: copilot.gate, cooldown: false,
-    config: { ...config, maxRetries: 0, requestTimeoutMs: Math.min(config.requestTimeoutMs, config.searchTimeoutMs) },
+    config: { ...config, maxRetries: 0, requestTimeoutMs: searchDeadline, nonStreamingTimeoutMs: searchDeadline },
   })
   const search = createWebSearchService({
     provider: searchProvider ?? createSearchProvider({ fetchImpl, config, logger, githubMcpUrl: `${baseUrl}/mcp/` }), config, logger,
@@ -172,6 +183,20 @@ export function createProxyServer({
     logger.warn(message)
   }
   const hostedSearch = createHostedSearch({ catalog, client: hostedClient, config, logger, warnOnce })
+
+  // The saved sign-in is read for each request, so it can have gone missing
+  // or become unreadable since startup. Log only the error code, never the file.
+  async function getToken() {
+    try {
+      return await readToken()
+    } catch (error) {
+      logger.error(`Cannot read the saved GitHub sign-in (${typeof error?.code === "string" ? error.code : error?.name ?? "error"}); run node scripts/auth.mjs`)
+      const failure = new ProxyError(503, "The proxy cannot read the saved GitHub sign-in. Run node scripts/auth.mjs to sign in again.",
+        "api_error", { "x-should-retry": "false" })
+      failure.logged = true
+      throw failure
+    }
+  }
 
   // Start an SSE response; handle() closes its writer.
   function startStream(ctx, headers) {
@@ -228,7 +253,7 @@ export function createProxyServer({
     let request = { ...upstreamBody(body), model }
     if (ctx.nativeTransport && !searchSettings) request = prepareSearchRequest(request, config, null)
     ctx.inference = true
-    logger.log(`[${new Date().toISOString()}] ${req.method} ${url.pathname} | model: ${model} | transport: ${transport}${searchSettings ? " + search" : ""}`)
+    logger.log(`[${new Date().toISOString()}] ${req.method} ${url.pathname} | model: ${JSON.stringify(model)} | transport: ${transport}${searchSettings ? " + search" : ""}`)
     if (countOnly) {
       if (!ctx.nativeTransport) {
         throw new ProxyError(501, "Authoritative token counting requires native Messages transport", "api_error")
@@ -355,7 +380,10 @@ export function createProxyServer({
     res.on("error", (error) => controller.abort(error))
     res.once("close", () => { if (!res.writableFinished) controller.abort(abortError()) })
     // Request state that the route helpers share with the error handling and cleanup below.
-    const ctx = { req, res, signal, controller, writer: null, upstream: null, nativeTransport: false, inference: false, outcome: "failed" }
+    const ctx = {
+      req, res, signal, controller, writer: null, upstream: null,
+      authorized: false, nativeTransport: false, inference: false, outcome: "failed",
+    }
     try {
       signal.throwIfAborted()
       const url = new URL(req.url, "http://localhost")
@@ -367,19 +395,31 @@ export function createProxyServer({
       if (!["/v1/messages", "/v1/messages/count_tokens", "/v1/models"].includes(route)) {
         throw new ProxyError(404, "Not found", "not_found_error")
       }
-      if (!authorized(req, key)) throw new ProxyError(401, "A valid local proxy API key is required", "authentication_error")
+      if (!authorized(req, key)) {
+        throw new ProxyError(401, "A valid local proxy API key is required", "authentication_error", { "x-should-retry": "false" })
+      }
+      ctx.authorized = true
       const modelsRoute = route === "/v1/models"
       if (req.method !== (modelsRoute ? "GET" : "POST")) {
         throw new ProxyError(405, "Method not allowed", "invalid_request_error", { allow: modelsRoute ? "GET" : "POST" })
       }
       if (modelsRoute) await listModels(ctx)
       else await handleMessages(ctx, url, route === "/v1/messages/count_tokens")
-    } catch (error) {
+    } catch (caught) {
       if (signal.aborted || res.destroyed) {
         if (!res.destroyed) res.destroy()
         return
       }
-      if (ctx.inference) logger.error(`Proxy request failed: ${error.status ?? 500} ${error.name}`)
+      // Once the local key is accepted, a 401 can only come from Copilot.
+      const signIn = ctx.authorized && caught.status === 401
+      const error = signIn ? signInRejected(caught) : caught
+      // Log what the operator must fix, including failures before inference
+      // such as a catalog outage, but not the client's own mistakes (4xx) or
+      // an unreadable sign-in, which getToken already logged.
+      if (signIn) logger.error("Copilot rejected the saved GitHub sign-in (HTTP 401); run node scripts/auth.mjs")
+      else if (ctx.inference || (ctx.authorized && !error.logged && !(error.status < 500))) {
+        logger.error(`Proxy request failed: ${error.status ?? 500} ${error.name}`)
+      }
       if (ctx.writer && res.headersSent) {
         ctx.writer.stopPings()
         await ctx.writer.event("error", errorEnvelope(error))
@@ -431,6 +471,26 @@ export function createProxyServer({
   return server
 }
 
+// Clients can resolve localhost to ::1. Holding [::1] on the same port keeps
+// another process from taking it and receiving their key and prompts.
+async function holdIPv6Loopback(server, port) {
+  // The socket options http.Server gives its own connections.
+  const loopback = createTcpServer({ allowHalfOpen: true, noDelay: true }, (socket) => server.emit("connection", socket))
+  try {
+    loopback.listen(port, "::1")
+    await once(loopback, "listening")
+  } catch (error) {
+    if (!["EADDRNOTAVAIL", "EAFNOSUPPORT"].includes(error.code)) {
+      const problem = error.code === "EADDRINUSE" ? `another process is listening on [::1]:${port}`
+        : `cannot listen on [::1]:${port} (${error.code ?? error.name})`
+      console.warn(`Warning: ${problem}. Clients using http://localhost:${port} may reach another process; use http://127.0.0.1:${port} instead.`)
+    }
+    return null
+  }
+  server.once("close", () => loopback.close())
+  return loopback
+}
+
 export async function startServer() {
   const args = process.argv.slice(2)
   if (args.length) {
@@ -452,11 +512,14 @@ export async function startServer() {
     if (error.code === "EADDRINUSE") throw new Error(`Port ${config.port} is already in use; stop the old proxy or choose COPILOT_PROXY_PORT`)
     throw error
   }
-  console.log(`Claude Code / GitHub Copilot proxy listening on ${config.host}:${server.address().port}`)
+  const port = server.address().port
+  const loopback = config.host === "127.0.0.1" ? await holdIPv6Loopback(server, port) : null
+  console.log(`Claude Code / GitHub Copilot proxy listening on ${config.host}:${port}`)
   console.log(`Transport: ${config.transport}; local API key required (retrieve with --print-api-key)`)
   const stop = () => {
     shutdown.abort(abortError("Proxy is shutting down"))
     server.close()
+    loopback?.close()
     const timer = setTimeout(() => server.closeAllConnections(), 5000)
     timer.unref()
     server.once("close", () => clearTimeout(timer))

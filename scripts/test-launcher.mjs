@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { once } from "node:events"
 import { existsSync } from "node:fs"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import net from "node:net"
 import { tmpdir } from "node:os"
@@ -20,7 +20,7 @@ const bash = process.env.COPILOT_TEST_BASH || (process.platform === "win32"
     join(process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)", "Git", "bin", "bash.exe"),
   ].find(existsSync)
   : spawnSync("bash", ["--version"], { stdio: "ignore" }).status === 0 ? "bash" : undefined)
-const options = { skip: !bash && "Bash (Git Bash on Windows) is needed for launcher fixtures", timeout: 45000 }
+const options = { skip: !bash && "Bash (Git Bash on Windows) is needed for launcher fixtures", timeout: 120000 }
 
 async function availablePort() {
   const reservation = createServer()
@@ -62,6 +62,8 @@ async function setup(t, port, key = "launcher-fixture-key") {
     TEST_PROXY_HOOK: pathToFileURL(join(directory, "proxy-hook.mjs")).href,
     TEST_CONTROL_PIPE: process.platform === "win32" ? `\\\\.\\pipe\\copilot-launch-${randomUUID()}` : join(directory, "control.sock"),
     TEST_CONTROL_TOKEN: randomUUID(),
+    // Stale client settings from older instructions must not reach Claude Code.
+    ANTHROPIC_API_KEY: "copilot-proxy",
     ANTHROPIC_AUTH_TOKEN: "stale-fixture-auth-token",
   })
   await savePrivateJson(env.COPILOT_AUTH_FILE, { access_token: "launcher-fixture-upstream-token" })
@@ -77,13 +79,14 @@ exec "$TEST_REAL_NODE" "$@"
   await writeFile(env.TEST_CLAUDE_APP, `
 import { writeFile } from "node:fs/promises";
 const response = await fetch(process.env.ANTHROPIC_BASE_URL + "/v1/messages", {
-  method: "POST", headers: {"x-api-key": process.env.ANTHROPIC_API_KEY, "content-type":"application/json"}, body:"null",
+  method: "POST", headers: {authorization: "Bearer " + process.env.ANTHROPIC_AUTH_TOKEN, "content-type":"application/json"}, body:"null",
   signal: AbortSignal.timeout(3000)
 });
 await response.arrayBuffer();
 await writeFile(process.env.TEST_CLIENT_RESULT, JSON.stringify({
   base: process.env.ANTHROPIC_BASE_URL, keyAccepted: response.status === 400,
-  authTokenCleared: !process.env.ANTHROPIC_AUTH_TOKEN, args: process.argv.slice(2)
+  apiKeyUnset: !("ANTHROPIC_API_KEY" in process.env), autoModeServer: process.env.CLAUDE_CODE_AUTO_MODE_SERVER,
+  args: process.argv.slice(2)
 }));
 console.log("fixture client finished");
 `)
@@ -118,7 +121,8 @@ async function launch(t, env, args = [], trace = false) {
     await shutdownProxy(env)
     await closed
   })
-  const timer = setTimeout(() => child.kill(), 35000)
+  // A launch takes 1-2 s in CI, but over 35 s through the Docker fallback on a loaded Windows machine.
+  const timer = setTimeout(() => child.kill(), 90000)
   try {
     const code = await new Promise((resolve, reject) => {
       child.once("error", reject)
@@ -137,14 +141,16 @@ test("launcher refuses a healthy service whose API key differs from its configur
   assert.equal((await fetch(`${f.base}/health`)).status, 200)
 })
 
-test("launcher hands the configured key to Claude without an inherited competing auth token", options, async (t) => {
+test("launcher hands the configured key to Claude as its auth token and unsets an inherited API key", options, async (t) => {
   const f = await fixture(t, () => assert.fail("no upstream calls expected"))
   const { env } = await setup(t, f.server.address().port, f.key)
   const result = await launch(t, env, ["-p", "fixture with spaces"])
   assert.equal(result.code, 0, result.stderr)
   const client = JSON.parse(await readFile(env.TEST_CLIENT_RESULT, "utf8"))
   assert.equal(client.keyAccepted, true)
-  assert.equal(client.authTokenCleared, true)
+  // Unset, not empty: interactive Claude Code asks before using an API key.
+  assert.equal(client.apiKeyUnset, true)
+  assert.equal(client.autoModeServer, "0")
   assert.equal(client.base, f.base)
   assert.deepEqual(client.args, ["-p", "fixture with spaces"])
 })
@@ -165,6 +171,45 @@ test("launcher shell tracing cannot print the local API key", options, async (t)
   assert.equal(result.code, 0)
   assert.equal(result.stdout.includes(f.key), false)
   assert.equal(result.stderr.includes(f.key), false)
+})
+
+test("launcher passes the local API key in no command line, which other local users can list", options, async (t) => {
+  const port = await availablePort()
+  const key = `argv-fixture-key-${randomUUID()}`
+  const { env, directory } = await setup(t, port, key)
+  env.TEST_ARGV_LOG = join(directory, "argv.log")
+  env.TEST_REAL_ENV = spawnSync(bash, ["-c", "command -v env"], { encoding: "utf8" }).stdout.trim()
+  const logged = (name, body) => `#!/bin/bash
+{ printf '<<${name}>>'; printf ' %q' "$@"; printf '\\n'; } >> "$TEST_ARGV_LOG"
+${body}
+`
+  // Docker is available but fails to start, so the probes, Docker, the Node fallback and Claude all run.
+  const wrappers = {
+    node: `if [[ "$#" -eq 1 && "$1" == */proxy.mjs ]]; then
+  exec "$TEST_REAL_NODE" --import "$TEST_PROXY_HOOK" "$@"
+fi
+exec "$TEST_REAL_NODE" "$@"`,
+    docker: `if [[ "$1" == info || ( "$1" == compose && "$2" == version ) ]]; then exit 0; fi
+exit 1`,
+    curl: "exit 1",
+    env: 'exec "$TEST_REAL_ENV" "$@"',
+    claude: 'exec "$TEST_REAL_NODE" "$TEST_CLAUDE_APP" "$@"',
+  }
+  for (const [name, body] of Object.entries(wrappers)) {
+    await writeFile(join(directory, name), logged(name, body), { mode: 0o755 })
+  }
+  // Git Bash puts its own directories, which have env and curl, ahead of the inherited PATH.
+  env.TEST_WRAPPERS = process.platform === "win32"
+    ? spawnSync(bash, ["-c", 'cygpath -u "$0"', directory], { encoding: "utf8" }).stdout.trim() : directory
+  await writeFile(join(directory, "path.sh"), 'PATH="$TEST_WRAPPERS:$PATH"\n')
+  env.BASH_ENV = `${env.TEST_WRAPPERS}/path.sh`
+  const result = await launch(t, env)
+  assert.equal(result.code, 0, result.stderr)
+  assert.equal(JSON.parse(await readFile(env.TEST_CLIENT_RESULT, "utf8")).keyAccepted, true)
+  const calls = (await readFile(env.TEST_ARGV_LOG, "utf8")).trim().split("\n")
+  const names = new Set(calls.map((line) => line.match(/^<<(\w+)>>/)?.[1]))
+  for (const name of ["node", "docker", "env", "claude"]) assert.ok(names.has(name), `${name} was not run`)
+  for (const line of calls) assert.equal(line.includes(key), false, `key in argv: ${line.slice(0, 120)}`)
 })
 
 for (const status of [404, 500, 200]) {
@@ -233,4 +278,23 @@ exit 1
   assert.equal(existsSync(env.TEST_DOCKER_ATTEMPT), true)
   assert.equal(JSON.parse(await readFile(env.TEST_CLIENT_RESULT, "utf8")).keyAccepted, true)
   assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, 200)
+})
+
+test("launcher restricts an auth file other users can read before it starts Docker", {
+  ...options, skip: process.platform === "win32" ? "POSIX permissions only" : options.skip,
+}, async (t) => {
+  const port = await availablePort()
+  const { env, directory } = await setup(t, port)
+  await chmod(env.COPILOT_AUTH_FILE, 0o644)
+  env.TEST_DOCKER_MODE = join(directory, "docker-mode")
+  // Compose mounts the file read-only, so its mode when Docker starts is what the container gets.
+  await writeFile(join(directory, "docker"), `#!/bin/bash
+if [[ "$1" == info || ( "$1" == compose && "$2" == version ) ]]; then exit 0; fi
+"$TEST_REAL_NODE" -e 'process.stdout.write((require("node:fs").statSync(process.env.COPILOT_AUTH_FILE).mode & 0o777).toString(8))' > "$TEST_DOCKER_MODE"
+exit 1
+`, { mode: 0o755 })
+  const result = await launch(t, env)
+  assert.equal(result.code, 0, result.stderr)
+  assert.equal(await readFile(env.TEST_DOCKER_MODE, "utf8"), "600")
+  assert.match(result.stdout, /Restricted .+ to owner-only access/)
 })

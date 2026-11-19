@@ -141,6 +141,32 @@ test("search progress and result blocks are emitted before the following generat
   assert.deepEqual(events.filter((entry) => entry.type === "content_block_start").map((entry) => entry.data.index), [0, 1, 2])
 })
 
+test("text beside a search call is kept in the message and in the stream, at matching indices", async () => {
+  const events = []
+  let calls = 0
+  const output = await exported("runWebSearch")({
+    request: request(), config: searchConfig(), signal: new AbortController().signal,
+    search: async () => [result()],
+    emit: async (type, data) => { events.push(data) },
+    generate: async (body, onEvent) => {
+      calls++
+      const response = calls === 1
+        ? answer([{ type: "text", text: "Let me search." }, tool("search_after_text")])
+        : answer([{ type: "text", text: "Found it." }], "end_turn")
+      for (const [index, block] of response.content.entries()) {
+        await onEvent({ type: "content_block_start", index, content_block: block })
+        await onEvent({ type: "content_block_stop", index })
+      }
+      return response
+    },
+  })
+  assert.deepEqual(output.content.map((block) => block.type), ["text", "server_tool_use", "web_search_tool_result", "text"])
+  assert.equal(output.content[0].text, "Let me search.")
+  const starts = events.filter((data) => data.type === "content_block_start")
+  assert.deepEqual(starts.map((data) => data.index), [0, 1, 2, 3])
+  for (const data of starts) assert.deepEqual(data.content_block, output.content[data.index])
+})
+
 test("unsupported search versions, user location and contradictory domain lists reject explicitly", () => {
   const extract = exported("extractWebSearchConfig")
   const config = searchConfig()
@@ -150,6 +176,22 @@ test("unsupported search versions, user location and contradictory domain lists 
   assert.throws(() => extract([{ name: "web_search", type: "web_search_20250305", user_location: { country: "US" } }], config), /location/i)
   assert.throws(() => extract([{ name: "web_search", type: "web_search_20250305", allowed_domains: ["example.com"], blocked_domains: ["other.com"] }], config), /both|allowed_domains|blocked_domains/i)
   assert.throws(() => extract([{ name: "web_search", type: "web_search_20250305", max_uses: -1 }], config), /max_uses/i)
+})
+
+// Claude Code 2.1.328 forwards both lists to its nested WebSearch request,
+// one of them possibly empty, and rejects only two nonempty lists itself.
+test("an empty companion domain list is not a contradiction", () => {
+  const extract = exported("extractWebSearchConfig")
+  const config = searchConfig()
+  const domains = (fields) => {
+    const { allowedDomains, blockedDomains } = extract([{ name: "web_search", type: "web_search_20250305", ...fields }], config)
+    return { allowedDomains, blockedDomains }
+  }
+  assert.deepEqual(domains({ allowed_domains: ["NodeJS.org"], blocked_domains: [] }), { allowedDomains: ["nodejs.org"], blockedDomains: [] })
+  assert.deepEqual(domains({ allowed_domains: [], blocked_domains: ["example.com"] }), { allowedDomains: [], blockedDomains: ["example.com"] })
+  assert.deepEqual(domains({ allowed_domains: [], blocked_domains: [] }), { allowedDomains: [], blockedDomains: [] })
+  assert.throws(() => domains({ allowed_domains: ["nodejs.org"], blocked_domains: ["example.com"] }),
+    (error) => error.status === 400 && /both allowed_domains and blocked_domains/.test(error.message))
 })
 
 test("domain constraints match normalized hostname boundaries, never string suffix tricks", async () => {
@@ -482,7 +524,7 @@ test("results of one search round are appended whole and in call order", async (
   ])
 })
 
-test("a fatal search failure cancels the other searches of its round and adds no later output", async () => {
+test("a fatal search failure cancels the other searches of its round and adds no later output", { timeout: 2000 }, async () => {
   const failure = new Error("unexpected search failure")
   const events = []
   let sibling

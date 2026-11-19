@@ -7,6 +7,7 @@ const numbers = {
   maxResponseBytes: ["COPILOT_MAX_RESPONSE_BYTES", 64 * 1024 * 1024, 1],
   maxEventBytes: ["COPILOT_MAX_SSE_EVENT_BYTES", 8 * 1024 * 1024, 1],
   requestTimeoutMs: ["COPILOT_REQUEST_TIMEOUT_MS", 120000, 1],
+  nonStreamingTimeoutMs: ["COPILOT_NONSTREAMING_TIMEOUT_MS", 600000, 1],
   maxRetries: ["COPILOT_MAX_RETRIES", 3, 0, 20],
   retryBudgetMs: ["COPILOT_RETRY_BUDGET_MS", 30000, 0],
   minRequestIntervalMs: ["COPILOT_MIN_REQUEST_INTERVAL_MS", 0, 0],

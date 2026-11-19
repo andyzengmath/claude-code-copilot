@@ -36,13 +36,16 @@ export async function upstreamError(upstream) {
   const rawBody = await upstream.text()
   let source
   try { source = JSON.parse(rawBody) } catch { source = null }
-  const type = source?.error?.type ?? errorType(response.status)
+  const anthropic = source?.type === "error" && typeof source.error?.type === "string"
+  const type = typeof source?.error?.type === "string" ? source.error.type : errorType(response.status)
   const message = typeof source?.error?.message === "string" ? source.error.message
     : typeof source?.message === "string" ? source.message
     : rawBody.trim() || `Copilot returned HTTP ${response.status}`
   const error = new ProxyError(response.status, message, type, responseHeaders(response.headers))
-  error.rawBody = rawBody
-  error.envelope = source?.type === "error" && source?.error?.type
+  // The native transport relays an Anthropic error envelope as sent; any
+  // other body, such as a gateway's HTML page, gets a JSON envelope.
+  if (anthropic) error.rawBody = rawBody
+  error.envelope = anthropic
     ? source
     : { type: "error", error: { ...(source?.error && typeof source.error === "object" ? source.error : {}), type, message } }
   if (source?.request_id) error.envelope.request_id = source.request_id
@@ -62,7 +65,7 @@ export function createUpstreamClient({ fetchImpl, baseUrl, config, logger, gate:
   })
   return {
     gate,
-    async request(path, body, { token, headers: incoming, signal }) {
+    async request(path, body, { token, headers: incoming, signal, onDispatch }) {
       const serialized = JSON.stringify(body)
       const bytes = Buffer.byteLength(serialized)
       const deadline = performance.now() + config.retryBudgetMs
@@ -84,18 +87,23 @@ export function createUpstreamClient({ fetchImpl, baseUrl, config, logger, gate:
       if (serialized.includes('"type":"image"') || serialized.includes('"type":"image_url"')) {
         headers["copilot-vision-request"] = "true"
       }
+      // Copilot sends the headers of a non-streaming reply only once the reply
+      // is finished, so a generation without `stream: true` waits longer for them.
+      const headersTimeoutMs = body?.stream !== true && !path.startsWith("/v1/messages/count_tokens")
+        ? config.nonStreamingTimeoutMs : config.requestTimeoutMs
       for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
         const release = await acquire(attempt)
         let upstream
         try {
           const dispatch = (url, init) => {
             if (attempt > 0 && performance.now() >= deadline) throw budgetError()
+            onDispatch?.()
             return fetchImpl(url, init)
           }
           upstream = await openResponse(dispatch, `${baseUrl}${path}`, {
             method: "POST", headers, body: serialized,
           }, {
-            signal, timeoutMs: config.requestTimeoutMs, maxBytes: config.maxResponseBytes, logger,
+            signal, timeoutMs: config.requestTimeoutMs, headersTimeoutMs, maxBytes: config.maxResponseBytes, logger,
           })
         } catch (error) {
           release()
@@ -112,7 +120,9 @@ export function createUpstreamClient({ fetchImpl, baseUrl, config, logger, gate:
         const hint = parseRetryAfterMs(response.headers.get("retry-after"))
         if (cooldown && (response.status === 429 || response.status === 503) && hint !== null) gate.cooldown(hint)
         const delay = hint ?? Math.floor(Math.min(1000 * 2 ** attempt, 8000) * (0.5 + Math.random() * 0.5))
-        if (!retryable.has(response.status) || attempt === config.maxRetries || performance.now() + delay > deadline) {
+        // Like Claude Code, honor an upstream x-should-retry: false.
+        if (!retryable.has(response.status) || response.headers.get("x-should-retry") === "false" ||
+          attempt === config.maxRetries || performance.now() + delay > deadline) {
           return { ...upstream, dispose }
         }
         retryHeaders = responseHeaders(response.headers)

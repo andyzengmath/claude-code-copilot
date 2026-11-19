@@ -232,6 +232,14 @@ test("a header timeout aborts the fetch and cancels a late ignored response", as
   assert.equal(cancelled, true)
 })
 
+test("the header wait has its own deadline, while each body read keeps the idle timeout", async () => {
+  const upstream = await runtime.openResponse(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    return new Response(new ReadableStream({ start() {} }))
+  }, "https://fixture.invalid", {}, { timeoutMs: 20, headersTimeoutMs: 5000 })
+  await assert.rejects(upstream.text(), (error) => error.status === 504 && /body read timed out after 20ms/.test(error.message))
+})
+
 test("relay headers discard decompression lengths and connection-nominated hop headers", () => {
   const headers = responseHeaders(new Headers({
     "content-type": "application/json", "content-encoding": "gzip", "content-length": "42",
@@ -269,3 +277,34 @@ test("native stream validation rejects malformed block headers before forwarding
   state.accept({ type: "message_start", message: { type: "message", content: [], usage: {} } })
   assert.throws(() => state.accept({ type: "content_block_start", index: 0, content_block: "not a block" }), (error) => error.status === 502)
 })
+
+const nativeStart = { type: "message_start", message: { type: "message", content: [], usage: {} } }
+const blockStart = (index) => ({ type: "content_block_start", index, content_block: { type: "text", text: "" } })
+const blockDelta = (index) => ({ type: "content_block_delta", index, delta: { type: "text_delta", text: "x" } })
+const blockStop = (index) => ({ type: "content_block_stop", index })
+const outputUsage = { type: "message_delta", delta: {}, usage: { output_tokens: 1 } }
+const finish = { type: "message_delta", delta: { stop_reason: "end_turn" } }
+const messageStop = { type: "message_stop" }
+
+test("native stream validation accepts and assembles a complete message", () => {
+  const state = new NativeMessageState({ collect: true })
+  for (const data of [nativeStart, blockStart(0), blockDelta(0), blockStop(0), outputUsage, finish]) assert.equal(state.accept(data), false)
+  assert.equal(state.accept(messageStop), true)
+  assert.deepEqual(state.message.content, [{ type: "text", text: "x" }])
+})
+
+// `collect`: search emulation, which also needs the final output usage.
+for (const [name, events, collect = false] of [
+  ["a repeated block index", [nativeStart, blockStart(0), blockStop(0), blockStart(0)]],
+  ["a delta after its block stopped", [nativeStart, blockStart(0), blockStop(0), blockDelta(0)]],
+  ["message_stop while a block is open", [nativeStart, blockStart(0), outputUsage, finish, messageStop]],
+  ["message_stop without a stop_reason", [nativeStart, blockStart(0), blockStop(0), outputUsage, messageStop]],
+  ["output usage reported before the last block closed", [nativeStart, blockStart(0), outputUsage, blockStop(0), finish, messageStop], true],
+  ["output usage reported before a later block", [nativeStart, blockStart(0), blockStop(0), outputUsage, blockStart(1), blockStop(1), finish, messageStop], true],
+]) {
+  test(`native stream validation rejects ${name}`, () => {
+    const state = new NativeMessageState({ collect })
+    for (const data of events.slice(0, -1)) state.accept(data)
+    assert.throws(() => state.accept(events.at(-1)), (error) => error.status === 502)
+  })
+}
