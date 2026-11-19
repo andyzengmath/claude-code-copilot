@@ -202,7 +202,7 @@ Search input rules:
 
 - Supply at most one nonempty list, `allowed_domains` or `blocked_domains`, with up to 100 hostnames; an empty companion list, which Claude Code sends, is ignored. Matching enforces hostname boundaries and normalizes case, punycode, and trailing dots. Schemes, ports, paths, and wildcards are not accepted.
 - `user_location` (`{"type": "approximate"}` with optional `city`, `region`, two-letter `country`, and `timezone`) is passed to hosted search. Provider search cannot localize results; it ignores the location and logs a warning.
-- Supplying two non-null domain lists, a malformed `user_location`, or a newer/unknown server-search version is explicitly rejected, not guessed. Documented nullable options treat `null` as unset.
+- Supplying two nonempty domain lists, a malformed `user_location`, or a newer/unknown server-search version is explicitly rejected, not guessed. Documented nullable options treat `null` as unset.
 - The `search_profile` hint that Claude Code 2.1.303 and later can send is accepted and ignored. Other unrecognized optional tool fields are ignored with one logged warning per distinct set of names, so a new Claude Code release does not break WebSearch.
 - `max_uses: 0` disables search without changing a remaining client-tool selection or `none` choice. Requiring a disabled or unavailable tool is contradictory input and returns HTTP 400 before model discovery or SSE starts.
 
