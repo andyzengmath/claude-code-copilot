@@ -3,7 +3,7 @@ import { spawn, spawnSync } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { once } from "node:events"
 import { existsSync } from "node:fs"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import net from "node:net"
 import { tmpdir } from "node:os"
@@ -238,4 +238,23 @@ exit 1
   assert.equal(existsSync(env.TEST_DOCKER_ATTEMPT), true)
   assert.equal(JSON.parse(await readFile(env.TEST_CLIENT_RESULT, "utf8")).keyAccepted, true)
   assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, 200)
+})
+
+test("launcher restricts an auth file other users can read before it starts Docker", {
+  ...options, skip: process.platform === "win32" ? "POSIX permissions only" : options.skip,
+}, async (t) => {
+  const port = await availablePort()
+  const { env, directory } = await setup(t, port)
+  await chmod(env.COPILOT_AUTH_FILE, 0o644)
+  env.TEST_DOCKER_MODE = join(directory, "docker-mode")
+  // Compose mounts the file read-only, so its mode when Docker starts is what the container gets.
+  await writeFile(join(directory, "docker"), `#!/bin/bash
+if [[ "$1" == info || ( "$1" == compose && "$2" == version ) ]]; then exit 0; fi
+"$TEST_REAL_NODE" -e 'process.stdout.write((require("node:fs").statSync(process.env.COPILOT_AUTH_FILE).mode & 0o777).toString(8))' > "$TEST_DOCKER_MODE"
+exit 1
+`, { mode: 0o755 })
+  const result = await launch(t, env)
+  assert.equal(result.code, 0, result.stderr)
+  assert.equal(await readFile(env.TEST_DOCKER_MODE, "utf8"), "600")
+  assert.match(result.stdout, /Restricted .+ to owner-only access/)
 })

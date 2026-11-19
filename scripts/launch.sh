@@ -52,6 +52,17 @@ if [ ! -f "$COPILOT_AUTH_FILE" ]; then
     printf '  node %q\n' "$SCRIPT_DIR/auth.mjs" >&2
     exit 1
 fi
+# Older versions wrote the token readable by other users. Compose mounts it
+# read-only, so a proxy in Docker cannot restrict it as Node mode does.
+if [[ "$OSTYPE" != msys* && "$OSTYPE" != cygwin* ]] && node -e '
+    process.exit(process.platform !== "win32" && require("node:fs").statSync(process.argv[1]).mode & 0o077 ? 0 : 1)
+' "$COPILOT_AUTH_FILE" 2>/dev/null; then
+    if chmod go-rwx "$COPILOT_AUTH_FILE"; then
+        echo "Restricted $COPILOT_AUTH_FILE to owner-only access; other users could read it."
+    else
+        echo "Warning: other users can read $COPILOT_AUTH_FILE, and it could not be restricted. Run: chmod 600 on that file." >&2
+    fi
+fi
 
 CLIENT_HOST="$HOST"
 case "$HOST" in

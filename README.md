@@ -91,13 +91,14 @@ export COPILOT_AUTH_FILE="${COPILOT_AUTH_FILE:-$HOME/.claude-copilot-auth.json}"
 export COPILOT_PROXY_KEY_FILE="${COPILOT_PROXY_KEY_FILE:-$HOME/.claude-copilot-proxy-key.json}"
 # Run node scripts/auth.mjs first if the auth file does not exist.
 export ANTHROPIC_API_KEY="$(node scripts/proxy.mjs --print-api-key)"
+chmod 600 "$COPILOT_AUTH_FILE" "$COPILOT_PROXY_KEY_FILE"
 docker compose up -d --build proxy
 export ANTHROPIC_BASE_URL="http://127.0.0.1:${COPILOT_PROXY_PORT:-18080}"
 unset ANTHROPIC_AUTH_TOKEN
 claude
 ```
 
-Use absolute host paths for custom credential files. Compose requires both path variables and mounts the files read-only at `/run/secrets/copilot-auth.json` and `/run/secrets/copilot-proxy-key.json`; it does not create missing source files. Never copy credentials into the image.
+Use absolute host paths for custom credential files. Compose requires both path variables and mounts the files read-only at `/run/secrets/copilot-auth.json` and `/run/secrets/copilot-proxy-key.json`; it does not create missing source files. Never copy credentials into the image. Because the mounts are read-only, the proxy in the container cannot restrict a credential file that other users can read, such as a token written by an older version; `chmod 600` above does that, and the launcher restricts the auth file itself before it starts Docker.
 
 Inside the container the proxy listens on `0.0.0.0:18080`, but Compose publishes **only** `127.0.0.1:${COPILOT_PROXY_PORT:-18080}`. `COPILOT_PROXY_HOST` only controls direct Node mode, not container publishing. `restart: always` keeps the proxy available when Docker restarts.
 
@@ -212,7 +213,7 @@ Every non-health route requires the persistent local key in `x-api-key` or `Auth
 
 With `?nonce=` followed by 32 to 128 lowercase hex characters, the response also includes `key_proof`: an HMAC-SHA256 of the nonce under the local key. The launcher checks it before it sends the key, so a process that occupies the port cannot collect the key or Claude Code's prompts.
 
-OAuth credentials and the local API key are persisted privately on disk. On POSIX, a credential file that other users can read, such as one written by an older version, is restricted to its owner when read. On Windows, credential files, including their temporary copies, grant access only to you from the moment they are created. Still keep custom credential paths in a folder only you can write to, not one created directly under `C:\`: there every signed-in user can create files, so another user could place a key file before the proxy creates its own. Model metadata and query results are cached in memory; query logging is disabled by default, but operational/error logs can still be emitted. Prompts go to GitHub Copilot. Hosted search sends the search request, including Claude Code's search prompt, to Copilot's `/responses` endpoint, where the search model runs OpenAI's web search. Provider search sends queries to GitHub's search first and then to configured or fallback providers, unless `WEB_SEARCH_THIRD_PARTY=0` limits it to GitHub's search. Their data handling policies apply. Do not put secrets in queries, publish credential files, or assume that a local proxy means data stays on your machine.
+OAuth credentials and the local API key are persisted privately on disk. On POSIX, a credential file that other users can read, such as one written by an older version, is restricted to its owner when read; with Docker, where the files are mounted read-only, the launcher restricts the auth file before it starts the container. On Windows, credential files, including their temporary copies, grant access only to you from the moment they are created. Still keep custom credential paths in a folder only you can write to, not one created directly under `C:\`: there every signed-in user can create files, so another user could place a key file before the proxy creates its own. Model metadata and query results are cached in memory; query logging is disabled by default, but operational/error logs can still be emitted. Prompts go to GitHub Copilot. Hosted search sends the search request, including Claude Code's search prompt, to Copilot's `/responses` endpoint, where the search model runs OpenAI's web search. Provider search sends queries to GitHub's search first and then to configured or fallback providers, unless `WEB_SEARCH_THIRD_PARTY=0` limits it to GitHub's search. Their data handling policies apply. Do not put secrets in queries, publish credential files, or assume that a local proxy means data stays on your machine.
 
 ## Reliability and errors
 
