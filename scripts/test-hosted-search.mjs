@@ -149,6 +149,18 @@ test("hosted search accepts only request fields it can honor; everything else us
   ]) assert.match(reason(body), expected)
 })
 
+test("hosted search takes only the tool choices it honors; a forced undeclared tool uses provider search", () => {
+  const reason = (body) => hostedSearchIneligibility(body, settingsFor(body), config)
+  for (const tool_choice of [
+    undefined, { type: "auto" }, { type: "any" }, { type: "tool", name: "web_search" },
+    { type: "auto", disable_parallel_tool_use: false }, { type: "tool", name: "web_search", disable_parallel_tool_use: true },
+  ]) assert.equal(reason(nestedSearch({ tool_choice })), null, JSON.stringify(tool_choice))
+  for (const tool_choice of [
+    { type: "tool", name: "undeclared_tool" }, { type: "tool" }, { type: "auto", name: "web_search" },
+    { type: "any", disable_parallel_tool_use: "yes" }, { type: "auto", strict: true }, { type: "required" }, "auto", null,
+  ]) assert.match(reason(nestedSearch({ tool_choice })), /tool_choice requires provider search/, JSON.stringify(tool_choice))
+})
+
 test("hosted results map to server_tool_use, web_search_tool_result and text blocks", () => {
   const body = nestedSearch()
   const message = hostedSearchMessage(lunaResponse(), { id: "msg_hosted", model: "claude-opus-5.5", settings: settingsFor(body) })

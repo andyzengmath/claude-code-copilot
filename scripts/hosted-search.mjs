@@ -35,6 +35,17 @@ function textOnly(content) {
   return parts.join("\n\n")
 }
 
+// Whether hosted search, which always searches, honors this tool_choice:
+// absent, auto, any, or the declared search tool by name. Any other choice,
+// such as an undeclared tool, goes to provider search and its validation.
+function hostedToolChoice(choice, tool) {
+  if (choice === undefined) return true
+  if (!plainObject(choice)) return false
+  const { type, name, disable_parallel_tool_use: parallel, ...other } = choice
+  if (Object.keys(other).length || (parallel !== undefined && typeof parallel !== "boolean")) return false
+  return type === "tool" ? name === tool.name : ["auto", "any"].includes(type) && !Object.hasOwn(choice, "name")
+}
+
 // Why hosted search cannot answer this request faithfully, or null when it can.
 export function hostedSearchIneligibility(body, settings, config) {
   if (config.webSearchMode !== "hosted") return "disabled by WEB_SEARCH_MODE"
@@ -48,6 +59,7 @@ export function hostedSearchIneligibility(body, settings, config) {
     return "stop_sequences require provider search"
   }
   if (body.tool_choice?.type === "none") return "tool_choice is none"
+  if (!hostedToolChoice(body.tool_choice, body.tools[0])) return "tool_choice requires provider search"
   if (body.thinking !== undefined && !["disabled", "adaptive"].includes(body.thinking?.type)) return "manual thinking requires provider search"
   if (body.output_config !== undefined && (!plainObject(body.output_config) || Object.keys(body.output_config).some((name) => name !== "effort"))) {
     return "output_config other than effort requires provider search"

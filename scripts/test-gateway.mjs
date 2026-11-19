@@ -963,6 +963,7 @@ test("provider search is used when the hosted search model, mode or request does
     ["blocked_domains", withLuna, nestedWebSearch({}, { blocked_domains: ["example.org"] })],
     ["stop_sequences", withLuna, nestedWebSearch({ stop_sequences: ["<END>"] })],
     ["temperature", withLuna, nestedWebSearch({ temperature: 0 })],
+    ["a forced undeclared tool", withLuna, nestedWebSearch({ tool_choice: { type: "tool", name: "undeclared_tool" } })],
   ]) {
     const paths = []
     const rounds = []
