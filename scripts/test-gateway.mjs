@@ -1553,7 +1553,7 @@ test("a hosted search without a response falls back at the search deadline, not 
   assert.deepEqual(paths, ["/responses", "/v1/messages", "/v1/messages"])
 })
 
-test("a hosted search still waiting for admission at the search deadline falls back", { timeout: 5000 }, async (t) => {
+test("a hosted search still waiting for admission at the search deadline falls back without pausing hosted search", { timeout: 5000 }, async (t) => {
   const paths = []
   const rounds = []
   const warnings = []
@@ -1572,7 +1572,7 @@ test("a hosted search still waiting for admission at the search deadline falls b
   const plain = await f.request({ stream: true })
   const search = f.request(nestedWebSearch({ stream: false }))
   await until(() => warnings.length > 0)
-  assert.deepEqual(warnings, ["Hosted web search timed out after 100ms; using provider search for the next 60s"])
+  assert.deepEqual(warnings, ["Hosted web search failed before /responses answered (still waiting for admission after 100ms); using provider search"])
   held.enqueue(new TextEncoder().encode(nativeFrames()))
   held.close()
   assert.equal(parsedEvents(await plain.text()).at(-1).type, "message_stop")
@@ -1580,6 +1580,9 @@ test("a hosted search still waiting for admission at the search deadline falls b
   assert.equal(response.status, 200)
   assert.equal((await response.json()).content.at(-1).text, "Emulated answer")
   assert.deepEqual(paths, ["/v1/messages", "/v1/messages", "/v1/messages"])
+  // /responses was never sent, so the next search tries hosted search again.
+  assert.equal((await f.request(nestedWebSearch({ stream: false }))).status, 200)
+  assert.equal(paths.at(-1), "/responses")
 })
 
 test("hosted search serves Chat-transport models, and other searches there get 501 before any output", async (t) => {

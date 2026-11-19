@@ -65,7 +65,7 @@ export function createUpstreamClient({ fetchImpl, baseUrl, config, logger, gate:
   })
   return {
     gate,
-    async request(path, body, { token, headers: incoming, signal }) {
+    async request(path, body, { token, headers: incoming, signal, onDispatch }) {
       const serialized = JSON.stringify(body)
       const bytes = Buffer.byteLength(serialized)
       const deadline = performance.now() + config.retryBudgetMs
@@ -97,6 +97,7 @@ export function createUpstreamClient({ fetchImpl, baseUrl, config, logger, gate:
         try {
           const dispatch = (url, init) => {
             if (attempt > 0 && performance.now() >= deadline) throw budgetError()
+            onDispatch?.()
             return fetchImpl(url, init)
           }
           upstream = await openResponse(dispatch, `${baseUrl}${path}`, {

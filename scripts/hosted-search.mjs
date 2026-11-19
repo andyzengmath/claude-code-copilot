@@ -341,6 +341,7 @@ export function createHostedSearch({ catalog, client, config, logger, warnOnce }
     let upstream
     let data
     let deadline
+    let dispatched = false
     try {
       const info = (await catalog.get(token, signal)).find((entry) => entry.id === config.webSearchModel)
       if (!info || !isRoutable(info) || !info.supported_endpoints?.includes("/responses")) {
@@ -352,7 +353,7 @@ export function createHostedSearch({ catalog, client, config, logger, warnOnce }
       deadline = AbortSignal.timeout(config.searchTimeoutMs)
       // No incoming headers: anthropic-* headers do not apply to /responses.
       upstream = await client.request("/responses", buildHostedSearchRequest(body, settings, config, info), {
-        token, headers: {}, signal: AbortSignal.any([signal, deadline]),
+        token, headers: {}, signal: AbortSignal.any([signal, deadline]), onDispatch: () => { dispatched = true },
       })
       if (!upstream.response.ok) throw await upstreamError(upstream)
       // Parse errors only: a failed or timed-out read keeps its own error.
@@ -370,20 +371,22 @@ export function createHostedSearch({ catalog, client, config, logger, warnOnce }
       return { message, searchModel: info.id }
     } catch (error) {
       signal.throwIfAborted()
-      // A timeout is the deadline expiring, which is a hosted failure rather
-      // than a cancellation, or the client's own 504 for one wait; a 504 that
+      // A timeout means /responses was sent but did not answer in time: the
+      // deadline expired, or the client's own 504 ended one wait. A 504 that
       // /responses returned is an answer like any other status.
       const response = upstream?.response
-      const timedOut = deadline !== undefined && (deadline.aborted || (error.status === 504 && response?.ok !== false))
+      const timedOut = dispatched && (deadline.aborted || (error.status === 504 && response?.ok !== false))
       // Only /responses' answers and timeouts pause hosted search. An error
-      // raised before /responses answered, such as the shared admission
-      // gate's cooldown or a full queue, says nothing about hosted search.
+      // raised before the request was sent, such as the shared admission
+      // gate's cooldown, a full queue, or a queue wait past the deadline, says
+      // nothing about hosted search.
       const duration = pause(Math.max(timedOut ? 60000 : 0, response?.ok === false ? refusalPause(response) : 0))
       const pauseNote = duration > 0 ? ` for the next ${Math.ceil(duration / 1000)}s` : ""
       if (timedOut) {
         logger.warn(`Hosted web search timed out${deadline.aborted ? ` after ${config.searchTimeoutMs}ms` : ""}; using provider search${pauseNote}`)
       } else if (!response) {
-        logger.warn(`Hosted web search failed before /responses answered (${error.status ?? error.name}); using provider search`)
+        const reason = deadline?.aborted ? `still waiting for admission after ${config.searchTimeoutMs}ms` : error.status ?? error.name
+        logger.warn(`Hosted web search failed before /responses answered (${reason}); using provider search`)
       } else {
         // Upstream messages are never logged; hostedReason is written locally.
         logger.warn(`Hosted web search failed (${error.hostedReason ?? error.status ?? error.name}); using provider search${pauseNote}`)
