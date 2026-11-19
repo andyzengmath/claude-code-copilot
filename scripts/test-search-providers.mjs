@@ -785,6 +785,26 @@ test("results the domain lists exclude do not end the fallback chain", async () 
   } finally { service.close() }
 })
 
+test("domain lists filter all of a provider's results before the result cap", async () => {
+  const page = (host, index) => ghItem({ url: `https://${host}/${index}` })
+  const pages = (host, from, count) => Array.from({ length: count }, (_, index) => page(host, from + index))
+  for (const [items, lists, expected] of [
+    // Only the sixth result is permitted, and WEB_SEARCH_THIRD_PARTY=0 leaves no other provider.
+    [[...pages("wrong.test", 0, 5), page("example.org", 5)], { allowedDomains: ["example.org"] }, [5]],
+    [[...pages("blocked.test", 0, 5), page("example.org", 5)], { blockedDomains: ["blocked.test"] }, [5]],
+    // The cap applies to the permitted results.
+    [[...pages("wrong.test", 0, 5), ...pages("example.org", 5, 7)], { allowedDomains: ["example.org"] }, [5, 6, 7, 8, 9]],
+  ]) {
+    const { search: provider, calls } = githubHarness(() => ghSse(ghPayload(items)), { webSearchThirdParty: false })
+    const service = createWebSearchService({ provider, config: readConfig({}), logger: { log() {}, warn() {} } })
+    try {
+      assert.deepEqual((await service.search("node", { ...lists, token: TOKEN })).map((r) => r.url),
+        expected.map((index) => `https://example.org/${index}`))
+      assert.deepEqual(calls.map((call) => call.name), ["github"])
+    } finally { service.close() }
+  }
+})
+
 test("one search stops trying providers at the total search deadline", { timeout: 3000 }, async () => {
   const { search, calls, warnings } = harness(() => new Promise(() => {}), { searchTimeoutMs: 100, searchTotalTimeoutMs: 150 })
   await assert.rejects(search(QUERY), (error) => error instanceof WebSearchError && error.errorCode === "unavailable" && /deadline/.test(error.message))
