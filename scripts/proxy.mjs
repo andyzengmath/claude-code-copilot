@@ -36,6 +36,14 @@ function jsonResponse(res, status, body, headers = {}) {
   res.end(JSON.stringify(body))
 }
 
+// Claude Code takes a 401 to mean its API key, and only the local key should
+// get one. Copilot rejecting the saved GitHub sign-in needs a new sign-in, so
+// it is a 502 that says so, and retrying helps neither.
+function signInRejected(error) {
+  return new ProxyError(502, "Copilot rejected the saved GitHub sign-in (HTTP 401). Run node scripts/auth.mjs to sign in again.",
+    "api_error", { ...error.headers, "x-should-retry": "false" })
+}
+
 // Client-chosen names in logs: escaped, truncated and limited in number.
 function fieldList(names) {
   const shown = names.slice(0, 5).map((name) => JSON.stringify(name.slice(0, 64))).join(", ")
@@ -356,7 +364,10 @@ export function createProxyServer({
     res.on("error", (error) => controller.abort(error))
     res.once("close", () => { if (!res.writableFinished) controller.abort(abortError()) })
     // Request state that the route helpers share with the error handling and cleanup below.
-    const ctx = { req, res, signal, controller, writer: null, upstream: null, nativeTransport: false, inference: false, outcome: "failed" }
+    const ctx = {
+      req, res, signal, controller, writer: null, upstream: null,
+      authorized: false, nativeTransport: false, inference: false, outcome: "failed",
+    }
     try {
       signal.throwIfAborted()
       const url = new URL(req.url, "http://localhost")
@@ -368,18 +379,23 @@ export function createProxyServer({
       if (!["/v1/messages", "/v1/messages/count_tokens", "/v1/models"].includes(route)) {
         throw new ProxyError(404, "Not found", "not_found_error")
       }
-      if (!authorized(req, key)) throw new ProxyError(401, "A valid local proxy API key is required", "authentication_error")
+      if (!authorized(req, key)) {
+        throw new ProxyError(401, "A valid local proxy API key is required", "authentication_error", { "x-should-retry": "false" })
+      }
+      ctx.authorized = true
       const modelsRoute = route === "/v1/models"
       if (req.method !== (modelsRoute ? "GET" : "POST")) {
         throw new ProxyError(405, "Method not allowed", "invalid_request_error", { allow: modelsRoute ? "GET" : "POST" })
       }
       if (modelsRoute) await listModels(ctx)
       else await handleMessages(ctx, url, route === "/v1/messages/count_tokens")
-    } catch (error) {
+    } catch (caught) {
       if (signal.aborted || res.destroyed) {
         if (!res.destroyed) res.destroy()
         return
       }
+      // Once the local key is accepted, a 401 can only come from Copilot.
+      const error = ctx.authorized && caught.status === 401 ? signInRejected(caught) : caught
       if (ctx.inference) logger.error(`Proxy request failed: ${error.status ?? 500} ${error.name}`)
       if (ctx.writer && res.headersSent) {
         ctx.writer.stopPings()

@@ -265,9 +265,29 @@ test("health is public but inference and model discovery require the local key",
   for (const path of ["/v1/messages", "/v1/models", "/v1/messages/count_tokens"]) {
     const response = await fetch(`${f.base}${path}`, { headers: { "x-api-key": "wrong" } })
     assert.equal(response.status, 401)
+    assert.equal(response.headers.get("x-should-retry"), "false")
     assert.equal(response.headers.has("access-control-allow-origin"), false)
   }
   assert.equal(f.calls.length, 0)
+})
+
+test("Copilot rejecting the GitHub sign-in is a final 502 naming the fix, so only the local key gets a 401", async (t) => {
+  const rejected = () => Response.json({ type: "error", error: { type: "authentication_error", message: "Bad credentials" } }, { status: 401 })
+  for (const [name, path, options] of [
+    ["model listing", "/v1/models", { catalog: rejected }],
+    ["model discovery", "/v1/messages", { catalog: rejected }],
+    ["native generation", "/v1/messages", {}],
+    ["Chat generation", "/v1/messages", { config: { transport: "chat" } }],
+    ["token counting", "/v1/messages/count_tokens", {}],
+  ]) {
+    const f = await fixture(t, rejected, options)
+    const response = path === "/v1/models" ? await fetch(`${f.base}${path}`, { headers: { "x-api-key": f.key } }) : await f.request({}, path)
+    assert.equal(response.status, 502, name)
+    assert.equal(response.headers.get("x-should-retry"), "false", name)
+    assert.deepEqual(await response.json(), { type: "error", error: {
+      type: "api_error", message: "Copilot rejected the saved GitHub sign-in (HTTP 401). Run node scripts/auth.mjs to sign in again.",
+    } }, name)
+  }
 })
 
 test("health proves possession of the local key only for a well-formed nonce", async (t) => {
