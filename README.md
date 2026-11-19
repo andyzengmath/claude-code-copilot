@@ -334,7 +334,7 @@ node --test scripts\test-claude-client.mjs
 Remove-Item Env:CLAUDE_CODE_TEST_BINARY
 ```
 
-Alternatively, set the variable to the full path of your installed executable. The ordinary inference fixture uses `--bare`; the WebSearch fixture deliberately uses non-bare mode to exercise Claude Code's actual nested search request, with hooks and MCP disabled. Setting this variable also enables the fixtures during `npm test`; leave it unset for the default dependency-free run.
+Alternatively, set the variable to the full path of your installed executable. The ordinary inference fixture uses `--bare`; the WebSearch fixture deliberately uses non-bare mode to exercise Claude Code's actual nested search request, with hooks and MCP disabled. Each fixture runs Claude Code with a new temporary `CLAUDE_CONFIG_DIR`, deleted afterwards, and without inherited `ANTHROPIC_*`, `CLAUDE_CODE_USE_*` or `HTTP(S)_PROXY` settings, so it never touches your own Claude Code configuration. The WebSearch fixtures also check the search result that Claude Code passes to its model. Setting this variable also enables the fixtures during `npm test`; leave it unset for the default dependency-free run.
 
 ## License
 
