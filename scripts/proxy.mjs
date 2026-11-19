@@ -157,7 +157,7 @@ export function createProxyServer({
   const key = Buffer.from(proxyKey)
   const config = readConfig({}, overrides)
   const baseUrl = upstreamBaseUrl.replace(/\/$/, "")
-  const getToken = tokenProvider ?? (token ? async () => token : readAuthToken)
+  const readToken = tokenProvider ?? (token ? async () => token : readAuthToken)
   const shutdown = new AbortController()
   const lifecycle = shutdownSignal ? AbortSignal.any([shutdownSignal, shutdown.signal]) : shutdown.signal
   const catalog = createModelCatalog({ fetchImpl, baseUrl, config, logger })
@@ -181,6 +181,18 @@ export function createProxyServer({
     logger.warn(message)
   }
   const hostedSearch = createHostedSearch({ catalog, client: hostedClient, config, logger, warnOnce })
+
+  // The saved sign-in is read for each request, so it can have gone missing
+  // or become unreadable since startup. Log only the error code, never the file.
+  async function getToken() {
+    try {
+      return await readToken()
+    } catch (error) {
+      logger.error(`Cannot read the saved GitHub sign-in (${typeof error?.code === "string" ? error.code : error?.name ?? "error"}); run node scripts/auth.mjs`)
+      throw new ProxyError(503, "The proxy cannot read the saved GitHub sign-in. Run node scripts/auth.mjs to sign in again.",
+        "api_error", { "x-should-retry": "false" })
+    }
+  }
 
   // Start an SSE response; handle() closes its writer.
   function startStream(ctx, headers) {

@@ -1,9 +1,13 @@
 import assert from "node:assert/strict"
 import { createHmac } from "node:crypto"
 import { once } from "node:events"
+import { mkdtemp, rm } from "node:fs/promises"
 import { createServer } from "node:http"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { gzipSync } from "node:zlib"
 import test from "node:test"
+import { readAuthToken } from "./credentials.mjs"
 import * as proxy from "./proxy.mjs"
 import { NativeMessageState } from "./sse.mjs"
 import { fixture, event, message, nativeFrames, streamResponse, key, token, models } from "./test-helpers/gateway.mjs"
@@ -692,6 +696,29 @@ test("model discovery caches are isolated when the credential provider changes",
   currentToken = "first-fixture-token"
   assert.deepEqual(await discover(), ["claude-sonnet-5"])
   assert.equal(discoveries, 2)
+})
+
+test("a sign-in that cannot be read at request time is a final 503 naming the fix, logged by its code only", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "copilot-gateway-auth-"))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const errors = []
+  let read = () => readAuthToken(join(directory, "missing.json"))
+  const f = await fixture(t, () => assert.fail("no Copilot request without a sign-in"), {
+    tokenProvider: () => read(),
+    logger: { log() {}, warn() {}, error: (line) => errors.push(line) },
+  })
+  const failures = [await f.request(), await fetch(`${f.base}/v1/models`, { headers: { "x-api-key": f.key } })]
+  // A read error can quote the file, as a JSON parser's does.
+  read = async () => { throw new SyntaxError('Unexpected token in {"access_token":"gho_fixture_secret"}') }
+  failures.push(await f.request())
+  for (const response of failures) {
+    assert.equal(response.status, 503)
+    assert.equal(response.headers.get("x-should-retry"), "false")
+    assert.match((await response.json()).error.message, /Run node scripts\/auth\.mjs/)
+  }
+  assert.deepEqual(errors.map((line) => /\((\w+)\)/.exec(line)?.[1]), ["ENOENT", "ENOENT", "SyntaxError"])
+  assert.equal(errors.some((line) => line.includes("gho_fixture_secret") || line.includes(directory)), false)
+  assert.equal(f.calls.length, 0)
 })
 
 test("a temporary catalog outage permits bounded stale data but never indefinite stale routing", async (t) => {
