@@ -336,14 +336,31 @@ test("an inference 404 is never replayed against a second transport", async (t) 
   assert.deepEqual(dispatched, ["/v1/messages"])
 })
 
-test("a network failure does not replay an ambiguously submitted completion", async (t) => {
-  let dispatched = 0
-  const f = await fixture(t, () => {
-    dispatched++
-    throw new TypeError("fetch failed")
-  }, { config: { maxRetries: 3 } })
-  assert.equal((await f.request()).status, 502)
-  assert.equal(dispatched, 1)
+for (const [name, dispatch, status] of [
+  ["a network failure", () => { throw new TypeError("fetch failed") }, 502],
+  ["a header timeout", () => new Promise(() => {}), 504],
+]) {
+  test(`${name} does not replay an ambiguously submitted completion`, async (t) => {
+    let dispatched = 0
+    const f = await fixture(t, () => {
+      dispatched++
+      return dispatch()
+    }, { config: { maxRetries: 3, requestTimeoutMs: 50, nonStreamingTimeoutMs: 50 } })
+    assert.equal((await f.request()).status, status)
+    assert.equal(dispatched, 1)
+  })
+}
+
+// Copilot sends a non-streaming reply's headers only once the reply is finished.
+test("a non-streaming reply may take longer than the request timeout to start", async (t) => {
+  const f = await fixture(t, async (call) => {
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    return call.url.pathname.endsWith("/count_tokens") ? Response.json({ input_tokens: 5 }) : Response.json(message())
+  }, { config: { requestTimeoutMs: 50, nonStreamingTimeoutMs: 10000 } })
+  assert.equal((await f.request()).status, 200)
+  // Streaming replies and token counts start at once, so they keep the request timeout.
+  assert.equal((await f.request({ stream: true })).status, 504)
+  assert.equal((await f.request({}, "/v1/messages/count_tokens")).status, 504)
 })
 
 test("native token counting uses the same normalized payload without an estimate fallback", async (t) => {

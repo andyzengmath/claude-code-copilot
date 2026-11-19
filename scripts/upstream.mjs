@@ -84,6 +84,10 @@ export function createUpstreamClient({ fetchImpl, baseUrl, config, logger, gate:
       if (serialized.includes('"type":"image"') || serialized.includes('"type":"image_url"')) {
         headers["copilot-vision-request"] = "true"
       }
+      // Copilot sends the headers of a non-streaming reply only once the reply
+      // is finished, so a generation without `stream: true` waits longer for them.
+      const headersTimeoutMs = body?.stream !== true && !path.startsWith("/v1/messages/count_tokens")
+        ? config.nonStreamingTimeoutMs : config.requestTimeoutMs
       for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
         const release = await acquire(attempt)
         let upstream
@@ -95,7 +99,7 @@ export function createUpstreamClient({ fetchImpl, baseUrl, config, logger, gate:
           upstream = await openResponse(dispatch, `${baseUrl}${path}`, {
             method: "POST", headers, body: serialized,
           }, {
-            signal, timeoutMs: config.requestTimeoutMs, maxBytes: config.maxResponseBytes, logger,
+            signal, timeoutMs: config.requestTimeoutMs, headersTimeoutMs, maxBytes: config.maxResponseBytes, logger,
           })
         } catch (error) {
           release()

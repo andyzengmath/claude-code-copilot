@@ -232,6 +232,14 @@ test("a header timeout aborts the fetch and cancels a late ignored response", as
   assert.equal(cancelled, true)
 })
 
+test("the header wait has its own deadline, while each body read keeps the idle timeout", async () => {
+  const upstream = await runtime.openResponse(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    return new Response(new ReadableStream({ start() {} }))
+  }, "https://fixture.invalid", {}, { timeoutMs: 20, headersTimeoutMs: 5000 })
+  await assert.rejects(upstream.text(), (error) => error.status === 504 && /body read timed out after 20ms/.test(error.message))
+})
+
 test("relay headers discard decompression lengths and connection-nominated hop headers", () => {
   const headers = responseHeaders(new Headers({
     "content-type": "application/json", "content-encoding": "gzip", "content-length": "42",

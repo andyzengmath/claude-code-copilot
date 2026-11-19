@@ -158,9 +158,10 @@ export function createProxyServer({
   // search is the fallback. It shares the admission gate, so the configured
   // concurrency and spacing limits cover all Copilot requests, but its
   // Retry-After pauses only hosted search, never the gate Claude requests use.
+  const searchDeadline = Math.min(config.requestTimeoutMs, config.searchTimeoutMs)
   const hostedClient = createUpstreamClient({
     fetchImpl, baseUrl, logger, gate: copilot.gate, cooldown: false,
-    config: { ...config, maxRetries: 0, requestTimeoutMs: Math.min(config.requestTimeoutMs, config.searchTimeoutMs) },
+    config: { ...config, maxRetries: 0, requestTimeoutMs: searchDeadline, nonStreamingTimeoutMs: searchDeadline },
   })
   const search = createWebSearchService({
     provider: searchProvider ?? createSearchProvider({ fetchImpl, config, logger, githubMcpUrl: `${baseUrl}/mcp/` }), config, logger,
