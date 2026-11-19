@@ -9,6 +9,8 @@ permissions:
 
 jobs:
   test:
+    # A hung test must not hold a runner for GitHub's default of six hours.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
