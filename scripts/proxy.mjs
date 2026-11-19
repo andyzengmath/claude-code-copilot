@@ -191,8 +191,10 @@ export function createProxyServer({
       return await readToken()
     } catch (error) {
       logger.error(`Cannot read the saved GitHub sign-in (${typeof error?.code === "string" ? error.code : error?.name ?? "error"}); run node scripts/auth.mjs`)
-      throw new ProxyError(503, "The proxy cannot read the saved GitHub sign-in. Run node scripts/auth.mjs to sign in again.",
+      const failure = new ProxyError(503, "The proxy cannot read the saved GitHub sign-in. Run node scripts/auth.mjs to sign in again.",
         "api_error", { "x-should-retry": "false" })
+      failure.logged = true
+      throw failure
     }
   }
 
@@ -409,8 +411,15 @@ export function createProxyServer({
         return
       }
       // Once the local key is accepted, a 401 can only come from Copilot.
-      const error = ctx.authorized && caught.status === 401 ? signInRejected(caught) : caught
-      if (ctx.inference) logger.error(`Proxy request failed: ${error.status ?? 500} ${error.name}`)
+      const signIn = ctx.authorized && caught.status === 401
+      const error = signIn ? signInRejected(caught) : caught
+      // Log what the operator must fix, including failures before inference
+      // such as a catalog outage, but not the client's own mistakes (4xx) or
+      // an unreadable sign-in, which getToken already logged.
+      if (signIn) logger.error("Copilot rejected the saved GitHub sign-in (HTTP 401); run node scripts/auth.mjs")
+      else if (ctx.inference || (ctx.authorized && !error.logged && !(error.status < 500))) {
+        logger.error(`Proxy request failed: ${error.status ?? 500} ${error.name}`)
+      }
       if (ctx.writer && res.headersSent) {
         ctx.writer.stopPings()
         await ctx.writer.event("error", errorEnvelope(error))

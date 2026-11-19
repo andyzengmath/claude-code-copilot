@@ -285,14 +285,28 @@ test("Copilot rejecting the GitHub sign-in is a final 502 naming the fix, so onl
     ["Chat generation", "/v1/messages", { config: { transport: "chat" } }],
     ["token counting", "/v1/messages/count_tokens", {}],
   ]) {
-    const f = await fixture(t, rejected, options)
+    const errors = []
+    const f = await fixture(t, rejected, { ...options, logger: { log() {}, warn() {}, error: (line) => errors.push(line) } })
     const response = path === "/v1/models" ? await fetch(`${f.base}${path}`, { headers: { "x-api-key": f.key } }) : await f.request({}, path)
     assert.equal(response.status, 502, name)
     assert.equal(response.headers.get("x-should-retry"), "false", name)
     assert.deepEqual(await response.json(), { type: "error", error: {
       type: "api_error", message: "Copilot rejected the saved GitHub sign-in (HTTP 401). Run node scripts/auth.mjs to sign in again.",
     } }, name)
+    // The operator is told too, including before inference starts.
+    assert.deepEqual(errors, ["Copilot rejected the saved GitHub sign-in (HTTP 401); run node scripts/auth.mjs"], name)
   }
+})
+
+test("failures before inference are logged, but the client's own mistakes are not", async (t) => {
+  const errors = []
+  const f = await fixture(t, () => assert.fail("no generation without a catalog"), {
+    catalog: () => Response.json({ message: "private upstream detail" }, { status: 503 }),
+    logger: { log() {}, warn() {}, error: (line) => errors.push(line) },
+  })
+  assert.equal((await f.request()).status, 503)
+  assert.equal((await f.request({ max_tokens: -1 })).status, 400)
+  assert.deepEqual(errors, ["Proxy request failed: 503 ProxyError"])
 })
 
 test("health proves possession of the local key only for a well-formed nonce", async (t) => {
