@@ -73,6 +73,21 @@ async function assertUnavailable(promise) {
   })
 }
 
+// Runs setTimeout, and the total search deadline (an AbortSignal.timeout), on
+// the mocked clock: on a loaded machine, real timers created one after the
+// other can fire out of order.
+function mockClock(t) {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  t.mock.method(AbortSignal, "timeout", (ms) => {
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(new DOMException("The operation was aborted due to timeout", "TimeoutError")), ms)
+    return controller.signal
+  })
+}
+async function until(ready) {
+  while (!ready()) await new Promise((resolve) => setImmediate(resolve))
+}
+
 test("exports the requested error and provider factory", () => {
   assert.equal(typeof createSearchProvider, "function")
   assert.equal(typeof WebSearchError, "function")
@@ -384,24 +399,30 @@ test("body deadline cancels stalled reads without awaiting a stalled cancel", { 
   assert.ok(bodies.every((body) => !body.locked), "losing readers must release their locks")
 })
 
-test("fetch and body share one total provider deadline", { timeout: 2000 }, async () => {
+test("fetch and body share one total provider deadline", { timeout: 2000 }, async (t) => {
+  mockClock(t)
   let cancelled = 0
+  let body
   const { search, warnings } = harness((call) => {
     if (call.name !== "exa") return unavailable()
-    return new Promise((resolve) => setTimeout(() => resolve(new Response(new ReadableStream({
+    // Headers after 70 ms and the body 80 ms later: each within the 120 ms deadline, together past it.
+    return new Promise((resolve) => setTimeout(() => resolve(new Response(body = new ReadableStream({
       start(controller) {
-        const timer = setTimeout(() => {
+        this.timer = setTimeout(() => {
           controller.enqueue(new TextEncoder().encode(JSON.stringify({
             jsonrpc: "2.0", id: 1, result: { content: [] },
           })))
           controller.close()
         }, 80)
-        this.timer = timer
       },
       cancel() { cancelled++; clearTimeout(this.timer) },
     }))), 70))
   }, { searchTimeoutMs: 120 })
-  await assertUnavailable(search(QUERY))
+  const pending = search(QUERY)
+  t.mock.timers.tick(70)
+  await until(() => body?.locked)
+  t.mock.timers.tick(50)
+  await assertUnavailable(pending)
   assert.equal(cancelled, 1)
   assert.match(warnings[0], /timed out/i)
 })
@@ -805,18 +826,28 @@ test("domain lists filter all of a provider's results before the result cap", as
   }
 })
 
-test("one search stops trying providers at the total search deadline", { timeout: 3000 }, async () => {
+test("one search stops trying providers at the total search deadline", { timeout: 3000 }, async (t) => {
+  mockClock(t)
   const { search, calls, warnings } = harness(() => new Promise(() => {}), { searchTimeoutMs: 100, searchTotalTimeoutMs: 150 })
-  await assert.rejects(search(QUERY), (error) => error instanceof WebSearchError && error.errorCode === "unavailable" && /deadline/.test(error.message))
+  const pending = search(QUERY)
+  // The first provider times out at 100 ms; the second is still waiting at the 150 ms total deadline.
+  t.mock.timers.tick(100)
+  await until(() => calls.length === 2)
+  t.mock.timers.tick(50)
+  await assert.rejects(pending, (error) => error instanceof WebSearchError && error.errorCode === "unavailable" && /deadline/.test(error.message))
   assert.equal(calls.length, 2)
   assert.ok(calls.every((call) => call.signal.aborted))
   assert.match(warnings.at(-1), /total search deadline/)
 })
 
-test("a genuine empty result stands when a later provider runs past the total deadline", { timeout: 3000 }, async () => {
+test("a genuine empty result stands when a later provider runs past the total deadline", { timeout: 3000 }, async (t) => {
+  mockClock(t)
   const { search, calls, warnings } = githubHarness((call) => call.name === "github" ? ghSse(ghPayload([])) : new Promise(() => {}),
     { searchTimeoutMs: 1000, searchTotalTimeoutMs: 150 })
-  assert.deepEqual(await search(QUERY, { token: TOKEN }), [])
+  const pending = search(QUERY, { token: TOKEN })
+  await until(() => calls.length === 2)
+  t.mock.timers.tick(150)
+  assert.deepEqual(await pending, [])
   assert.equal(calls.length, 2)
   assert.match(warnings.at(-1), /total search deadline/)
 })
