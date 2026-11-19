@@ -197,6 +197,8 @@ Hosted search does not call the requested model, so it now runs before any outpu
 
 PR #12 resolves the deferred findings, one commit each, and each commit passes the suite on its own.
 
+**Confirmation:** the security reviewer, the architect and the correctness reviewer re-checked their own findings at `91e6a8d`. All are resolved, none of them found a new defect, and all three approve. The correctness reviewer compared 20 request scenarios before and after the handler split: status, headers, bodies and logs were identical.
+
 - **DR-28 (`ae8c1ea`).**
   - On Windows, the temporary credential file is now created inside a staging folder whose ACL already grants only the current user, so the file never has the folder's inherited access.
   - The file is still protected on its own, so it stays private after it is renamed or linked into place.
